@@ -150,16 +150,11 @@ func CacheIsActive(clusterObj *beehive.Object[ClusterSpec, ClusterStatus], cache
 // cluster. Nor is the next-reconcile time: a scheduling change fires no WatchList, so
 // it is a gauge on Clusters().WatchSchedule instead.
 type Cluster struct {
-	ID                  ClusterID
-	Generation          int64
-	CreatedAt           time.Time
-	DeletionRequestedAt *time.Time // beehive's soft-delete tombstone, surfaced as-is
+	// ID is the ClusterID; see RecordMeta for the rest.
+	RecordMeta
 
 	Spec   ClusterSpec
 	Status ClusterStatus
-	// Conditions are beehive object rows, not part of Status — read off the object
-	// rather than out of the status blob.
-	Conditions []Condition
 }
 
 // ClusterWatchFrame is one frame on the cluster list watch: what happened (Type) to
@@ -175,13 +170,9 @@ type ClusterWatchFrame struct {
 // object rows rather than the status blob, which is where beehive keeps them.
 func toCluster(obj *beehive.Object[ClusterSpec, ClusterStatus]) *Cluster {
 	return &Cluster{
-		ID:                  ClusterID(obj.ID),
-		Generation:          obj.Generation,
-		CreatedAt:           obj.CreatedAt,
-		DeletionRequestedAt: obj.DeletionRequestedAt,
-		Spec:                obj.Spec,
-		Status:              clusterStatus(obj),
-		Conditions:          obj.Conditions,
+		RecordMeta: toRecordMeta(obj),
+		Spec:       obj.Spec,
+		Status:     clusterStatus(obj),
 	}
 }
 
@@ -259,7 +250,7 @@ var clusterWatch = deltaWatch[ClusterSpec, ClusterStatus, ClusterWatchFrame]{
 		return ClusterWatchFrame{Type: t, Cluster: toCluster(obj)}, nil
 	},
 	departed: func(change beehive.ObjectChange[ClusterSpec, ClusterStatus]) ClusterWatchFrame {
-		cluster := &Cluster{ID: ClusterID(change.ID)}
+		cluster := &Cluster{RecordMeta: RecordMeta{ID: ObjectID(change.ID)}}
 		if change.Object != nil {
 			cluster = toCluster(change.Object)
 		}

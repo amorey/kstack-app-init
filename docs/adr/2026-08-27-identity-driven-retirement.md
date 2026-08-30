@@ -78,5 +78,5 @@ must not use them, since blocking holds an engine worker.
 ## Revisit when
 
 A conflict lingers long enough to need surfacing on the record. While the rebuild is in flight the
-stall is sub-minute, so the per-probe observability row (`TODO.md`) is where a lingering one would
+stall is sub-minute, so the per-probe observability row (`docs/TODO.md`) is where a lingering one would
 show.

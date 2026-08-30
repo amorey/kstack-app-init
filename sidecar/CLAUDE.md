@@ -637,7 +637,7 @@ on; the other four run on their own clocks (readiness 30s, the rest 5-10m), so f
 would count down to whichever happened to be due next. It emits nothing until the
 first pass lands, since a fresh claim's zero state is not "nothing is scheduled". `probing` is
 asserted from the run, never inferred from a countdown that has run out — but the supervisor publishes
-only on a pass, so the in-flight window is not observable yet; see `TODO.md`.
+only on a pass, so the in-flight window is not observable yet; see `docs/TODO.md`.
 
 **A claim outlives what it is a claim on.** The file can stop naming a context while a holder
 still holds it, and the entry stays — only releasing drops one. An **unread** kubeconfig names
@@ -1367,6 +1367,11 @@ consumer (a callee follows its caller — `LiveCondition` needs `TruncateMessage
 - `ClusterID` **is** the beehive ObjectID — opaque, source-agnostic, stable for the record's life;
   never the remote UID or the context name. One shared GraphQL `ObjectID` scalar (decimal string)
   carries every kind's id; frontend codegen maps it to `string`.
+- **`RecordMeta` (`shared.go`) is the metadata half of every record** — `ID`, `Generation`,
+  `CreatedAt`, `DeletionRequestedAt`, `Conditions` — embedded in all three kinds and filled by
+  `toRecordMeta`, so each `toX` is metadata + spec + status and a new beehive metadata field is one
+  edit. gqlgen autobinds the promoted fields, so the schema names them per kind and no `fields:`
+  mapping is needed. Serving it everywhere is what lets a child record carry a tombstone.
 - `ClusterSpec` is user/API-owned (`Name`, `Enabled`, `SyncEnabled`, `Source` — a discriminated
   union, kubeconfig today); the matching *observation* belongs in `ClusterStatus.Source`, never spec.
   The spec carries **no trigger/counter fields** — retries and resyncs ride out-of-band buses.

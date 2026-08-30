@@ -112,31 +112,28 @@ func newFakeClusterService(fixtures []clusterFixture) *fakeClusterService {
 		id := fx.id
 		f.order = append(f.order, id)
 		f.clusters[id] = &clustersvc.Cluster{
-			ID:         id,
+			RecordMeta: clustersvc.RecordMeta{ID: id, Conditions: fx.connConds},
 			Spec:       fx.spec,
 			Status:     fx.connStatus,
-			Conditions: fx.connConds,
 		}
 		// Caches stream standalone via WatchCaches and are joined client-side.
 		// Give each fixture one cache whose ServerUID matches the cluster's
 		// identity (the client's active-cache rule).
 		f.caches = append(f.caches, clustersvc.ClusterCache{
-			ID:         fixtureCacheID(id),
+			RecordMeta: clustersvc.RecordMeta{ID: fixtureCacheID(id), Conditions: fx.cacheConds},
 			Owner:      clustersvc.ObjectRef{ID: id, Kind: "Cluster"},
 			Spec:       clustersvc.ClusterCacheSpec{ServerUID: "uid-" + strconv.FormatInt(int64(id), 10)},
-			Conditions: fx.cacheConds,
 		})
 		// Each cache gets one per-kind sync record, so the cache-scoped watch has
 		// something to scope. Deliberately one per cache so a leak across caches is
 		// visible as an extra frame.
 		f.cachedKinds = append(f.cachedKinds, clustersvc.ClusterCachedKind{
-			ID:    fixtureKindID(id),
-			Owner: clustersvc.ObjectRef{ID: fixtureCacheID(id), Kind: "ClusterCache"},
+			RecordMeta: clustersvc.RecordMeta{ID: fixtureKindID(id), Conditions: fx.syncConds},
+			Owner:      clustersvc.ObjectRef{ID: fixtureCacheID(id), Kind: "ClusterCache"},
 			Spec: clustersvc.ClusterCachedKindSpec{
 				APIVersion: "apps/v1", Kind: "Deployment",
 				Resource: "deployments", Namespaced: true,
 			},
-			Conditions: fx.syncConds,
 		})
 		f.cacheStats[fixtureCacheID(id)] = clustersvc.ClusterCacheStats{
 			Exists: true, Bytes: 4096, ObjectCount: 1386, KindCount: 62,

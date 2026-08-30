@@ -423,6 +423,14 @@ type ClusterCache {
   id: ObjectID!
   "The Cluster this cache belongs to. The client joins caches onto clusters by `owner.id`."
   owner: ObjectRef!
+
+  "The record's spec generation, bumped on every spec write."
+  generation: Int!
+  "When this cache was created — the cluster's identity was first observed."
+  createdAt: Time!
+  "When this cache's deletion was requested (beehive soft-delete tombstone); null unless deletion is pending. The record lingers until its finalizers clear."
+  deletionRequestedAt: Time
+
   spec: ClusterCacheSpec!
   "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's per-kind records (`clusterCachedKindsWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
   conditions: [Condition!]!
@@ -502,6 +510,14 @@ type ClusterCachedKind {
   id: ObjectID!
   "The ClusterCache this kind is mirrored into — the client's join key."
   owner: ObjectRef!
+
+  "The record's spec generation, bumped on every spec write."
+  generation: Int!
+  "When this kind was first armed for sync."
+  createdAt: Time!
+  "When this record's deletion was requested (beehive soft-delete tombstone); null unless deletion is pending. The record lingers until its finalizers clear."
+  deletionRequestedAt: Time
+
   spec: ClusterCachedKindSpec!
   """
   Beehive object conditions. **Empty in practice**: this kind's verdict is a gauge, not a
@@ -729,7 +745,7 @@ active cache. Only the universal identity is typed for now (`uid`/`apiVersion`/`
 `namespace`/`name`/`creationTimestamp`) — enough to key the watch, sort, and render a
 Name/Namespace/Age table. The nested object body (and kind-specific columns computed
 from it) is deferred to a follow-up: see the "ClusterCachedDataObject — native nested body"
-item in `TODO.md`. Distinct from `ClusterCachedDataEvent`, which is one specific kind with its
+item in `docs/TODO.md`. Distinct from `ClusterCachedDataEvent`, which is one specific kind with its
 own fully-typed shape.
 """
 type ClusterCachedDataObject {

@@ -97,7 +97,7 @@ connection, no identity-scoped work runs over it, and nothing rebuilds a connect
 credentials never changed. In practice the common causes of a swapped server (a `minikube
 delete`/`start`, a re-issued cluster) also rewrite the kubeconfig, so the fingerprint moves and
 the connection is replaced. The residual case is an endpoint re-pointed at a different cluster
-with the same credentials, which stalls until identity-driven retirement (`TODO.md`) acts on the
+with the same credentials, which stalls until identity-driven retirement (`docs/TODO.md`) acts on the
 recorded conflict.
 
 Retiring the connection is deliberately *not* done here. It belongs to the pool, and alone it

@@ -73,7 +73,7 @@ putting `raw_json` back on this one, which would silently restore the cost for e
 
 **A resync is cheap but still O(collection) in uids scanned.** Going to O(changes) means an
 append-only write log, which is a different order of work — see the `object_writes` item in
-`TODO.md`.
+`docs/TODO.md`.
 
 ## Revisit when
 

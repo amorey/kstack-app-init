@@ -104,15 +104,14 @@ type ClusterCachedKindStatus struct{}
 // served kind rather than one per cache and an unscoped stream of a hundred-plus records
 // would be a firehose.
 type ClusterCachedKind struct {
-	ID ClusterCachedKindID
+	// ID is the ClusterCachedKindID; see RecordMeta for the rest. Conditions there are
+	// empty in practice: a kind's verdict is a read-side gauge rather than a stored
+	// condition, so nothing writes one. → docs/adr/2026-08-28-records-as-timeline-anchors.md.
+	RecordMeta
 	// Owner is the ClusterCache this kind is mirrored into — the join key a client
 	// already holds from the cache stream.
 	Owner ObjectRef
 	Spec  ClusterCachedKindSpec
-	// Conditions are beehive object conditions, and empty in practice: a kind's verdict is
-	// a read-side gauge rather than a stored condition, so nothing writes one.
-	// → docs/adr/2026-08-28-records-as-timeline-anchors.md.
-	Conditions []Condition
 }
 
 // ClusterCachedKindWatchFrame is one frame on the cache-scoped per-kind sync watch.
@@ -137,10 +136,9 @@ func toClusterCachedKind(obj *beehive.Object[ClusterCachedKindSpec, ClusterCache
 		return nil, err
 	}
 	return &ClusterCachedKind{
-		ID:         ClusterCachedKindID(obj.ID),
+		RecordMeta: toRecordMeta(obj),
 		Owner:      owner,
 		Spec:       obj.Spec,
-		Conditions: obj.Conditions,
 	}, nil
 }
 
@@ -338,10 +336,10 @@ var kindWatch = deltaWatch[ClusterCachedKindSpec, ClusterCachedKindStatus, Clust
 		return ClusterCachedKindWatchFrame{Type: t, Kind: kind}, nil
 	},
 	departed: func(change beehive.ObjectChange[ClusterCachedKindSpec, ClusterCachedKindStatus]) ClusterCachedKindWatchFrame {
-		kind := &ClusterCachedKind{ID: ClusterCachedKindID(change.ID)}
+		kind := &ClusterCachedKind{RecordMeta: RecordMeta{ID: ObjectID(change.ID)}}
 		if obj := change.Object; obj != nil {
+			kind.RecordMeta = toRecordMeta(obj)
 			kind.Spec = obj.Spec
-			kind.Conditions = obj.Conditions
 		}
 		return ClusterCachedKindWatchFrame{Type: DeltaFrameDeleted, Kind: kind}
 	},

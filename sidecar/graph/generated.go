@@ -73,13 +73,16 @@ type ComplexityRoot struct {
 	}
 
 	ClusterCache struct {
-		CachedKinds func(childComplexity int) int
-		Conditions  func(childComplexity int) int
-		Events      func(childComplexity int, category *string, limit *int) int
-		ID          func(childComplexity int) int
-		Kinds       func(childComplexity int) int
-		Owner       func(childComplexity int) int
-		Spec        func(childComplexity int) int
+		CachedKinds         func(childComplexity int) int
+		Conditions          func(childComplexity int) int
+		CreatedAt           func(childComplexity int) int
+		DeletionRequestedAt func(childComplexity int) int
+		Events              func(childComplexity int, category *string, limit *int) int
+		Generation          func(childComplexity int) int
+		ID                  func(childComplexity int) int
+		Kinds               func(childComplexity int) int
+		Owner               func(childComplexity int) int
+		Spec                func(childComplexity int) int
 	}
 
 	ClusterCacheDiscoveryStatus struct {
@@ -188,11 +191,14 @@ type ComplexityRoot struct {
 	}
 
 	ClusterCachedKind struct {
-		Conditions func(childComplexity int) int
-		Events     func(childComplexity int, category *string, limit *int) int
-		ID         func(childComplexity int) int
-		Owner      func(childComplexity int) int
-		Spec       func(childComplexity int) int
+		Conditions          func(childComplexity int) int
+		CreatedAt           func(childComplexity int) int
+		DeletionRequestedAt func(childComplexity int) int
+		Events              func(childComplexity int, category *string, limit *int) int
+		Generation          func(childComplexity int) int
+		ID                  func(childComplexity int) int
+		Owner               func(childComplexity int) int
+		Spec                func(childComplexity int) int
 	}
 
 	ClusterCachedKindSpec struct {
@@ -534,6 +540,18 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCache.Conditions(childComplexity), true
+	case "ClusterCache.createdAt":
+		if e.ComplexityRoot.ClusterCache.CreatedAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.CreatedAt(childComplexity), true
+	case "ClusterCache.deletionRequestedAt":
+		if e.ComplexityRoot.ClusterCache.DeletionRequestedAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.DeletionRequestedAt(childComplexity), true
 	case "ClusterCache.events":
 		if e.ComplexityRoot.ClusterCache.Events == nil {
 			break
@@ -545,6 +563,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCache.Events(childComplexity, args["category"].(*string), args["limit"].(*int)), true
+	case "ClusterCache.generation":
+		if e.ComplexityRoot.ClusterCache.Generation == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCache.Generation(childComplexity), true
 	case "ClusterCache.id":
 		if e.ComplexityRoot.ClusterCache.ID == nil {
 			break
@@ -985,6 +1009,18 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCachedKind.Conditions(childComplexity), true
+	case "ClusterCachedKind.createdAt":
+		if e.ComplexityRoot.ClusterCachedKind.CreatedAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCachedKind.CreatedAt(childComplexity), true
+	case "ClusterCachedKind.deletionRequestedAt":
+		if e.ComplexityRoot.ClusterCachedKind.DeletionRequestedAt == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCachedKind.DeletionRequestedAt(childComplexity), true
 	case "ClusterCachedKind.events":
 		if e.ComplexityRoot.ClusterCachedKind.Events == nil {
 			break
@@ -996,6 +1032,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCachedKind.Events(childComplexity, args["category"].(*string), args["limit"].(*int)), true
+	case "ClusterCachedKind.generation":
+		if e.ComplexityRoot.ClusterCachedKind.Generation == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCachedKind.Generation(childComplexity), true
 	case "ClusterCachedKind.id":
 		if e.ComplexityRoot.ClusterCachedKind.ID == nil {
 			break
@@ -1879,6 +1921,12 @@ func (ec *executionContext) childFields_ClusterCache(ctx context.Context, field 
 		return ec.fieldContext_ClusterCache_id(ctx, field)
 	case "owner":
 		return ec.fieldContext_ClusterCache_owner(ctx, field)
+	case "generation":
+		return ec.fieldContext_ClusterCache_generation(ctx, field)
+	case "createdAt":
+		return ec.fieldContext_ClusterCache_createdAt(ctx, field)
+	case "deletionRequestedAt":
+		return ec.fieldContext_ClusterCache_deletionRequestedAt(ctx, field)
 	case "spec":
 		return ec.fieldContext_ClusterCache_spec(ctx, field)
 	case "conditions":
@@ -2109,6 +2157,12 @@ func (ec *executionContext) childFields_ClusterCachedKind(ctx context.Context, f
 		return ec.fieldContext_ClusterCachedKind_id(ctx, field)
 	case "owner":
 		return ec.fieldContext_ClusterCachedKind_owner(ctx, field)
+	case "generation":
+		return ec.fieldContext_ClusterCachedKind_generation(ctx, field)
+	case "createdAt":
+		return ec.fieldContext_ClusterCachedKind_createdAt(ctx, field)
+	case "deletionRequestedAt":
+		return ec.fieldContext_ClusterCachedKind_deletionRequestedAt(ctx, field)
 	case "spec":
 		return ec.fieldContext_ClusterCachedKind_spec(ctx, field)
 	case "conditions":
@@ -3437,6 +3491,75 @@ func (ec *executionContext) fieldContext_ClusterCache_owner(_ context.Context, f
 		},
 	}
 	return fc, nil
+}
+
+func (ec *executionContext) _ClusterCache_generation(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_generation(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Generation, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int64) graphql.Marshaler {
+			return ec.marshalNInt2int64(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_generation(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCache", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCache_createdAt(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_createdAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.CreatedAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalNTime2timeᚐTime(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_createdAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCache", field, false, false, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCache_deletionRequestedAt(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCache) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCache_deletionRequestedAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.DeletionRequestedAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
+			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCache_deletionRequestedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCache", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCache_spec(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCache) (ret graphql.Marshaler) {
@@ -5245,6 +5368,75 @@ func (ec *executionContext) fieldContext_ClusterCachedKind_owner(_ context.Conte
 		},
 	}
 	return fc, nil
+}
+
+func (ec *executionContext) _ClusterCachedKind_generation(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCachedKind_generation(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Generation, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int64) graphql.Marshaler {
+			return ec.marshalNInt2int64(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCachedKind_generation(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCachedKind", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCachedKind_createdAt(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCachedKind_createdAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.CreatedAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalNTime2timeᚐTime(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCachedKind_createdAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCachedKind", field, false, false, errors.New("field of type Time does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCachedKind_deletionRequestedAt(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedKind) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCachedKind_deletionRequestedAt(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.DeletionRequestedAt, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
+			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCachedKind_deletionRequestedAt(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCachedKind", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCachedKind_spec(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedKind) (ret graphql.Marshaler) {
@@ -9565,6 +9757,18 @@ func (ec *executionContext) _ClusterCache(ctx context.Context, sel ast.Selection
 			if out.Values[i] == graphql.Null {
 				atomic.AddUint32(&out.Invalids, 1)
 			}
+		case "generation":
+			out.Values[i] = ec._ClusterCache_generation(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "createdAt":
+			out.Values[i] = ec._ClusterCache_createdAt(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "deletionRequestedAt":
+			out.Values[i] = ec._ClusterCache_deletionRequestedAt(ctx, field, obj)
 		case "spec":
 			out.Values[i] = ec._ClusterCache_spec(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
@@ -10550,6 +10754,18 @@ func (ec *executionContext) _ClusterCachedKind(ctx context.Context, sel ast.Sele
 			if out.Values[i] == graphql.Null {
 				atomic.AddUint32(&out.Invalids, 1)
 			}
+		case "generation":
+			out.Values[i] = ec._ClusterCachedKind_generation(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "createdAt":
+			out.Values[i] = ec._ClusterCachedKind_createdAt(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				atomic.AddUint32(&out.Invalids, 1)
+			}
+		case "deletionRequestedAt":
+			out.Values[i] = ec._ClusterCachedKind_deletionRequestedAt(ctx, field, obj)
 		case "spec":
 			out.Values[i] = ec._ClusterCachedKind_spec(ctx, field, obj)
 			if out.Values[i] == graphql.Null {

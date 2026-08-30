@@ -66,13 +66,11 @@ type ClusterCacheStatus struct{}
 // Shaped like its sync siblings — {ID, Owner, Spec, Conditions} — with the stored spec
 // served as-is, no projection.
 type ClusterCache struct {
-	ID ClusterCacheID
+	// ID is the ClusterCacheID; see RecordMeta for the rest.
+	RecordMeta
 	// Owner is the Cluster this cache belongs to.
 	Owner ObjectRef
 	Spec  ClusterCacheSpec
-	// Conditions are beehive object conditions, not part of Status — read off the
-	// object rather than out of the status blob.
-	Conditions []Condition
 }
 
 // ClusterCacheWatchFrame is the ClusterCache-kind counterpart of ClusterWatchFrame, carried
@@ -218,10 +216,9 @@ func toClusterCache(obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (
 		return nil, err
 	}
 	return &ClusterCache{
-		ID:         ClusterCacheID(obj.ID),
+		RecordMeta: toRecordMeta(obj),
 		Owner:      owner,
 		Spec:       obj.Spec,
-		Conditions: obj.Conditions,
 	}, nil
 }
 
@@ -295,10 +292,10 @@ var cacheWatch = deltaWatch[ClusterCacheSpec, ClusterCacheStatus, ClusterCacheWa
 		return ClusterCacheWatchFrame{Type: t, Cache: cache}, nil
 	},
 	departed: func(change beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus]) ClusterCacheWatchFrame {
-		cache := &ClusterCache{ID: ClusterCacheID(change.ID)}
+		cache := &ClusterCache{RecordMeta: RecordMeta{ID: ObjectID(change.ID)}}
 		if obj := change.Object; obj != nil {
+			cache.RecordMeta = toRecordMeta(obj)
 			cache.Spec = obj.Spec
-			cache.Conditions = obj.Conditions
 		}
 		return ClusterCacheWatchFrame{Type: DeltaFrameDeleted, Cache: cache}
 	},

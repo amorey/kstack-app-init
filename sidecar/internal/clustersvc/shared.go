@@ -40,7 +40,7 @@ import (
 
 // ErrNotFound is the boundary's sentinel for an id that names no tracked record,
 // matched with errors.Is. Nothing in graph maps it to errors.ErrRecordNotFound yet, so
-// a mutation's failure still reaches the webview as an internal string — see TODO.md.
+// a mutation's failure still reaches the webview as an internal string — see docs/TODO.md.
 var ErrNotFound = errors.New("clustersvc: cluster not found")
 
 // ErrDeclaredBySource is the sentinel for deleting a record its source still declares,
@@ -48,14 +48,14 @@ var ErrNotFound = errors.New("clustersvc: cluster not found")
 // still lists would only re-import it under a fresh id — losing the user's toggles to
 // the new record's defaults, and every id a client was holding. Stop tracking such a
 // cluster at the source, or disable it. Unmapped on the wire, like ErrNotFound above —
-// see TODO.md.
+// see docs/TODO.md.
 var ErrDeclaredBySource = errors.New("clustersvc: cluster is still declared by its source")
 
 // ErrNotConnectable is the sentinel for a record that exists and will not be connected:
 // disabled, awaiting deletion, or from a source that carries no credentials. Told apart
 // from ErrNotFound because the remedy is the record's own state rather than a bad id — a
 // caller offers to enable the cluster instead of reporting it gone. Unmapped on the wire,
-// like the two above — see TODO.md.
+// like the two above — see docs/TODO.md.
 var ErrNotConnectable = errors.New("clustersvc: cluster cannot be connected")
 
 // --- Process-wide services ---
@@ -155,6 +155,35 @@ type ClusterCacheID = ObjectID
 
 // ClusterCachedKindID identifies one synced kind's ClusterCachedKind object.
 type ClusterCachedKindID = ObjectID
+
+// RecordMeta is the per-record metadata every served kind carries, embedded so a new
+// beehive metadata field is one edit rather than one per kind. Conditions sit here
+// too: beehive keeps them as object rows, not in the status blob, so every kind reads
+// them off the object the same way.
+//
+// The id is ObjectID rather than a per-kind alias — the aliases name the same type, so
+// one field serves them all and each kind's doc comment still says what it points at.
+//
+// Exported only so other packages can build a record literal; nothing outside this one
+// fills it from an object (toRecordMeta does that).
+type RecordMeta struct {
+	ID                  ObjectID
+	Generation          int64
+	CreatedAt           time.Time
+	DeletionRequestedAt *time.Time // beehive's soft-delete tombstone, surfaced as-is
+	Conditions          []Condition
+}
+
+// toRecordMeta projects the metadata half of any stored object.
+func toRecordMeta[Spec, Status any](obj *beehive.Object[Spec, Status]) RecordMeta {
+	return RecordMeta{
+		ID:                  ObjectID(obj.ID),
+		Generation:          obj.Generation,
+		CreatedAt:           obj.CreatedAt,
+		DeletionRequestedAt: obj.DeletionRequestedAt,
+		Conditions:          obj.Conditions,
+	}
+}
 
 // parseObjectID parses an ObjectID from its decimal-string wire form; a
 // malformed value is a client error surfaced through UnmarshalGQL.
