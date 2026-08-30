@@ -36,8 +36,6 @@ type Config = graphql.Config[ResolverRoot, DirectiveRoot, ComplexityRoot]
 type ResolverRoot interface {
 	Cluster() ClusterResolver
 	ClusterCache() ClusterCacheResolver
-	ClusterCachedDataEvent() ClusterCachedDataEventResolver
-	ClusterCachedDataObject() ClusterCachedDataObjectResolver
 	ClusterCachedKind() ClusterCachedKindResolver
 	ClusterCachedKindSpec() ClusterCachedKindSpecResolver
 	ClusterPrincipal() ClusterPrincipalResolver
@@ -379,13 +377,6 @@ type ClusterCacheResolver interface {
 	Kinds(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedDataKind, error)
 	CachedKinds(ctx context.Context, obj *clustersvc.ClusterCache) ([]*clustersvc.ClusterCachedKind, error)
 	Events(ctx context.Context, obj *clustersvc.ClusterCache, category *string, limit *int) ([]*clustersvc.Event, error)
-}
-type ClusterCachedDataEventResolver interface {
-	FirstSeen(ctx context.Context, obj *clustersvc.ClusterCachedDataEvent) (*time.Time, error)
-	LastSeen(ctx context.Context, obj *clustersvc.ClusterCachedDataEvent) (*time.Time, error)
-}
-type ClusterCachedDataObjectResolver interface {
-	CreationTimestamp(ctx context.Context, obj *clustersvc.ClusterCachedDataObject) (*time.Time, error)
 }
 type ClusterCachedKindResolver interface {
 	Events(ctx context.Context, obj *clustersvc.ClusterCachedKind, category *string, limit *int) ([]*clustersvc.Event, error)
@@ -4726,18 +4717,18 @@ func (ec *executionContext) _ClusterCachedDataEvent_firstSeen(ctx context.Contex
 			return ec.fieldContext_ClusterCachedDataEvent_firstSeen(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
-			return ec.Resolvers.ClusterCachedDataEvent().FirstSeen(ctx, obj)
+			return obj.FirstSeen, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
-			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalOTime2timeᚐTime(ctx, selections, v)
 		},
 		true,
 		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCachedDataEvent_firstSeen(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedDataEvent", field, true, true, errors.New("field of type Time does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterCachedDataEvent", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCachedDataEvent_lastSeen(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedDataEvent) (ret graphql.Marshaler) {
@@ -4749,18 +4740,18 @@ func (ec *executionContext) _ClusterCachedDataEvent_lastSeen(ctx context.Context
 			return ec.fieldContext_ClusterCachedDataEvent_lastSeen(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
-			return ec.Resolvers.ClusterCachedDataEvent().LastSeen(ctx, obj)
+			return obj.LastSeen, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
-			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalOTime2timeᚐTime(ctx, selections, v)
 		},
 		true,
 		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCachedDataEvent_lastSeen(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedDataEvent", field, true, true, errors.New("field of type Time does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterCachedDataEvent", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCachedDataEvent_involvedKind(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedDataEvent) (ret graphql.Marshaler) {
@@ -5250,18 +5241,18 @@ func (ec *executionContext) _ClusterCachedDataObject_creationTimestamp(ctx conte
 			return ec.fieldContext_ClusterCachedDataObject_creationTimestamp(ctx, field)
 		},
 		func(ctx context.Context) (any, error) {
-			return ec.Resolvers.ClusterCachedDataObject().CreationTimestamp(ctx, obj)
+			return obj.CreationTimestamp, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *time.Time) graphql.Marshaler {
-			return ec.marshalOTime2ᚖtimeᚐTime(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v time.Time) graphql.Marshaler {
+			return ec.marshalOTime2timeᚐTime(ctx, selections, v)
 		},
 		true,
 		false,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCachedDataObject_creationTimestamp(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterCachedDataObject", field, true, true, errors.New("field of type Time does not have child fields"))
+	return graphql.NewScalarFieldContext("ClusterCachedDataObject", field, false, false, errors.New("field of type Time does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterCachedDataObject_rawJSON(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCachedDataObject) (ret graphql.Marshaler) {
@@ -10412,108 +10403,46 @@ func (ec *executionContext) _ClusterCachedDataEvent(ctx context.Context, sel ast
 		case "uid":
 			out.Values[i] = ec._ClusterCachedDataEvent_uid(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "type":
 			out.Values[i] = ec._ClusterCachedDataEvent_type(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "reason":
 			out.Values[i] = ec._ClusterCachedDataEvent_reason(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "message":
 			out.Values[i] = ec._ClusterCachedDataEvent_message(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "count":
 			out.Values[i] = ec._ClusterCachedDataEvent_count(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "firstSeen":
-			field := field
-
-			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
-				defer func() {
-					if r := recover(); r != nil {
-						ec.Error(ctx, ec.Recover(ctx, r))
-					}
-				}()
-				res = ec._ClusterCachedDataEvent_firstSeen(ctx, field, obj)
-				return res
-			}
-
-			if field.Deferrable != nil {
-				dfs, ok := deferred[field.Deferrable.Label]
-				di := 0
-				if ok {
-					dfs.AddField(field)
-					di = len(dfs.Values) - 1
-				} else {
-					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
-					deferred[field.Deferrable.Label] = dfs
-				}
-				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
-					return innerFunc(ctx, dfs)
-				})
-
-				// don't run the out.Concurrently() call below
-				out.Values[i] = graphql.Null
-				continue
-			}
-
-			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+			out.Values[i] = ec._ClusterCachedDataEvent_firstSeen(ctx, field, obj)
 		case "lastSeen":
-			field := field
-
-			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
-				defer func() {
-					if r := recover(); r != nil {
-						ec.Error(ctx, ec.Recover(ctx, r))
-					}
-				}()
-				res = ec._ClusterCachedDataEvent_lastSeen(ctx, field, obj)
-				return res
-			}
-
-			if field.Deferrable != nil {
-				dfs, ok := deferred[field.Deferrable.Label]
-				di := 0
-				if ok {
-					dfs.AddField(field)
-					di = len(dfs.Values) - 1
-				} else {
-					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
-					deferred[field.Deferrable.Label] = dfs
-				}
-				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
-					return innerFunc(ctx, dfs)
-				})
-
-				// don't run the out.Concurrently() call below
-				out.Values[i] = graphql.Null
-				continue
-			}
-
-			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+			out.Values[i] = ec._ClusterCachedDataEvent_lastSeen(ctx, field, obj)
 		case "involvedKind":
 			out.Values[i] = ec._ClusterCachedDataEvent_involvedKind(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "involvedNamespace":
 			out.Values[i] = ec._ClusterCachedDataEvent_involvedNamespace(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "involvedName":
 			out.Values[i] = ec._ClusterCachedDataEvent_involvedName(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
@@ -10708,61 +10637,30 @@ func (ec *executionContext) _ClusterCachedDataObject(ctx context.Context, sel as
 		case "uid":
 			out.Values[i] = ec._ClusterCachedDataObject_uid(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "apiVersion":
 			out.Values[i] = ec._ClusterCachedDataObject_apiVersion(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "kind":
 			out.Values[i] = ec._ClusterCachedDataObject_kind(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "namespace":
 			out.Values[i] = ec._ClusterCachedDataObject_namespace(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "name":
 			out.Values[i] = ec._ClusterCachedDataObject_name(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
-				atomic.AddUint32(&out.Invalids, 1)
+				out.Invalids++
 			}
 		case "creationTimestamp":
-			field := field
-
-			innerFunc := func(ctx context.Context, _ *graphql.FieldSet) (res graphql.Marshaler) {
-				defer func() {
-					if r := recover(); r != nil {
-						ec.Error(ctx, ec.Recover(ctx, r))
-					}
-				}()
-				res = ec._ClusterCachedDataObject_creationTimestamp(ctx, field, obj)
-				return res
-			}
-
-			if field.Deferrable != nil {
-				dfs, ok := deferred[field.Deferrable.Label]
-				di := 0
-				if ok {
-					dfs.AddField(field)
-					di = len(dfs.Values) - 1
-				} else {
-					dfs = graphql.NewFieldSet([]graphql.CollectedField{field})
-					deferred[field.Deferrable.Label] = dfs
-				}
-				dfs.Concurrently(di, func(ctx context.Context) graphql.Marshaler {
-					return innerFunc(ctx, dfs)
-				})
-
-				// don't run the out.Concurrently() call below
-				out.Values[i] = graphql.Null
-				continue
-			}
-
-			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+			out.Values[i] = ec._ClusterCachedDataObject_creationTimestamp(ctx, field, obj)
 		case "rawJSON":
 			out.Values[i] = ec._ClusterCachedDataObject_rawJSON(ctx, field, obj)
 		default:
@@ -13694,6 +13592,18 @@ func (ec *executionContext) marshalOString2ᚖstring(ctx context.Context, sel as
 	_ = sel
 	_ = ctx
 	res := graphql.MarshalString(*v)
+	return res
+}
+
+func (ec *executionContext) unmarshalOTime2timeᚐTime(ctx context.Context, v any) (time.Time, error) {
+	res, err := graphql.UnmarshalTime(v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalOTime2timeᚐTime(ctx context.Context, sel ast.SelectionSet, v time.Time) graphql.Marshaler {
+	_ = sel
+	_ = ctx
+	res := graphql.MarshalTime(v)
 	return res
 }
 

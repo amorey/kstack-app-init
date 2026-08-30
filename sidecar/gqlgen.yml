@@ -174,29 +174,20 @@ models:
   ClusterCachedDataKindWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataKindWatchFrame
 
+  # firstSeen/lastSeen autobind to value time.Time fields: gqlgen's Time marshaler emits null
+  # for the zero time, which is exactly the wire's meaning of an absent timestamp.
   ClusterCachedDataEvent:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataEvent
-    # The record carries value time.Time (must stay comparable for the delta-watch diff),
-    # so resolvers map the zero time to null instead of serializing 0001-01-01.
-    fields:
-      firstSeen:
-        resolver: true
-      lastSeen:
-        resolver: true
 
   ClusterCachedDataEventWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataEventWatchFrame
 
+  # creationTimestamp autobinds like the event timestamps above. rawJSON autobinds to the
+  # RawJSON field too: the body is already read by the time the record exists — the watch
+  # fetches one per frame it sends — so gating its marshal behind a resolver would defer
+  # nothing.
   ClusterCachedDataObject:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataObject
-    # The record carries value time.Time (parallel to ClusterCachedDataEvent), so the resolver
-    # maps the zero creationTimestamp to null instead of serializing 0001-01-01. rawJSON
-    # autobinds to the RawJSON field (no resolver): the body is already read by the time the
-    # record exists — the watch fetches one per frame it sends — so gating its marshal behind
-    # a resolver would defer nothing.
-    fields:
-      creationTimestamp:
-        resolver: true
 
   ClusterCachedDataObjectWatchFrame:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterCachedDataObjectWatchFrame

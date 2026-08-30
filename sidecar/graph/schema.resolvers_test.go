@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"github.com/amorey/beehive"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // --- Cluster ---
@@ -1259,4 +1261,26 @@ func TestClusterCacheSyncStatusWatchServesEveryKind(t *testing.T) {
 			t.Fatal("timed out waiting for a sync status frame")
 		}
 	}
+}
+
+// A timestamp the source object never carried serializes as null, not as 0001-01-01. The records
+// keep a value time.Time — the delta-watch diff compares frames with ==, so they must stay
+// comparable — and this is the wire's whole answer for "absent".
+func TestAnAbsentTimestampSerializesAsNull(t *testing.T) {
+	seen := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	svc := newFakeClusterService(clusterFixtures())
+	svc.dataEvents = map[clustersvc.ClusterID][]clustersvc.ClusterCachedDataEvent{
+		1: {{UID: "e-1", LastSeen: seen}},
+	}
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{ClusterSvc: svc, Auth: newFakeAuth(auth.Identity{})}))
+	t.Cleanup(srv.Close)
+
+	resp := openSSESubscription(t, srv.URL, "",
+		`subscription { clusterCachedDataEventsWatch(id: "1", cacheID: "1") { event { firstSeen lastSeen } } }`)
+	defer resp.Body.Close()
+
+	frame := testutil.Recv(t, sseEvents(t, resp), "the first frame")
+
+	assert.Contains(t, frame.data, `"firstSeen":null`)
+	assert.Contains(t, frame.data, `"lastSeen":"2026-08-30T12:00:00Z"`)
 }

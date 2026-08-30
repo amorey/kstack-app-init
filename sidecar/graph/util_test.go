@@ -4,9 +4,7 @@ import (
 	"context"
 	"strconv"
 	"testing"
-	"time"
 
-	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
@@ -65,34 +63,4 @@ func TestMapStreamStopsOnContextCancelDuringSend(t *testing.T) {
 	// Drain whatever arrives; the stream must end (channel close) either way.
 	testutil.WaitClosed(t, out, "the output channel")
 	testutil.RecvClosed(t, unsubbed, "the unsub channel")
-}
-
-// The event-timestamp resolvers map Go's zero time (a source Event with no timestamp)
-// to null on the wire rather than serializing 0001-01-01, while a real timestamp passes
-// through as a pointer. The record keeps value time.Time (comparable for the delta-watch
-// diff), so this resolver mapping is where absence becomes null.
-func TestClusterCachedDataEventTimestampResolversMapZeroToNil(t *testing.T) {
-	ctx := context.Background()
-	r := &clusterCachedDataEventResolver{&Resolver{}}
-	ts := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
-
-	// A real timestamp resolves to a non-nil pointer to that time.
-	present := &clustersvc.ClusterCachedDataEvent{FirstSeen: ts, LastSeen: ts}
-	first, err := r.FirstSeen(ctx, present)
-	if err != nil || first == nil || !first.Equal(ts) {
-		t.Fatalf("FirstSeen(present) = %v, %v; want %v", first, err, ts)
-	}
-	last, err := r.LastSeen(ctx, present)
-	if err != nil || last == nil || !last.Equal(ts) {
-		t.Fatalf("LastSeen(present) = %v, %v; want %v", last, err, ts)
-	}
-
-	// The zero time (no source timestamp) resolves to nil → null on the wire.
-	absent := &clustersvc.ClusterCachedDataEvent{}
-	if got, err := r.FirstSeen(ctx, absent); err != nil || got != nil {
-		t.Fatalf("FirstSeen(absent) = %v, %v; want nil", got, err)
-	}
-	if got, err := r.LastSeen(ctx, absent); err != nil || got != nil {
-		t.Fatalf("LastSeen(absent) = %v, %v; want nil", got, err)
-	}
 }

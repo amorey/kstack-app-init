@@ -2,18 +2,7 @@ package graph
 
 import (
 	"context"
-	"time"
 )
-
-// nilIfZeroTime is the value→nullable mapping the cluster-data field resolvers share:
-// their domain types keep a value time.Time (comparable, as the delta-watch diff
-// requires) but must serialize an absent timestamp as null, not 0001-01-01.
-func nilIfZeroTime(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	return &t
-}
 
 // mapStream maps a latest-value source onto the returned channel until ctx ends or sub
 // closes. No separate snapshot: the source is current-on-subscribe, so its first value IS

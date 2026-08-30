@@ -8,7 +8,6 @@ package graph
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/kubetail-org/kstack-app/sidecar/graph/model"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
@@ -55,21 +54,6 @@ func (r *clusterCacheResolver) Events(ctx context.Context, obj *clustersvc.Clust
 		return nil, err
 	}
 	return ptrSlice(evs), nil
-}
-
-// FirstSeen is the resolver for the firstSeen field — see nilIfZeroTime.
-func (r *clusterCachedDataEventResolver) FirstSeen(ctx context.Context, obj *clustersvc.ClusterCachedDataEvent) (*time.Time, error) {
-	return nilIfZeroTime(obj.FirstSeen), nil
-}
-
-// LastSeen is the resolver for the lastSeen field — see nilIfZeroTime.
-func (r *clusterCachedDataEventResolver) LastSeen(ctx context.Context, obj *clustersvc.ClusterCachedDataEvent) (*time.Time, error) {
-	return nilIfZeroTime(obj.LastSeen), nil
-}
-
-// CreationTimestamp is the resolver for the creationTimestamp field — see nilIfZeroTime.
-func (r *clusterCachedDataObjectResolver) CreationTimestamp(ctx context.Context, obj *clustersvc.ClusterCachedDataObject) (*time.Time, error) {
-	return nilIfZeroTime(obj.CreationTimestamp), nil
 }
 
 // Events is the resolver for the events field — this kind's sync-transition
@@ -348,16 +332,6 @@ func (r *Resolver) Cluster() ClusterResolver { return &clusterResolver{r} }
 // ClusterCache returns ClusterCacheResolver implementation.
 func (r *Resolver) ClusterCache() ClusterCacheResolver { return &clusterCacheResolver{r} }
 
-// ClusterCachedDataEvent returns ClusterCachedDataEventResolver implementation.
-func (r *Resolver) ClusterCachedDataEvent() ClusterCachedDataEventResolver {
-	return &clusterCachedDataEventResolver{r}
-}
-
-// ClusterCachedDataObject returns ClusterCachedDataObjectResolver implementation.
-func (r *Resolver) ClusterCachedDataObject() ClusterCachedDataObjectResolver {
-	return &clusterCachedDataObjectResolver{r}
-}
-
 // ClusterCachedKind returns ClusterCachedKindResolver implementation.
 func (r *Resolver) ClusterCachedKind() ClusterCachedKindResolver {
 	return &clusterCachedKindResolver{r}
@@ -382,8 +356,6 @@ func (r *Resolver) Subscription() SubscriptionResolver { return &subscriptionRes
 
 type clusterResolver struct{ *Resolver }
 type clusterCacheResolver struct{ *Resolver }
-type clusterCachedDataEventResolver struct{ *Resolver }
-type clusterCachedDataObjectResolver struct{ *Resolver }
 type clusterCachedKindResolver struct{ *Resolver }
 type clusterCachedKindSpecResolver struct{ *Resolver }
 type clusterPrincipalResolver struct{ *Resolver }
