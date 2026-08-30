@@ -59,9 +59,14 @@ func TestASweepKeepsOnlyWhatAKindSyncCanMirror(t *testing.T) {
 		listable("Pod", "pods/log", true),
 		// A create-only kind is a sync that can only fail.
 		metav1.APIResource{Kind: "TokenReview", Name: "tokenreviews", Verbs: metav1.Verbs{"create"}},
-		listable("Event", "events", true))
+		listable("Event", "events", true),
+		// notMirrored: EndpointSlice already carries the same state.
+		listable("Endpoints", "endpoints", true))
 	// One store backs both spellings of Event, and v1/events is the one that is synced.
 	cluster.serve("events.k8s.io/v1", listable("Event", "events", true))
+	// notMirrored: renewed every few seconds, and answers nothing a holder's status does not.
+	cluster.group("coordination.k8s.io", "coordination.k8s.io/v1")
+	cluster.serve("coordination.k8s.io/v1", listable("Lease", "leases", true))
 	// Every served version mirrors the same objects again, so only the preferred one is kept.
 	cluster.group("apps", "apps/v1", "apps/v1beta1")
 	cluster.serve("apps/v1", listable("Deployment", "deployments", true))
@@ -144,7 +149,7 @@ func TestACatalogThatMovedIsAnnouncedWithItsReasonUnmoved(t *testing.T) {
 
 	// Two sweeps both settling on Discovered with a kind appearing between them: a
 	// reason-only feed would leave the new kind unmirrored until something unrelated moved.
-	cluster.serve("v1", listable("Pod", "pods", true), listable("Secret", "secrets", true))
+	cluster.serve("v1", listable("Pod", "pods", true), listable("ConfigMap", "configmaps", true))
 	svc.RestartAll()
 	testutil.Recv(t, news.Chan(), "the cache is woken for the kind that appeared")
 

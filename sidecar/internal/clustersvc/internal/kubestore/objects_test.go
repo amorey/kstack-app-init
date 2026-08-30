@@ -116,6 +116,58 @@ func TestProjectRedactsOnlyCoreSecrets(t *testing.T) {
 	assert.Equal(t, map[string]any{"password": "kept"}, body(t, row)["data"])
 }
 
+// A CRD that inlines a credential rather than referencing one is redacted at the path its
+// own schema names, and the rest of the body is left intact.
+func TestProjectRedactsInlineCRDCredentials(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+		"metadata": map[string]any{"uid": "uid-1", "name": "tls"},
+		"spec": map[string]any{
+			"dnsNames":  []any{"api.example.com"},
+			"keystores": map[string]any{"jks": map[string]any{"create": true, "password": "hunter2"}},
+		},
+	})
+
+	row, err := projectObject(u)
+
+	require.NoError(t, err)
+	jks := body(t, row)["spec"].(map[string]any)["keystores"].(map[string]any)["jks"].(map[string]any)
+	assert.Equal(t, redactedValue, jks["password"])
+	assert.Equal(t, true, jks["create"], "the rest of the body survives")
+}
+
+// A map-valued entry keeps its keys, so a reader can still list what the object holds.
+func TestProjectRedactsCRDCredentialMapValuesKeepingKeys(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "grafana.integreatly.org/v1beta1", "kind": "GrafanaDatasource",
+		"metadata": map[string]any{"uid": "uid-1", "name": "prom"},
+		"spec": map[string]any{"datasource": map[string]any{
+			"jsonData":       map[string]any{"timeInterval": "5s"},
+			"secureJsonData": map[string]any{"basicAuthPassword": "hunter2"},
+		}},
+	})
+
+	row, err := projectObject(u)
+
+	require.NoError(t, err)
+	ds := body(t, row)["spec"].(map[string]any)["datasource"].(map[string]any)
+	assert.Equal(t, map[string]any{"basicAuthPassword": redactedValue}, ds["secureJsonData"])
+	assert.Equal(t, map[string]any{"timeInterval": "5s"}, ds["jsonData"], "configuration is not a credential")
+}
+
+// A redaction whose path the body does not carry is a no-op, not an invented field.
+func TestSanitizeLeavesABodyMissingARedactedPath(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+		"metadata": map[string]any{"uid": "uid-1", "name": "tls"},
+		"spec":     map[string]any{"dnsNames": []any{"api.example.com"}},
+	})
+
+	got := sanitize(u)
+
+	assert.NotContains(t, got.Object["spec"], "keystores")
+}
+
 func TestProjectKeepsOnlyOwnerRefsThatCarryAUID(t *testing.T) {
 	yes := true
 	u := obj(map[string]any{

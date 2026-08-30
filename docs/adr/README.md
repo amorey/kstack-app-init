@@ -99,3 +99,4 @@ usually just documentation in the wrong place.
 | 2026-08-28 | [A record anchors a timeline; it does not mirror a status](2026-08-28-records-as-timeline-anchors.md) | sidecar | Accepted |
 | 2026-08-29 | [The objects watch reads identity, and fetches a body only for the rows it sends](2026-08-29-object-read-split.md) | sidecar | Accepted |
 | 2026-08-29 | [The all-key tables lose their rowid, by editing the initial schema rather than migrating](2026-08-29-schema-edit-not-migration.md) | sidecar | Accepted |
+| 2026-08-30 | [Redact credentials on the way into the cache, and never store a function of a secret](2026-08-30-secret-redaction-at-write-time.md) | sidecar | Accepted |

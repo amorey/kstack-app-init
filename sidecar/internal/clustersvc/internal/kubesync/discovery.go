@@ -80,9 +80,25 @@ const (
 	apiServiceResource   = "apiservices"
 )
 
-// eventsAPIGroup is the spelling of Event that is not synced: one store backs both, and
-// v1/events is the canonical one.
-const eventsAPIGroup = "events.k8s.io"
+// notMirrored names the kinds a sweep drops on purpose, keyed by api group — empty for the
+// core group — and plural. Each costs a standing watch and a share of the cache file and
+// earns nothing back:
+//
+//   - events.k8s.io/events duplicates v1/events, which is the spelling that is synced. One
+//     store backs both, so mirroring each would write every event twice.
+//   - v1/endpoints duplicates discovery.k8s.io/v1 EndpointSlice, and pod readiness rewrites
+//     it continuously — two copies of one answer, at the churn of the noisier copy.
+//   - coordination.k8s.io/leases is renewed every few seconds by every node and every
+//     leader-electing controller, and answers nothing the holder's own status does not.
+//
+// Sensitivity is not a reason to be here: a Secret is mirrored, with its values redacted at
+// write time (kubestore's sanitize). A dropped kind is invisible, not deferred — there is no
+// other read path to a cluster object.
+var notMirrored = map[[2]string]bool{
+	{"events.k8s.io", "events"}:       true,
+	{"", "endpoints"}:                 true,
+	{"coordination.k8s.io", "leases"}: true,
+}
 
 // registerProbes wires the sweep. Kept side by side on purpose — the set's rules are
 // checked by eye.
@@ -295,7 +311,8 @@ func sweepResources(ctx context.Context, conn *kubeconn.Connection, gvs []string
 }
 
 // mirrorable is the three filters a row must pass on top of the preferred-version one the
-// group list already applied. A kind that gets through is one a sync can actually mirror.
+// group list already applied. A kind that gets through is one a sync can actually mirror
+// and that is worth mirroring.
 func mirrorable(gv string, r metav1.APIResource) bool {
 	switch {
 	case strings.Contains(r.Name, "/"):
@@ -305,9 +322,7 @@ func mirrorable(gv string, r metav1.APIResource) bool {
 		// A create-only kind — tokenreviews, subjectaccessreviews, bindings — is a sync
 		// that can only fail.
 		return false
-	case groupOf(gv) == eventsAPIGroup && r.Name == "events":
-		// The server serves the same events under two spellings backed by one store, so
-		// exactly one may be synced.
+	case notMirrored[[2]string{groupOf(gv), r.Name}]:
 		return false
 	}
 	return true

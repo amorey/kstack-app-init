@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -27,8 +28,8 @@ import (
 // land it. Every statement is kind-scoped — the table is shared by every kind a cache
 // mirrors, and concurrent workers touch disjoint rows.
 
-// redactedValue replaces every Secret data value at write time; keys are kept so a UI
-// can list what a Secret holds.
+// redactedValue replaces a credential at write time, so the cache file never holds one.
+// What it replaces is named by the redactions table below.
 const redactedValue = "[redacted]"
 
 // objectRow is one row of the objects table, flattened from an object body.
@@ -116,31 +117,93 @@ func sanitize(u *unstructured.Unstructured) *unstructured.Unstructured {
 	if ann, ok, _ := unstructured.NestedMap(out.Object, "metadata", "annotations"); ok && len(ann) == 0 {
 		unstructured.RemoveNestedField(out.Object, "metadata", "annotations")
 	}
-	if isSecret(out) {
-		redactSecret(out)
+	for _, r := range redactionsFor(out) {
+		redact(out, r)
 	}
 	return out
 }
 
-// isSecret reads the BODY's own kind, not the worker's configured one, so redaction
-// cannot be bypassed by how the object was addressed.
-func isSecret(u *unstructured.Unstructured) bool {
-	return u.GetKind() == "Secret" && u.GetAPIVersion() == "v1"
+// How one redaction treats the field it names.
+const (
+	// redactValue replaces a scalar, keeping the field so a reader sees it was set.
+	redactValue = iota
+	// redactMapValues replaces every value in a map, keeping the keys so a reader can
+	// list what the object holds without seeing any of it.
+	redactMapValues
+	// dropField removes the field outright, for one the stored object should not claim
+	// to carry at all.
+	dropField
+)
+
+// redaction is one path into a body and what to do at the end of it.
+type redaction struct {
+	path []string
+	mode int
 }
 
-// redactSecret strips a Secret's values, keeping its keys, so the cache file never
-// holds the cluster's credentials. stringData is write-only server-side, so it is
-// dropped.
-func redactSecret(u *unstructured.Unstructured) {
-	unstructured.RemoveNestedField(u.Object, "stringData")
-	data, ok, _ := unstructured.NestedMap(u.Object, "data")
-	if !ok {
-		return
+// redactions names every field a mirrored body carries in the clear, keyed by api group —
+// empty for the core group — and Kind. A path that is absent costs nothing, so an entry is
+// cheap; what it must be is CORRECT, since redacting a field that merely sounds sensitive
+// throws away the diagnostic value the mirror exists for.
+//
+// **This table is necessarily incomplete, and is not the only defence.** Most operators
+// reference credentials rather than inlining them (a `secretRef`, a `key`/`name` selector),
+// and those need no entry — but a long tail offers an inline value beside the reference, and
+// no table enumerates every operator. Add an entry when a real one turns up; the shape of
+// the cache does not depend on this list being exhaustive.
+//
+// Every entry below was read off the CRD's own schema, not inferred from the field's name.
+var redactions = map[[2]string][]redaction{
+	{"", "Secret"}: {
+		{path: []string{"data"}, mode: redactMapValues},
+		// Write-only server-side: a stored object claiming to hold it would be a lie.
+		{path: []string{"stringData"}, mode: dropField},
+	},
+	{"cert-manager.io", "Certificate"}: {
+		// "Password provides a literal password", the alternative to passwordSecretRef.
+		{path: []string{"spec", "keystores", "jks", "password"}, mode: redactValue},
+		{path: []string{"spec", "keystores", "pkcs12", "password"}, mode: redactValue},
+	},
+	{"grafana.integreatly.org", "GrafanaDatasource"}: {
+		// Grafana's own split: jsonData is configuration, secureJsonData the credentials.
+		{path: []string{"spec", "datasource", "secureJsonData"}, mode: redactMapValues},
+	},
+	{"grafana.integreatly.org", "GrafanaDashboard"}: {
+		{path: []string{"spec", "publicSharing", "accessToken"}, mode: redactValue},
+	},
+}
+
+// redactionsFor reads the BODY's own group and kind, not the worker's configured ones, so
+// redaction cannot be bypassed by how the object was addressed.
+func redactionsFor(u *unstructured.Unstructured) []redaction {
+	group, _, _ := strings.Cut(u.GetAPIVersion(), "/")
+	if u.GetAPIVersion() == group {
+		group = "" // an unslashed apiVersion is the core group
 	}
-	for k := range data {
-		data[k] = redactedValue
+	return redactions[[2]string{group, u.GetKind()}]
+}
+
+// redact applies one entry. A path that is missing, or whose value is not the shape the
+// schema promises, leaves the body alone rather than panicking on it — an unreadable shape
+// must not become a way to skip the redaction of a readable one.
+func redact(u *unstructured.Unstructured, r redaction) {
+	switch r.mode {
+	case dropField:
+		unstructured.RemoveNestedField(u.Object, r.path...)
+	case redactValue:
+		if _, ok, _ := unstructured.NestedString(u.Object, r.path...); ok {
+			_ = unstructured.SetNestedField(u.Object, redactedValue, r.path...)
+		}
+	case redactMapValues:
+		m, ok, _ := unstructured.NestedMap(u.Object, r.path...)
+		if !ok {
+			return
+		}
+		for k := range m {
+			m[k] = redactedValue
+		}
+		_ = unstructured.SetNestedMap(u.Object, m, r.path...)
 	}
-	_ = unstructured.SetNestedMap(u.Object, data, "data")
 }
 
 // insertObjectRow upserts one object and rewrites its edges — the chokepoint both the

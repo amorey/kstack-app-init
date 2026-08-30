@@ -171,8 +171,15 @@ its write path:
   holds, for events as for every other kind, and `Store.Events` serves all of it newest-first. A
   row leaves only when the server says it did.
 - **Object bodies are sanitized on the way in** — `managedFields` and the kubectl last-applied
-  annotation stripped, Secret values redacted (by the *body's* own kind, so how a collection was
-  addressed cannot bypass it) — which is what lets a read serve `raw_json` verbatim.
+  annotation stripped, credentials redacted — which is what lets a read serve `raw_json` verbatim.
+  What gets redacted is the `redactions` table, keyed by **(api group, Kind)** with explicit paths
+  and a mode (replace a scalar, replace a map's values keeping its keys, drop the field); `v1/Secret`
+  is an ordinary entry in it. **The lookup reads the *body's* own apiVersion and kind**, so how a
+  collection was addressed cannot bypass it. Add an entry only against a CRD's published schema —
+  most operators reference credentials and need none, and redacting a field that merely sounds
+  sensitive throws away the diagnostic value the mirror exists for. **Nothing derived from a secret
+  value is ever stored** (no hash, no length): "did it change" is `resource_version`.
+  → [ADR: secret redaction at write time](../docs/adr/2026-08-30-secret-redaction-at-write-time.md).
 - **A collection is bound as one JSON argument, never as a run of placeholders.** The edge tables
   (`owner_refs`, `labels`) take one `INSERT … SELECT … FROM json_each(?) WHERE true` per object,
   so the text is the same whatever the object carries — modernc caches no compiled statement, so
@@ -1042,7 +1049,12 @@ package's vocabulary rather than the supervisor's.
   prune flag is part of it**: a partial answer and a complete one over identical rows are different
   writes.
 - **Four filters, none optional** — preferred version only, `list` and `watch` in the verbs, no `/`
-  in the plural, and not the `events.k8s.io` spelling of Event.
+  in the plural, and not in `notMirrored`. That last is an explicit (group, plural) table of kinds
+  dropped on purpose: `events.k8s.io/events` (v1/events is the synced spelling), `v1/endpoints`
+  (EndpointSlice carries the same state at less churn), and `coordination.k8s.io/leases` (renewed
+  every few seconds, diagnostic of nothing). Sensitivity is not what earns a place there — a Secret
+  is mirrored, redacted on the way in. **A dropped kind is invisible**, since no read path reaches a
+  cluster object except the mirror, so the bar is "answers no question", not "is expensive".
 - **A group that will not answer is `Partial`, and blocks the prune.** Its kinds report their
   own verdicts, so a broken aggregated API shows up twice and correctly. `Partial` is the one
   verdict a `supervisor.Result` cannot carry (`Succeeded` takes no reason, and both neighbours misprice
