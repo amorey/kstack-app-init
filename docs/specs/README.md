@@ -38,3 +38,4 @@ dependency, so it can be built out of turn at a cost you can read off its header
 | Spec | Scope | Status |
 | --- | --- | --- |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
+| [Retry resolves with its probe](retry-resolves-with-its-probe.md) | sidecar + frontend | Planned |
