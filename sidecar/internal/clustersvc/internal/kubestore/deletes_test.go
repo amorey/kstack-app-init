@@ -220,3 +220,38 @@ func TestAnUnreadableTrimMarkIsAnError(t *testing.T) {
 
 	assert.Error(t, err)
 }
+
+// The trim is one transaction over two statements, and either half failing has to be
+// reported: the janitor logs it and the next sweep retries, where a silent failure would
+// leave the log growing and the marks describing a trim that never happened.
+func TestTrimDeletesReportsWhatItCouldNotDo(t *testing.T) {
+	t.Run("the transaction it could not open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := trimDeletes(ctx, openFileOf(t, newTestStore(t)), 0)
+
+		assert.Error(t, err)
+	})
+
+	t.Run("the marks it could not write", func(t *testing.T) {
+		s := newTestStore(t)
+		dropTable(t, s, "cluster_meta")
+
+		err := trimDeletes(context.Background(), openFileOf(t, s), 0)
+
+		assert.Error(t, err)
+	})
+
+	t.Run("the entries it could not remove", func(t *testing.T) {
+		s := newTestStore(t)
+		// A view reads for the marks and refuses the delete, so the trim fails with its
+		// marks already written — the half the raise-only rule has to survive.
+		swapTable(t, s, "deletes",
+			`SELECT 1 AS seq, 'v1' AS api_version, 'Pod' AS kind, 'uid-1' AS uid, 0 AS at`)
+
+		err := trimDeletes(context.Background(), openFileOf(t, s), 1)
+
+		assert.Error(t, err)
+	})
+}

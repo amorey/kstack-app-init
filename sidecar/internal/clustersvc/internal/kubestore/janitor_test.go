@@ -292,3 +292,15 @@ func TestASweepNeverLowersAKindsMark(t *testing.T) {
 	assert.Equal(t, int64(200), trimmedMark(t, store, "Pod"), "the older entry's lower position")
 	assert.Zero(t, countRows(t, store, `SELECT COUNT(*) FROM deletes`), "both entries went")
 }
+
+// A failed trim is logged and the sweep carries on to the vacuum: the next sweep retries,
+// and a cache whose log will not trim must still hand its free pages back.
+func TestSweepSurvivesATrimItCannotMake(t *testing.T) {
+	store := newTestStore(t)
+	swapTable(t, store, "deletes",
+		`SELECT 1 AS seq, 'v1' AS api_version, 'Pod' AS kind, 'uid-1' AS uid, 0 AS at`)
+
+	assert.NotPanics(t, func() {
+		sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	})
+}

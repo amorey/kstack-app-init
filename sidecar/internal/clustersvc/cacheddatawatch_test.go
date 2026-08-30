@@ -61,13 +61,16 @@ type watchFixture struct {
 	next       kubestore.Changes[row]
 	changesErr error
 	changes    int
+	// built fires as each frame is built, which is the moment before it is sent: a test
+	// that wants the loop parked in a send waits for one more build than the buffer holds.
+	built *testutil.Probe[DeltaFrameType]
 }
 
 func newWatchFixture(t *testing.T) *watchFixture {
 	t.Helper()
 	m := kubestore.NewManager(t.TempDir(), kubestore.Retention{})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
-	return &watchFixture{t: t, m: m}
+	return &watchFixture{t: t, m: m, built: testutil.NewProbe[DeltaFrameType](16)}
 }
 
 // open creates the cache's file, the way a worker or the sweep does.
@@ -187,6 +190,7 @@ func (f *watchFixture) run(ctx context.Context, debounce, retry time.Duration, c
 		key:      func(r row) string { return r.UID },
 		read:     f.read,
 		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			f.built.Fire(t)
 			return frame{Type: t, Row: &r}
 		},
 		bookmark: frame{Type: DeltaFrameBookmark},
@@ -414,7 +418,8 @@ func TestCacheWatchStopsAtTheFrameTheConsumerLeftOn(t *testing.T) {
 }
 
 // The Bookmark is a send like any other: one row fills the buffer, and the bookmark behind
-// it is where a departed consumer ends the loop.
+// it is where a departed consumer ends the loop. Cancelled once that row is built and
+// nobody is reading, so the loop is at the bookmark and not at the row before it.
 func TestCacheWatchStopsOnTheBookmarkWhenTheConsumerLeft(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := newWatchFixture(t)
@@ -422,6 +427,7 @@ func TestCacheWatchStopsOnTheBookmarkWhenTheConsumerLeft(t *testing.T) {
 	f.set(row{UID: "a", Data: "1"})
 
 	stream := f.start(ctx, time.Millisecond, time.Millisecond)
+	f.built.Await(t, "the snapshot's one row")
 	cancel()
 
 	testutil.WaitClosed(t, stream.Frames, "the loop to stop on the bookmark")
@@ -743,4 +749,203 @@ func TestCacheWatchFallsBackWhenTheKindBehindThePluralChanges(t *testing.T) {
 	assert.Equal(t, DeltaFrameDeleted, fr.Type, "the rows of the Kind the plural left were kept")
 	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row)
 	assert.Equal(t, 2, f.readCount())
+}
+
+// Every frame a changes read produces is a send that can find the consumer gone. Driven
+// directly because the loop's own select would race the cancellation, and what is under
+// test is that both sends are checked rather than assumed.
+func TestApplyStopsAtAnyFrameWhenTheConsumerIsGone(t *testing.T) {
+	changes := map[string]kubestore.Changes[row]{
+		"written": {Written: []row{{UID: "a", Data: "1"}}},
+		"deleted": {Deleted: []string{"a"}},
+	}
+	w := cachedDataWatchSpec[row, frame]{
+		key: func(r row) string { return r.UID },
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			return frame{Type: t, Row: &r}
+		},
+	}
+
+	for name, c := range changes {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			// Buffered like Frames and already full, so the one send each case makes has
+			// nowhere to go — otherwise the buffer takes it and the check never runs.
+			out := make(chan frame, 1)
+			out <- frame{}
+
+			ok := w.apply(ctx, out, nil, map[string]row{"a": {UID: "a", Data: "1"}}, c)
+
+			assert.False(t, ok)
+		})
+	}
+}
+
+// goneStores hands out a claim whose cache has already gone, which is the file going
+// between the open and the subscribe — the one gap bind cannot close by ordering.
+type goneStores struct {
+	m     *kubestore.Manager
+	store *kubestore.Store
+}
+
+func (g goneStores) OpenExisting(int64) (*kubestore.Store, bool, error) { return g.store, true, nil }
+
+func (g goneStores) WatchOpen(cacheID int64) kubestore.OpenSubscription {
+	return g.m.WatchOpen(cacheID)
+}
+
+// A cache that went between the claim and the subscription ends the watch CLEANLY: it is a
+// clear or a teardown, and a non-nil Err reaches the client as an error toast per open
+// watch for a button the user pressed.
+func TestCacheWatchEndsCleanlyWhenTheCacheGoesBeforeItSubscribes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	require.NoError(t, f.m.Remove(1))
+
+	s := runCachedDataWatch(ctx, cachedDataWatchSpec[row, frame]{
+		stores:   goneStores{m: f.m, store: f.store},
+		cacheID:  1,
+		debounce: time.Millisecond,
+		retry:    time.Millisecond,
+		key:      func(r row) string { return r.UID },
+		read:     f.read,
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			return frame{Type: t, Row: &r}
+		},
+		bookmark: frame{Type: DeltaFrameBookmark},
+	})
+
+	testutil.WaitClosed(t, s.Frames, "the stream to end")
+	assert.NoError(t, s.Err(), "a cache that went away was reported as a watch failure")
+}
+
+// lateBreakStores has no file to bind at first and is broken by the time the watch waits
+// for one — the failure awaitOpen answers with rather than parking forever.
+type lateBreakStores struct {
+	m    *kubestore.Manager
+	err  error
+	mu   sync.Mutex
+	seen int
+}
+
+func (l *lateBreakStores) OpenExisting(int64) (*kubestore.Store, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.seen++
+	if l.seen == 1 {
+		return nil, false, nil
+	}
+	return nil, false, l.err
+}
+
+func (l *lateBreakStores) WatchOpen(cacheID int64) kubestore.OpenSubscription {
+	return l.m.WatchOpen(cacheID)
+}
+
+// A watch waiting for a file that then will not open reports it. Parking on WatchOpen would
+// leave the client on an empty table with no reason for it, since that signal fires when a
+// file is CREATED and this one already exists.
+func TestCacheWatchReportsAStoreThatBreaksWhileItWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	boom := errors.New("database disk image is malformed")
+
+	s := runCachedDataWatch(ctx, cachedDataWatchSpec[row, frame]{
+		stores:   &lateBreakStores{m: f.m, err: boom},
+		cacheID:  1,
+		debounce: time.Millisecond,
+		retry:    time.Millisecond,
+		key:      func(r row) string { return r.UID },
+		read:     f.read,
+		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r row) frame {
+			return frame{Type: t, Row: &r}
+		},
+		bookmark: frame{Type: DeltaFrameBookmark},
+	})
+
+	assert.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+	testutil.WaitClosed(t, s.Frames, "the stream to end")
+	assert.ErrorIs(t, s.Err(), boom)
+}
+
+// A consumer that leaves mid-burst ends the loop at the frame it was on, whichever read
+// produced it. The buffer holds one, so the second frame of a burst is parked in its send
+// with nowhere to go, and the cancel is what frees it — no race with the loop's own select,
+// which is why this cannot be written as "cancel and see".
+func TestCacheWatchStopsMidBurstWhenTheConsumerLeaves(t *testing.T) {
+	bursts := map[string]func(*watchFixture){
+		"reading what moved": func(f *watchFixture) {
+			f.push(kubestore.Changes[row]{
+				Deleted: []string{"a"},
+				Written: []row{{UID: "b", Data: "2"}, {UID: "c", Data: "1"}},
+			})
+		},
+		// A different Kind sends the loop back to the full read, whose own diff is then
+		// what the departed consumer is parked in.
+		"falling back to the full read": func(f *watchFixture) {
+			f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 9, Kind: "Gadget"}})
+			f.readAs("Gadget")
+			f.set(row{UID: "b", Data: "2"}, row{UID: "c", Data: "1"})
+		},
+	}
+	for name, burst := range bursts {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f := newWatchFixture(t)
+			f.open()
+			f.readAs("Widget")
+			f.set(row{UID: "a", Data: "1"})
+
+			s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+			recvFrame(t, s)
+			require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+			f.built.Drain()
+
+			burst(f)
+			f.ping()
+			// One frame is in the buffer, the second is parked in its send.
+			f.built.Await(t, "the burst's first frame")
+			f.built.Await(t, "the burst's second frame")
+			cancel()
+
+			testutil.WaitClosed(t, s.Frames, "the loop to stop where the consumer left")
+			assert.NoError(t, s.Err(), "a consumer leaving is not a watch failure")
+		})
+	}
+}
+
+// The retry path is the other way into a re-read, and it ends the same way. A failed
+// changes read arms the retry with nothing sent, and the retry's own frames are where the
+// departed consumer stops the loop.
+func TestCacheWatchStopsOnTheRetryWhenTheConsumerLeaves(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, 5*time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+	f.built.Drain()
+
+	before := f.changesCount()
+	f.failChanges(errors.New("disk I/O error"))
+	f.ping()
+	require.Eventually(t, func() bool { return f.changesCount() > before },
+		5*time.Second, time.Millisecond, "the changes read to fail")
+
+	// Only the retry timer can fire now: the burst below pings nothing.
+	f.push(kubestore.Changes[row]{Written: []row{{UID: "b", Data: "1"}, {UID: "c", Data: "1"}}})
+	f.built.Await(t, "the retry's first frame")
+	f.built.Await(t, "the retry's second frame")
+	cancel()
+
+	testutil.WaitClosed(t, s.Frames, "the loop to stop on the retry's frames")
+	assert.NoError(t, s.Err())
 }

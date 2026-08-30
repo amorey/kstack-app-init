@@ -68,3 +68,23 @@ func TestAMissingCounterIsAnError(t *testing.T) {
 
 	assert.Error(t, err)
 }
+
+// The counter is what every write stamps from, so a file that cannot hand out a position
+// fails the write rather than stamping it with a zero every later cursor sits above.
+func TestNextSeqReportsACounterItCannotTake(t *testing.T) {
+	s := newTestStore(t)
+	dropTable(t, s, "cluster_meta")
+
+	_, err := nextSeq(context.Background(), openFileOf(t, s).stmts())
+
+	assert.Error(t, err)
+}
+
+func TestHeadReportsACounterItCannotRead(t *testing.T) {
+	s := newTestStore(t)
+	dropTable(t, s, "cluster_meta")
+
+	_, err := head(context.Background(), openFileOf(t, s).stmts())
+
+	assert.Error(t, err)
+}

@@ -395,3 +395,48 @@ func TestARelistThatChangesNothingLeavesEveryStamp(t *testing.T) {
 	assert.Equal(t, before, []int64{writeSeq(t, s, "uid-1"), writeSeq(t, s, "uid-2")})
 	assert.NotZero(t, before[0])
 }
+
+// An object's edges are rewritten on every write, so a table that will not take them fails
+// the write: a row whose labels or owners silently stopped being written would serve stale
+// edges for as long as the object lived.
+func TestInsertObjectRowReportsAnEdgeItCouldNotWrite(t *testing.T) {
+	for _, table := range []string{"owner_refs", "labels"} {
+		t.Run(table, func(t *testing.T) {
+			s := newTestStore(t)
+			dropTable(t, s, table)
+
+			err := s.ApplyChange(context.Background(), podKind, watch.Added, pod("uid-1", "api-0", "42"))
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+// The log is written before the row goes and in the same transaction, so a log that will
+// not take the entry must fail the delete outright — the alternative is a row gone with no
+// record that it went, which is the one thing a resuming reader cannot recover from.
+func TestADeleteThatCannotBeLoggedFails(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+	dropTable(t, s, "deletes")
+
+	err := s.ApplyChange(ctx, podKind, watch.Deleted, pod("uid-1", "api-0", "42"))
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM objects`), "the row went unlogged")
+}
+
+// The same promise for the relist's prune, which takes every row the list did not carry.
+func TestAPruneThatCannotBeLoggedFails(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+	session := beginReplace(t, s, podKind)
+	dropTable(t, s, "deletes")
+
+	_, err := session.Commit(ctx, "100")
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM objects`), "the rows went unlogged")
+}

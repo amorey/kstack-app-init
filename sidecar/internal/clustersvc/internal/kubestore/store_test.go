@@ -103,6 +103,47 @@ func db(t *testing.T, s *Store) *sql.DB {
 	return f.db
 }
 
+// closedStore is a claim whose cache went away while it was held, so every read and write
+// on it answers ErrClosed — the one way a method's own file() branch is reached.
+func closedStore(t *testing.T) *Store {
+	t.Helper()
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	require.NoError(t, m.Remove(1))
+	return store
+}
+
+// swapTable puts a view of the same name in a table's place, so a read still prepares and
+// then scans a value the row type cannot hold. dropTable fails the query; this fails the
+// scan, which is the other half of what a read has to report.
+func swapTable(t *testing.T, s *Store, table, query string) {
+	t.Helper()
+	dropTable(t, s, table)
+	_, err := db(t, s).ExecContext(context.Background(), `CREATE VIEW `+table+` AS `+query)
+	require.NoError(t, err)
+}
+
+// failCommit arms a DEFERRED foreign-key violation on the next write of the given shape, so
+// the statement succeeds and the COMMIT fails. Nothing a caller can pass makes SQLite fail
+// that late, and a commit that fails after its statements landed is exactly what the write
+// paths' own commit branches are for.
+func failCommit(t *testing.T, s *Store, event, table string) {
+	t.Helper()
+	for _, ddl := range []string{
+		`CREATE TABLE commit_parent(id INTEGER PRIMARY KEY)`,
+		`CREATE TABLE commit_child(id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`,
+		`CREATE TRIGGER commit_boom AFTER ` + event + ` ON ` + table + ` BEGIN
+			INSERT INTO commit_child VALUES (1);
+		END`,
+	} {
+		_, err := db(t, s).ExecContext(context.Background(), ddl)
+		require.NoError(t, err)
+	}
+}
+
 // countRows is one scalar SQL read.
 func countRows(t *testing.T, s *Store, q string, args ...any) int {
 	t.Helper()
@@ -1255,4 +1296,120 @@ func TestApplyChangeSkipsAnEventItCannotProject(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, "7", rv)
+}
+
+// A write that cannot take a position must fail rather than land: a row stamped with
+// nothing sits below every cursor, which is the silent miss the stamp exists to prevent.
+// Its commit is the same promise at the other end — the notify below it says the write
+// landed, and a client that took that word for it would never be told otherwise.
+func TestApplyChangeReportsWhatItCouldNotDo(t *testing.T) {
+	breaks := map[string]func(*testing.T, *Store){
+		"the position it could not take": func(t *testing.T, s *Store) { dropTable(t, s, "cluster_meta") },
+		"the commit that failed":         func(t *testing.T, s *Store) { failCommit(t, s, "INSERT", "objects") },
+	}
+	for name, brk := range breaks {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			brk(t, s)
+
+			err := s.ApplyChange(context.Background(), podKind, watch.Added, pod("uid-1", "api-0", "42"))
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+// A clear that fails must take nothing with it: the rows it evicts are only recoverable
+// through the log entries it writes first, so a half-done clear is the one outcome the
+// transaction exists to rule out.
+func TestClearKindReportsWhatItCouldNotDo(t *testing.T) {
+	cases := map[string]struct {
+		kind   Kind
+		break_ func(*testing.T, *Store)
+	}{
+		"the position it could not take": {podKind, func(t *testing.T, s *Store) { dropTable(t, s, "cluster_meta") }},
+		"the events it could not log":    {eventsKind, func(t *testing.T, s *Store) { dropTable(t, s, "deletes") }},
+		"the rows it could not log":      {podKind, func(t *testing.T, s *Store) { dropTable(t, s, "deletes") }},
+		"the commit that failed":         {podKind, func(t *testing.T, s *Store) { failCommit(t, s, "DELETE", "objects") }},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+			require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, firing("ev-1", "10", 1)))
+			c.break_(t, s)
+
+			err := s.ClearKind(ctx, c.kind)
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+// A page that fails is retried by the relist that owns it, so it has to say so: silence
+// would leave the sweep's mark covering rows no page rewrote.
+func TestWritePageReportsWhatItCouldNotDo(t *testing.T) {
+	breaks := map[string]func(*testing.T, *Store){
+		"the cookie it could not clear": func(t *testing.T, s *Store) { dropTable(t, s, "cluster_meta") },
+		"the commit that failed":        func(t *testing.T, s *Store) { failCommit(t, s, "INSERT", "objects") },
+	}
+	for name, brk := range breaks {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			session := beginReplace(t, s, podKind)
+			brk(t, s)
+
+			err := session.WritePage(ctx, []*unstructured.Unstructured{pod("uid-1", "api-0", "42")})
+
+			assert.Error(t, err)
+		})
+	}
+
+	// The stamp is taken after the cookie is cleared, so only a page past the first reaches
+	// it — the first fails on the cookie.
+	t.Run("the position it could not take", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStore(t)
+		session := beginReplace(t, s, podKind)
+		require.NoError(t, session.WritePage(ctx, []*unstructured.Unstructured{pod("uid-1", "api-0", "42")}))
+		dropTable(t, s, "cluster_meta")
+
+		err := session.WritePage(ctx, []*unstructured.Unstructured{pod("uid-2", "api-1", "42")})
+
+		assert.Error(t, err)
+	})
+}
+
+// The relist's commit is where the prune and the cookie land together. Any half of it
+// failing has to reach the caller: a cookie persisted over a prune that did not run would
+// resume the next watch past rows that are still there.
+func TestCommitRelistReportsWhatItCouldNotDo(t *testing.T) {
+	cases := map[string]struct {
+		kind   Kind
+		break_ func(*testing.T, *Store)
+	}{
+		"the position it could not take": {podKind, func(t *testing.T, s *Store) { dropTable(t, s, "cluster_meta") }},
+		"the pruned events it could not log": {eventsKind, func(t *testing.T, s *Store) {
+			dropTable(t, s, "deletes")
+		}},
+		"the events it could not prune": {eventsKind, func(t *testing.T, s *Store) {
+			// A view logs like a table and refuses the delete behind it.
+			swapTable(t, s, "events", `SELECT 'ev-1' AS uid, 0 AS updated_at, 0 AS write_seq`)
+		}},
+		"the commit that failed": {podKind, func(t *testing.T, s *Store) { failCommit(t, s, "UPDATE", "cluster_meta") }},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			session := beginReplace(t, s, c.kind)
+			c.break_(t, s)
+
+			_, err := session.Commit(ctx, "100")
+
+			assert.Error(t, err)
+		})
+	}
 }

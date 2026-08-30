@@ -149,3 +149,84 @@ func TestEventChangesReturnsWhatMovedAndWhatWent(t *testing.T) {
 	assert.Equal(t, storeHead(t, s), got.At.Seq)
 	assert.Equal(t, "Event", got.At.Kind, "the events collection is always addressable")
 }
+
+// A changes read is assembled from four reads, and any of them can fail. Each failure has
+// to reach the caller: a watch retries in place on an error, where an empty answer would be
+// taken as "nothing moved" and advance its cursor past changes it never sent.
+func TestObjectChangesReportsAReadItCannotMake(t *testing.T) {
+	breaks := map[string]func(*testing.T, *Store){
+		"the kind": func(t *testing.T, s *Store) { dropTable(t, s, "kind_catalog") },
+		"the rows": func(t *testing.T, s *Store) { dropTable(t, s, "objects") },
+		"the log":  func(t *testing.T, s *Store) { dropTable(t, s, "deletes") },
+		"the trim mark": func(t *testing.T, s *Store) {
+			require.NoError(t, setMeta(context.Background(), openFileOf(t, s).stmts(),
+				deletesTrimmedKey("v1", "Pod"), "not-a-number"))
+		},
+	}
+	for name, brk := range breaks {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
+			require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+			brk(t, s)
+
+			_, err := s.ObjectChanges(ctx, "v1", "pods", 0)
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestEventChangesReportsAReadItCannotMake(t *testing.T) {
+	breaks := map[string]func(*testing.T, *Store){
+		"the rows": func(t *testing.T, s *Store) { dropTable(t, s, "events") },
+		"the log":  func(t *testing.T, s *Store) { dropTable(t, s, "deletes") },
+		"the trim mark": func(t *testing.T, s *Store) {
+			require.NoError(t, setMeta(context.Background(), openFileOf(t, s).stmts(),
+				deletesTrimmedKey(eventsLogAPIVersion, eventsLogKind), "not-a-number"))
+		},
+	}
+	for name, brk := range breaks {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, firing("ev-1", "10", 1)))
+			brk(t, s)
+
+			_, err := s.EventChanges(ctx, 0)
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+// A log entry that will not scan is as unreadable as a log that will not open, and the
+// caller has to hear about it for the same reason: silence here reads as "nothing was
+// deleted".
+func TestObjectChangesReportsALogEntryItCannotScan(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
+	// A NULL uid: the column the reader keys the removal by, carrying nothing to key on.
+	swapTable(t, s, "deletes",
+		`SELECT 1 AS seq, 'v1' AS api_version, 'Pod' AS kind, NULL AS uid, 0 AS at`)
+
+	_, err := s.ObjectChanges(ctx, "v1", "pods", 0)
+
+	assert.Error(t, err)
+}
+
+// A claim whose cache went away answers ErrClosed rather than an empty collection: the rows
+// are not gone, the file this claim was bound to is. The watch reads that as the clean end
+// it is, where an empty answer would blank the client's table on the way out.
+func TestChangesReportACacheThatWentAway(t *testing.T) {
+	ctx := context.Background()
+	s := closedStore(t)
+
+	_, objErr := s.ObjectChanges(ctx, "v1", "pods", 0)
+	_, evErr := s.EventChanges(ctx, 0)
+
+	assert.ErrorIs(t, objErr, ErrClosed)
+	assert.ErrorIs(t, evErr, ErrClosed)
+}

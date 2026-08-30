@@ -114,6 +114,16 @@ func dataPod(uid, name, rv string) *unstructured.Unstructured {
 	}}
 }
 
+// dataEvent is an Event body the store will accept, at a given resourceVersion and count.
+func dataEvent(uid, rv string, count int64) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "Event",
+		"metadata":       map[string]any{"uid": uid, "name": uid, "resourceVersion": rv},
+		"involvedObject": map[string]any{"uid": "pod-1", "kind": "Pod", "name": "api-0"},
+		"reason":         "BackOff", "message": "restarting", "type": "Warning", "count": count,
+	}}
+}
+
 // A pair that does not resolve is definitively empty rather than an error or a wait: the
 // cache is gone, or was never this cluster's, and no row will ever arrive for it.
 func TestCachedDataGatesAnUnknownPair(t *testing.T) {
@@ -464,4 +474,26 @@ func TestWatchObjectsDropsRowsWhenTheKindBehindThePluralIsRenamed(t *testing.T) 
 	gone := testutil.Recv(t, stream.Frames, "the removal")
 	assert.Equal(t, DeltaFrameDeleted, gone.Type)
 	assert.Equal(t, "uid-1", gone.Object.UID)
+}
+
+// The events watch reads what moved past its cursor like the objects watch does, so a
+// re-fired event reaches the client as a Modified rather than waiting for a reconnect.
+func TestWatchEventsSendsWhatMovedAfterTheSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	eventsKind := kubestore.Kind{APIVersion: "v1", Kind: "Event", Resource: "events"}
+	require.NoError(t, f.store.ApplyChange(ctx, eventsKind, watch.Added, dataEvent("ev-1", "10", 1)))
+
+	stream, err := f.data().WatchEvents(ctx, f.clusterID, f.cacheID)
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the event")
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	require.NoError(t, f.store.ApplyChange(ctx, eventsKind, watch.Modified, dataEvent("ev-1", "11", 2)))
+
+	fr := testutil.Recv(t, stream.Frames, "the re-fired event")
+	assert.Equal(t, DeltaFrameModified, fr.Type)
+	require.NotNil(t, fr.Event)
+	assert.Equal(t, 2, fr.Event.Count)
 }

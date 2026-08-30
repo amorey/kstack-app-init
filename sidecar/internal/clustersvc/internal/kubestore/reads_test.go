@@ -274,3 +274,68 @@ func TestASnapshotIsReadAtACursor(t *testing.T) {
 	assert.Equal(t, Cursor{Seq: at, Kind: "Event"}, eventsAt)
 	assert.Equal(t, at, eventSeq(t, s, "ev-1"), "the head is the last write's position")
 }
+
+// Every read serves a watch that holds the client's table, so each one has to report a
+// fault rather than answer empty: empty is a collection the cache no longer holds, which
+// the watch turns into a Deleted per row on screen.
+func TestObjectsWithCursorReportsAReadItCannotMake(t *testing.T) {
+	breaks := map[string]func(*testing.T, *Store){
+		"the kind": func(t *testing.T, s *Store) { dropTable(t, s, "kind_catalog") },
+		"the rows": func(t *testing.T, s *Store) { dropTable(t, s, "objects") },
+		// A NULL uid is a row with nothing for the watch to key on.
+		"a row it cannot scan": func(t *testing.T, s *Store) {
+			swapTable(t, s, "objects", `SELECT NULL AS uid, 'v1' AS api_version, 'Pod' AS kind,
+				'prod' AS namespace, 'api-0' AS name, '42' AS resource_version, 0 AS created_at`)
+		},
+	}
+	for name, brk := range breaks {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
+			brk(t, s)
+
+			_, _, err := s.ObjectsWithCursor(ctx, "v1", "pods")
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestEventsWithCursorReportsAReadItCannotMake(t *testing.T) {
+	breaks := map[string]func(*testing.T, *Store){
+		"the rows": func(t *testing.T, s *Store) { dropTable(t, s, "events") },
+		"a row it cannot scan": func(t *testing.T, s *Store) {
+			swapTable(t, s, "events", `SELECT NULL AS uid, 'Normal' AS type, 'Started' AS reason,
+				'' AS message, 1 AS count, 0 AS first_seen, 0 AS last_seen,
+				'Pod' AS involved_kind, 'prod' AS involved_ns, 'api-0' AS involved_name`)
+		},
+	}
+	for name, brk := range breaks {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			brk(t, s)
+
+			_, _, err := s.EventsWithCursor(context.Background())
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+// A read that fails partway through its rows reports it. rows.Err is the only place that
+// failure surfaces — the loop simply stops, so a missing check would serve however many
+// rows arrived before the fault as if they were the whole catalog.
+func TestKindsReportsAReadThatFailsMidway(t *testing.T) {
+	s := newTestStore(t)
+	// The first row reads; the second raises as it is computed, which is a fault the loop
+	// itself cannot see.
+	swapTable(t, s, "kind_catalog", `SELECT 'v1' AS api_version, 'Pod' AS kind,
+		'pods' AS resource, 'Namespaced' AS scope, 0 AS is_crd,
+		NULL AS schema_json, NULL AS printer_columns
+		UNION ALL SELECT 'v1', json_extract('{', '$.a'), 'x', 'Namespaced', 0, NULL, NULL`)
+
+	_, _, _, err := s.KindsWithFingerprint(context.Background())
+
+	assert.Error(t, err)
+}
