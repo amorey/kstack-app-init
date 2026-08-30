@@ -149,57 +149,64 @@ export type Keyed<T> = ReadonlyMap<string, T>;
 // collection.
 type DeltaState<T> = { items: Keyed<T>; synced: boolean };
 
-// Apply one delta-watch change: Added/Modified upsert, Deleted removes. Returns a
-// fresh map (new identity so React re-renders). Shared by every delta-watch reducer.
-export function applyChange<T>(prev: Keyed<T> | undefined, type: string, id: string, entity: T): Keyed<T> {
-  const next = new Map(prev);
-  if (type === 'Deleted') next.delete(id);
-  else next.set(id, entity);
-  return next;
+// Apply one delta-watch change in place: Added/Modified upsert, Deleted removes. A
+// reducer copies its map once per batch, then applies each frame to the copy.
+export function applyChange<T>(items: Map<string, T>, type: string, id: string, entity: T) {
+  if (type === 'Deleted') items.delete(id);
+  else items.set(id, entity);
 }
 
 export function ClustersProvider({ children }: { children: React.ReactNode }) {
   // Each stream reduces into its own id-keyed map; useWatchSubscription resets it
   // to `undefined` on a transport reconnect.
-  const [{ data: clusterState, connected }] = useWatchSubscription(
+  const { data: clusterState, connected } = useWatchSubscription(
     { query: ClustersWatchSubscription },
-    (prev: DeltaState<ClusterRow> | undefined, data) => {
-      const { type, cluster } = data.clustersWatch;
-      const base = prev ?? { items: new Map<string, ClusterRow>(), synced: false };
-      // The Bookmark closes the snapshot. Keyed on `type`, never on a missing cluster:
-      // a nested non-null field erroring nulls its parent, and reading that as the
-      // snapshot boundary would show a half-listed fleet as the whole fleet.
-      if (type === 'Bookmark') return { ...base, synced: true };
-      if (!cluster) return base;
-      // The boundary reports the store as it is, tombstones included, and leaves the
-      // choice here. One place, at the edge: a per-view filter is one a view forgets.
-      // A record being torn down is dropped rather than rendered mid-teardown — the
-      // window is microseconds unless children are draining.
-      const change = cluster.deletionRequestedAt ? 'Deleted' : type;
-      return { ...base, items: applyChange(base.items, change, cluster.id, cluster) };
+    (prev: DeltaState<ClusterRow> | undefined, frames) => {
+      const items = new Map(prev?.items);
+      let synced = prev?.synced ?? false;
+      frames.forEach(({ clustersWatch: { type, cluster } }) => {
+        // The Bookmark closes the snapshot. Keyed on `type`, never on a missing cluster:
+        // a nested non-null field erroring nulls its parent, and reading that as the
+        // snapshot boundary would show a half-listed fleet as the whole fleet.
+        if (type === 'Bookmark') {
+          synced = true;
+          return;
+        }
+        if (!cluster) return;
+        // The boundary reports the store as it is, tombstones included, and leaves the
+        // choice here. One place, at the edge: a per-view filter is one a view forgets.
+        // A record being torn down is dropped rather than rendered mid-teardown — the
+        // window is microseconds unless children are draining.
+        applyChange(items, cluster.deletionRequestedAt ? 'Deleted' : type, cluster.id, cluster);
+      });
+      return { items, synced };
     },
   );
   // Held back until the snapshot is complete, so a half-listed fleet never reads as
   // the whole fleet.
   const clusterMap = clusterState?.synced ? clusterState.items : undefined;
-  const [{ data: cacheMap }] = useWatchSubscription(
+  const { data: cacheMap } = useWatchSubscription(
     { query: ClusterCachesWatchSubscription },
-    (prev: Keyed<CacheRow> | undefined, data) => {
-      const { type, cache } = data.clusterCachesWatch;
-      // The Bookmark carries no cache; the caches join in as they arrive (the streams
-      // carry no mutual ordering), so it needs no gate of its own here. A change with
-      // no cache is a server-side field error — equally unfoldable.
-      if (type === 'Bookmark' || !cache) return prev ?? new Map();
-      return applyChange(prev, type, cache.id, cache);
+    (prev: Keyed<CacheRow> | undefined, frames) => {
+      const items = new Map(prev);
+      frames.forEach(({ clusterCachesWatch: { type, cache } }) => {
+        // The Bookmark carries no cache; the caches join in as they arrive (the streams
+        // carry no mutual ordering), so it needs no gate of its own here. A change with
+        // no cache is a server-side field error — equally unfoldable.
+        if (type === 'Bookmark' || !cache) return;
+        applyChange(items, type, cache.id, cache);
+      });
+      return items;
     },
   );
   // A latest-value gauge, not a delta stream: each frame replaces that cache's
   // reading outright. Which verdicts are LIVE is decided below, against the cache stream.
-  const [{ data: verdictMap }] = useWatchSubscription(
+  const { data: verdictMap } = useWatchSubscription(
     { query: ClusterCacheHealthWatchSubscription },
-    (prev: Keyed<ClusterCacheHealth> | undefined, data) => {
-      const h = data.clusterCacheHealthWatch;
-      return applyChange(prev, 'Added', h.cacheID, h);
+    (prev: Keyed<ClusterCacheHealth> | undefined, frames) => {
+      const items = new Map(prev);
+      frames.forEach(({ clusterCacheHealthWatch: h }) => items.set(h.cacheID, h));
+      return items;
     },
   );
   // A gauge has no Deleted, so a verdict's lifetime is its CACHE's. Derive liveness

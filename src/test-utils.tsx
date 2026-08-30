@@ -17,6 +17,8 @@ import { createMemoryHistory, createRouter, RouterProvider } from '@tanstack/rea
 import type { AnyRoute } from '@tanstack/react-router';
 import { vi } from 'vitest';
 
+import { setWatchFlushScheduler } from '@/lib/graphql/use-watch-subscription';
+
 export type FakeChannel = { onmessage?: (raw: string) => void };
 
 // Shared fake for '@tauri-apps/api/core'. Usage:
@@ -52,6 +54,15 @@ export function mockTauriCore() {
       },
     }),
   };
+}
+
+// Watches publish once per animation frame. A suite that pushes a frame and asserts on
+// the very next line wants each frame visible at once: call this at module scope.
+export function flushWatchesSynchronously() {
+  setWatchFlushScheduler((flush) => {
+    flush();
+    return () => {};
+  });
 }
 
 // Cluster-delta test helpers ------------------------------------------

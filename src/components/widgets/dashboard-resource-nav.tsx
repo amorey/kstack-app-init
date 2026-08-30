@@ -174,10 +174,10 @@ export function DashboardResourceNav() {
       ))}
       {/* Transport hint below the tree so it never shifts the resource rows. */}
       {status !== null && (
-        <p className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground" data-testid="nav-status">
+        <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground" data-testid="nav-status">
           <Spinner size="xs" className="mr-0" />
           {status}
-        </p>
+        </div>
       )}
     </nav>
   );

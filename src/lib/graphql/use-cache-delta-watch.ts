@@ -65,23 +65,31 @@ export function useCacheDeltaWatch<Data, T>(
 ): { items: T[]; phase: WatchPhase } {
   const { select, keyOf, currentProvenance } = opts;
 
-  const [{ data, connected }] = useWatchSubscription(args, (prev: DeltaSet<T> | undefined, res) => {
-    const { type, entity, provenance } = select(res);
-    const empty = { provenance: currentProvenance, items: new Map<string, T>(), synced: false };
-    // Drop stragglers from a superseded subscription.
-    if (provenance !== currentProvenance) return prev ?? empty;
+  const { data, connected } = useWatchSubscription(args, (prev: DeltaSet<T> | undefined, frames) => {
     // Restart when the current provenance changed under us (cache swap / kind switch).
-    const base = prev && prev.provenance === currentProvenance ? prev : empty;
-    // The Bookmark closes the snapshot. Keyed on `type`, never on a missing entity:
-    // a nested non-null field erroring nulls its parent, and reading that as the
-    // snapshot boundary would declare a still-loading collection complete.
-    if (type === 'Bookmark') return { ...base, synced: true };
-    if (!entity) return base;
-    return { ...base, items: applyChange(base.items, type, keyOf(entity), entity) };
+    const base = prev && prev.provenance === currentProvenance ? prev : undefined;
+    const items = new Map(base?.items);
+    let synced = base?.synced ?? false;
+    frames.forEach((res) => {
+      const { type, entity, provenance } = select(res);
+      // Drop stragglers from a superseded subscription.
+      if (provenance !== currentProvenance) return;
+      // The Bookmark closes the snapshot. Keyed on `type`, never on a missing entity:
+      // a nested non-null field erroring nulls its parent, and reading that as the
+      // snapshot boundary would declare a still-loading collection complete.
+      if (type === 'Bookmark') {
+        synced = true;
+        return;
+      }
+      if (!entity) return;
+      applyChange(items, type, keyOf(entity), entity);
+    });
+    return { provenance: currentProvenance, items, synced };
   });
 
-  // Read only a set tagged for the current provenance — urql retains the previous
-  // provenance's `data` across a swap/switch. Feeds both items and phase.
+  // Read only a set tagged for the current provenance: on a swap/switch the accumulator
+  // still holds the previous one's set for the render in which `currentProvenance` flips,
+  // before the resubscribe clears it. Feeds both items and phase.
   const active = data && data.provenance === currentProvenance ? data : undefined;
   const activeItems = active?.items;
   const items = useMemo(() => (activeItems ? [...activeItems.values()] : []), [activeItems]);

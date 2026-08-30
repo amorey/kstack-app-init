@@ -37,7 +37,7 @@ import {
 } from '@/lib/clusters';
 import { type AppDialogProps } from '@/lib/dialog';
 import { EVENTS_GVR, gvrKey } from '@/lib/gvr';
-import { useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
+import { perFrame, useWatchSubscription, watchPhase } from '@/lib/graphql/use-watch-subscription';
 
 const ClusterEnabledSetMutation = graphql(`
   mutation ClusterEnabledSet($id: ObjectID!, $enabled: Boolean!) {
@@ -164,9 +164,9 @@ function foldFrame(prev: Timeline | undefined, frame: RawEventFrame): Timeline {
 const EMPTY_TIMELINE: Timeline = { runs: [], synced: false };
 
 function useConnectionAttempts(clusterId: string): EventRun[] {
-  const [{ data }] = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
+  const { data } = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterConnectionEventsSubscription, variables: { id: clusterId } },
-    (prev, resp) => foldFrame(prev, resp.eventsWatch),
+    perFrame((prev, resp) => foldFrame(prev, resp.eventsWatch)),
   );
   return data?.runs ?? [];
 }
@@ -195,9 +195,9 @@ const ClusterSyncEventsSubscription = graphql(`
 // subscription would carry nothing). Returns the timeline, not bare runs: the empty
 // state must not render before the bookmark says the history really is empty.
 function useSyncEvents(syncId: string | undefined): Timeline {
-  const [{ data }] = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
+  const { data } = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterSyncEventsSubscription, variables: { id: syncId ?? '' }, pause: !syncId },
-    (prev, resp) => foldFrame(prev, resp.eventsWatch),
+    perFrame((prev, resp) => foldFrame(prev, resp.eventsWatch)),
   );
   return data ?? EMPTY_TIMELINE;
 }
@@ -224,9 +224,9 @@ const ClusterDiscoveryEventsSubscription = graphql(`
 // One cache's discovery log; paused until there's a cache, since a placeholder
 // subscription would carry nothing.
 function useDiscoveryEvents(cacheId: string | undefined): Timeline {
-  const [{ data }] = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
+  const { data } = useWatchSubscription<{ eventsWatch: RawEventFrame }, Timeline>(
     { query: ClusterDiscoveryEventsSubscription, variables: { id: cacheId ?? '' }, pause: !cacheId },
-    (prev, resp) => foldFrame(prev, resp.eventsWatch),
+    perFrame((prev, resp) => foldFrame(prev, resp.eventsWatch)),
   );
   return data ?? EMPTY_TIMELINE;
 }
@@ -268,9 +268,9 @@ type CacheSyncStatus = {
 // A gauge: each frame replaces the last outright. null until the first frame, which is what
 // keeps a still-arriving detail from rendering as "no kinds".
 function useCacheSyncStatus(clusterId: string, cacheId: string): CacheSyncStatus | null {
-  const [{ data }] = useWatchSubscription<{ clusterCacheSyncStatusWatch: CacheSyncStatus }, CacheSyncStatus>(
+  const { data } = useWatchSubscription<{ clusterCacheSyncStatusWatch: CacheSyncStatus }, CacheSyncStatus>(
     { query: ClusterCacheSyncStatusSubscription, variables: { id: clusterId, cacheID: cacheId } },
-    (_prev, resp) => resp.clusterCacheSyncStatusWatch,
+    perFrame((_prev, resp) => resp.clusterCacheSyncStatusWatch),
   );
   return data ?? null;
 }
@@ -304,9 +304,9 @@ type CacheContents = {
 
 // A gauge: each frame replaces the last outright. null until the first frame.
 function useCacheContents(clusterId: string, cacheId: string, pause: boolean): CacheContents | null {
-  const [{ data }] = useWatchSubscription<{ clusterCacheStatsWatch: CacheContents }, CacheContents>(
+  const { data } = useWatchSubscription<{ clusterCacheStatsWatch: CacheContents }, CacheContents>(
     { query: ClusterCacheStatsSubscription, variables: { id: clusterId, cacheID: cacheId }, pause },
-    (_prev, resp) => resp.clusterCacheStatsWatch,
+    perFrame((_prev, resp) => resp.clusterCacheStatsWatch),
   );
   return data ?? null;
 }
@@ -335,16 +335,19 @@ type CachedKind = NonNullable<ClusterCachedKindsSubscription['clusterCachedKinds
 
 // The cache's kind syncs, id-keyed through the registry's shared delta fold.
 function useCachedKinds(cacheId: string): CachedKind[] {
-  const [{ data }] = useWatchSubscription<
+  const { data } = useWatchSubscription<
     { clusterCachedKindsWatch: { type: string; kind: CachedKind | null } },
     Keyed<CachedKind>
-  >({ query: ClusterCachedKindsSubscription, variables: { cacheID: cacheId } }, (prev, resp) => {
-    const { type, kind } = resp.clusterCachedKindsWatch;
-    // The Bookmark carries no record; the row renders per-kind detail, not an
-    // empty state, so it needs no snapshot-complete gate. A change with no record is
-    // a server-side field error — equally unfoldable.
-    if (type === 'Bookmark' || !kind) return prev ?? new Map();
-    return applyChange(prev, type, kind.id, kind);
+  >({ query: ClusterCachedKindsSubscription, variables: { cacheID: cacheId } }, (prev, frames) => {
+    const items = new Map(prev);
+    frames.forEach(({ clusterCachedKindsWatch: { type, kind } }) => {
+      // The Bookmark carries no record; the row renders per-kind detail, not an
+      // empty state, so it needs no snapshot-complete gate. A change with no record is
+      // a server-side field error — equally unfoldable.
+      if (type === 'Bookmark' || !kind) return;
+      applyChange(items, type, kind.id, kind);
+    });
+    return items;
   });
   return useMemo(() => (data ? [...data.values()] : []), [data]);
 }
@@ -367,16 +370,19 @@ function useNextCheck(clusterId: string): NextCheck {
   // Null `nextRequeueAt` = reconcile in flight (`probing`) or nothing scheduled.
   // Hold the last time only across the in-flight window; with `probing` false a
   // null must clear the countdown, not freeze a stale one.
-  const [{ data }] = useWatchSubscription<
+  const { data } = useWatchSubscription<
     { clusterScheduleWatch: { nextRequeueAt: string | null; probing: boolean } },
     { nextRequeueAt: string | null; probing: boolean }
-  >({ query: ClusterScheduleSubscription, variables: { id: clusterId } }, (prev, resp) => {
-    const { nextRequeueAt, probing } = resp.clusterScheduleWatch;
-    return {
-      nextRequeueAt: nextRequeueAt ?? (probing ? (prev?.nextRequeueAt ?? null) : null),
-      probing,
-    };
-  });
+  >(
+    { query: ClusterScheduleSubscription, variables: { id: clusterId } },
+    perFrame((prev, resp) => {
+      const { nextRequeueAt, probing } = resp.clusterScheduleWatch;
+      return {
+        nextRequeueAt: nextRequeueAt ?? (probing ? (prev?.nextRequeueAt ?? null) : null),
+        probing,
+      };
+    }),
+  );
   return { atMs: parseTimeOrNull(data?.nextRequeueAt ?? null), probing: data?.probing ?? false };
 }
 
@@ -1262,18 +1268,18 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
     >
       {/* Transport dropped with the registry loaded: the table is last-known state. */}
       {phase === 'reconnecting' ? (
-        <p className={`mb-2 flex items-center gap-1.5 text-xs ${TONE.attention.text}`}>
+        <div className={`mb-2 flex items-center gap-1.5 text-xs ${TONE.attention.text}`}>
           <Spinner size="xs" className="mr-0" />
           Reconnecting…
-        </p>
+        </div>
       ) : null}
       {/* Guarded branches, not a nested ternary; `rows` is only non-empty once
           loaded, so table and connecting states never overlap. */}
       {phase === 'connecting' && (
-        <p className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
           <Spinner size="sm" className="mr-0" />
           Connecting…
-        </p>
+        </div>
       )}
       {phase !== 'connecting' && rows.length === 0 && (
         <p className="py-6 text-sm text-muted-foreground">No clusters yet.</p>

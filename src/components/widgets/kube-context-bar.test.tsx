@@ -17,9 +17,12 @@ import { createRootRoute, createRoute, Outlet, retainSearchParams } from '@tanst
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore, pushClusters, renderWithRouter } from '@/test-utils';
+import { flushWatchesSynchronously, mockTauriCore, pushClusters, renderWithRouter } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
+
+// Frames pushed here are asserted on immediately.
+flushWatchesSynchronously();
 
 const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());

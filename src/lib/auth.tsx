@@ -22,7 +22,7 @@ import { useMutation } from 'urql';
 
 import { graphql } from '@/gql';
 import type { AuthStateWatchSubscription } from '@/gql/graphql';
-import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
+import { perFrame, useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 
 // Mirrors the sidecar's GraphQL shape; `identity` is non-null only when authenticated.
 export type Identity = {
@@ -82,9 +82,9 @@ function toAuthState(s: AuthStateWatchSubscription['authStateWatch']): AuthState
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   // Last-value semantics; reverts to "no frame yet" (→ loading) on a transport
   // reconnect until the snapshot replays.
-  const [{ data }] = useWatchSubscription<AuthStateWatchSubscription, AuthStateWatchSubscription>(
+  const { data } = useWatchSubscription<AuthStateWatchSubscription, AuthStateWatchSubscription>(
     { query: AuthStateWatchSubscription },
-    (_prev, next) => next,
+    perFrame((_prev, next) => next),
   );
   const [, runStartLogin] = useMutation(AuthLoginStartMutation);
   const [, runLogout] = useMutation(AuthLogoutMutation);

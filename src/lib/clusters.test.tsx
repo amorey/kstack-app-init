@@ -16,8 +16,11 @@ import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { clusterOf, mockTauriCore, pushClusters, pushWatchBookmark } from '@/test-utils';
+import { clusterOf, flushWatchesSynchronously, mockTauriCore, pushClusters, pushWatchBookmark } from '@/test-utils';
 import type { ClusterRow } from '@/test-utils';
+
+// Frames pushed here are asserted on immediately.
+flushWatchesSynchronously();
 
 // Mocks ---------------------------------------------------------------
 

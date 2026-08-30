@@ -60,18 +60,19 @@ function Chat() {
       pause: pending === null,
     },
     // On transport reconnect the accumulator resets and the stream restarts from the top.
-    (prev: string | undefined, data) => {
-      const chunk = data.chatStream;
-      const next = (prev ?? '') + chunk.delta;
-      if (chunk.done) {
-        if (finishedRef.current) return next;
+    (prev: string | undefined, frames) => {
+      let next = prev ?? '';
+      frames.forEach(({ chatStream: chunk }) => {
+        next += chunk.delta;
+        if (!chunk.done) return;
+        if (finishedRef.current) return;
         finishedRef.current = true;
         setMessages((m) => [...m, { id: crypto.randomUUID(), from: 'assistant', content: next }]);
         setStreamed('');
         setPending(null);
-      } else {
-        setStreamed(next);
-      }
+      });
+      // Once for the batch, after the fold — every earlier value is a frame nobody paints.
+      if (!finishedRef.current) setStreamed(next);
       return next;
     },
   );

@@ -15,38 +15,33 @@
 import { renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The hook composes urql's `useSubscription` with the active-context → cluster/cache
+// The hook composes `useWatchSubscription` with the active-context → cluster/cache
 // join and a cache-aware guard. Mock those seams so the test drives the delta stream +
-// cache state directly, without a real GraphQL client. The mock stands in for urql's
+// cache state directly, without a real GraphQL client. The mock stands in for the
 // accumulator: it captures the reducer and returns the accumulated data, so `pushFrame`
-// folds a delta through the real reducer just as urql would.
-const { useSubscriptionMock } = vi.hoisted(() => ({ useSubscriptionMock: vi.fn() }));
+// folds a delta through the real reducer just as the live hook would.
+const { useWatchSubscriptionMock } = vi.hoisted(() => ({ useWatchSubscriptionMock: vi.fn() }));
 const { useClustersMock, useActiveKubeContextMock } = vi.hoisted(() => ({
   useClustersMock: vi.fn(),
   useActiveKubeContextMock: vi.fn(),
 }));
-// useWatchSubscription reads the transport-status registry to drive its
-// generation-based reset. Mock it so `pushReset` bumps the generation directly (the
-// real reset semantics are covered in use-watch-subscription.test.tsx). The snapshot is
-// a stable per-generation object so useSyncExternalStore's getSnapshot stays stable.
+// Transport state as the stand-in reports it; `pushReset` models a reconnect (the real
+// reset semantics are covered in use-watch-subscription.test.tsx).
 const { statusState } = vi.hoisted(() => ({
   statusState: { snapshot: { connected: true, generation: 0 } },
 }));
 
-vi.mock('urql', () => ({ useSubscription: useSubscriptionMock, createRequest: () => ({ key: 1 }) }));
-vi.mock('@/lib/graphql/transport-status', () => ({
-  getStatus: () => statusState.snapshot,
-  subscribeStatus: () => () => {},
+vi.mock('@/lib/graphql/use-watch-subscription', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/graphql/use-watch-subscription')>()),
+  useWatchSubscription: useWatchSubscriptionMock,
 }));
 // Mock the provider hook but keep the real `applyChange` reducer helper (a pure map
 // patch the hook reuses) so the delta accumulation under test runs unaltered.
 vi.mock('@/lib/clusters', () => ({
   useClusters: useClustersMock,
-  applyChange: <T,>(prev: ReadonlyMap<string, T> | undefined, type: string, id: string, entity: T) => {
-    const next = new Map(prev);
-    if (type === 'Deleted') next.delete(id);
-    else next.set(id, entity);
-    return next;
+  applyChange: <T,>(items: Map<string, T>, type: string, id: string, entity: T) => {
+    if (type === 'Deleted') items.delete(id);
+    else items.set(id, entity);
   },
 }));
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
@@ -96,21 +91,22 @@ const workloadsExtra = (nav: { id: string; moreChildren?: readonly { id: string;
 // superseded subscription.
 let acc: unknown;
 let lastArgs: { variables?: { cacheID?: string }; pause?: boolean } | undefined;
-let lastReducer: ((prev: unknown, res: unknown) => unknown) | undefined;
+let lastReducer: ((prev: unknown, frames: unknown[]) => unknown) | undefined;
 
 function pushFrame(type: string, kind: unknown, cacheID = lastArgs?.variables?.cacheID) {
-  acc = lastReducer!(acc, { clusterCachedDataKindsWatch: { type, cacheID, kind } });
+  acc = lastReducer!(acc, [{ clusterCachedDataKindsWatch: { type, cacheID, kind } }]);
 }
 
 // The Bookmark closing the snapshot: what flips the watch from connecting to live.
 function pushBookmark(cacheID = lastArgs?.variables?.cacheID) {
-  acc = lastReducer!(acc, { clusterCachedDataKindsWatch: { type: 'Bookmark', cacheID, kind: null } });
+  acc = lastReducer!(acc, [{ clusterCachedDataKindsWatch: { type: 'Bookmark', cacheID, kind: null } }]);
 }
 
 // A transport reconnect: the exchange bumps the op's generation on the new
 // connection's `open`, which is what makes useWatchSubscription reset its
 // accumulator (fold onto a clean slate, and mask any not-yet-refolded state).
 function pushReset() {
+  acc = undefined;
   statusState.snapshot = { connected: true, generation: statusState.snapshot.generation + 1 };
 }
 
@@ -121,10 +117,10 @@ beforeEach(() => {
   lastReducer = undefined;
   statusState.snapshot = { connected: true, generation: 0 };
   useActiveKubeContextMock.mockReturnValue({ context: 'prod' });
-  useSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
+  useWatchSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
     lastArgs = args;
     lastReducer = reducer;
-    return [{ data: acc }];
+    return { data: acc, connected: statusState.snapshot.connected };
   });
 });
 

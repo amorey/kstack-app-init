@@ -16,9 +16,12 @@ import { render, screen, act } from '@testing-library/react';
 import { Provider as UrqlProvider } from 'urql';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore, pushClusters } from '@/test-utils';
+import { flushWatchesSynchronously, mockTauriCore, pushClusters } from '@/test-utils';
 
 // Mocks ---------------------------------------------------------------
+
+// Frames pushed here are asserted on immediately.
+flushWatchesSynchronously();
 
 const { invokeMock, channels, channelFor, factory } = mockTauriCore();
 vi.mock('@tauri-apps/api/core', () => factory());

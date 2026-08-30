@@ -15,10 +15,10 @@
 import { renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Same seams as cluster-cached-data-events.test.tsx: mock urql's useSubscription (a delta
-// accumulator), the transport-status registry (so `pushReset` bumps the generation), the
-// clusters provider (keeping the real applyChange reducer), and the active-context hook.
-const { useSubscriptionMock } = vi.hoisted(() => ({ useSubscriptionMock: vi.fn() }));
+// Same seams as cluster-cached-data-events.test.tsx: mock useWatchSubscription (an
+// accumulator stand-in that captures the reducer), the clusters provider (keeping the
+// real applyChange reducer), and the active-context hook.
+const { useWatchSubscriptionMock } = vi.hoisted(() => ({ useWatchSubscriptionMock: vi.fn() }));
 const { useClustersMock, useActiveKubeContextMock } = vi.hoisted(() => ({
   useClustersMock: vi.fn(),
   useActiveKubeContextMock: vi.fn(),
@@ -27,18 +27,15 @@ const { statusState } = vi.hoisted(() => ({
   statusState: { snapshot: { connected: true, generation: 0 } },
 }));
 
-vi.mock('urql', () => ({ useSubscription: useSubscriptionMock, createRequest: () => ({ key: 1 }) }));
-vi.mock('@/lib/graphql/transport-status', () => ({
-  getStatus: () => statusState.snapshot,
-  subscribeStatus: () => () => {},
+vi.mock('@/lib/graphql/use-watch-subscription', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/graphql/use-watch-subscription')>()),
+  useWatchSubscription: useWatchSubscriptionMock,
 }));
 vi.mock('@/lib/clusters', () => ({
   useClusters: useClustersMock,
-  applyChange: <T,>(prev: ReadonlyMap<string, T> | undefined, type: string, id: string, entity: T) => {
-    const next = new Map(prev);
-    if (type === 'Deleted') next.delete(id);
-    else next.set(id, entity);
-    return next;
+  applyChange: <T,>(items: Map<string, T>, type: string, id: string, entity: T) => {
+    if (type === 'Deleted') items.delete(id);
+    else items.set(id, entity);
   },
 }));
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
@@ -73,7 +70,7 @@ const uids = (objects: { uid: string }[]) => objects.map((o) => o.uid);
 // subscribed variables so a normal frame is always accepted.
 let acc: unknown;
 let lastArgs: { variables?: { cacheID?: string; apiVersion?: string; resource?: string }; pause?: boolean } | undefined;
-let lastReducer: ((prev: unknown, res: unknown) => unknown) | undefined;
+let lastReducer: ((prev: unknown, frames: unknown[]) => unknown) | undefined;
 
 function pushFrame(
   type: string,
@@ -82,7 +79,7 @@ function pushFrame(
   apiVersion = lastArgs?.variables?.apiVersion,
   resource = lastArgs?.variables?.resource,
 ) {
-  acc = lastReducer!(acc, { clusterCachedDataObjectsWatch: { type, cacheID, apiVersion, resource, object } });
+  acc = lastReducer!(acc, [{ clusterCachedDataObjectsWatch: { type, cacheID, apiVersion, resource, object } }]);
 }
 
 // The Bookmark closing the snapshot: what flips the watch from connecting to live.
@@ -91,12 +88,13 @@ function pushBookmark(
   apiVersion = lastArgs?.variables?.apiVersion,
   resource = lastArgs?.variables?.resource,
 ) {
-  acc = lastReducer!(acc, {
-    clusterCachedDataObjectsWatch: { type: 'Bookmark', cacheID, apiVersion, resource, object: null },
-  });
+  acc = lastReducer!(acc, [
+    { clusterCachedDataObjectsWatch: { type: 'Bookmark', cacheID, apiVersion, resource, object: null } },
+  ]);
 }
 
 function pushReset() {
+  acc = undefined;
   statusState.snapshot = { connected: true, generation: statusState.snapshot.generation + 1 };
 }
 
@@ -107,10 +105,10 @@ beforeEach(() => {
   lastReducer = undefined;
   statusState.snapshot = { connected: true, generation: 0 };
   useActiveKubeContextMock.mockReturnValue({ context: 'prod' });
-  useSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
+  useWatchSubscriptionMock.mockImplementation((args: typeof lastArgs, reducer: typeof lastReducer) => {
     lastArgs = args;
     lastReducer = reducer;
-    return [{ data: acc }];
+    return { data: acc, connected: statusState.snapshot.connected };
   });
 });
 

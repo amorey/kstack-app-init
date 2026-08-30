@@ -15,10 +15,13 @@
 import { createElement } from 'react';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { Client, gql, Provider } from 'urql';
+import { filter, pipe, tap } from 'wonka';
+import type { Source } from 'wonka';
+import type { Exchange, OperationContext, OperationResult } from 'urql';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockTauriCore } from '@/test-utils';
+import { flushWatchesSynchronously, mockTauriCore } from '@/test-utils';
 
 // End-to-end wiring: a real urql Client running the real subscribe-exchange over
 // a mocked Tauri channel, so the hook, the exchange, and the transport-status
@@ -32,7 +35,8 @@ vi.mock('../error-bus', () => ({
 }));
 
 const { tauriSubscriptionExchange } = await import('./subscribe-exchange');
-const { useWatchSubscription, watchPhase } = await import('./use-watch-subscription');
+const { scheduleFlush, setWatchFlushScheduler, useWatchSubscription, watchPhase } =
+  await import('./use-watch-subscription');
 
 const TICK = gql`
   subscription Tick {
@@ -45,7 +49,10 @@ const OPEN = JSON.stringify({ type: 'open' });
 
 // Append each tick — a stand-in for a delta reducer whose accumulation must be
 // thrown away and rebuilt from scratch on a reconnect.
-const appendTick = (prev: number[] | undefined, data: { tick: number }) => [...(prev ?? []), data.tick];
+const appendTick = (prev: number[] | undefined, frames: { tick: number }[]) => [
+  ...(prev ?? []),
+  ...frames.map((f) => f.tick),
+];
 
 // Drive the live channel, wrapped in act so React flushes the resulting renders.
 const emit = (raw: string) => act(() => liveChannel().onmessage!(raw));
@@ -63,12 +70,11 @@ function renderWatch() {
   );
 }
 
-// The first tuple element of the hook result.
-const state = (r: { result: { current: [{ data?: number[] | undefined; connected: boolean }, unknown] } }) =>
-  r.result.current[0];
+const state = (r: { result: { current: { data?: number[] | undefined; connected: boolean } } }) => r.result.current;
 
 describe('useWatchSubscription', () => {
   beforeEach(() => {
+    flushWatchesSynchronously();
     invokeMock.mockReset();
     channels.length = 0;
     let id = 0;
@@ -194,11 +200,9 @@ describe('useWatchSubscription', () => {
     expect(state(r).data).toBeUndefined();
   });
 
-  // urql carries a useSubscription accumulator across a variables change (new op
-  // key). A per-key generation would restart at 1 and alias the old tag, folding
-  // the next operation's first frame onto the previous one's data — e.g. chat,
-  // where each request changes `variables`, would append a later response's first
-  // chunk to the previous response. The globally-monotonic serial prevents it.
+  // A variables change is a new operation: its first frame folds onto nothing, and the
+  // old operation's data never shows through — e.g. chat, where each request changes
+  // `variables`, must not append a later response's first chunk to the previous one.
   it("does not carry a prior operation's accumulator when variables change (P1)", async () => {
     const r = renderHook(
       ({ n }: { n: number }) =>
@@ -222,9 +226,39 @@ describe('useWatchSubscription', () => {
     expect(state(r).data).toEqual([9]); // fresh — not [1, 2, 9]
   });
 
-  // urql also retains the accumulator when the *same* operation pauses and
-  // re-executes. Teardown clears the key's status, so a per-key counter would
-  // restart at 1 and match the retained tag; the monotonic serial does not.
+  // The silent case: a replacement operation that never emits. Nothing after the rerender
+  // is allowed to be what clears the old rows.
+  it('drops its data as soon as variables change, before the new operation emits', async () => {
+    const r = renderHook(
+      ({ n }: { n: number }) =>
+        useWatchSubscription<{ tick: number }, number[]>({ query: TICK, variables: { n } }, appendTick),
+      { wrapper: makeWrapper(), initialProps: { n: 1 } },
+    );
+    await waitFor(() => expect(channels.length).toBeGreaterThan(0));
+    await emit(OPEN);
+    await emit(NEXT(1));
+    expect(state(r).data).toEqual([1]);
+
+    act(() => r.rerender({ n: 2 }));
+    expect(state(r).data).toBeUndefined();
+  });
+
+  it('drops its data as soon as it pauses', async () => {
+    const r = renderHook(
+      ({ paused }: { paused: boolean }) =>
+        useWatchSubscription<{ tick: number }, number[]>({ query: TICK, variables: {}, pause: paused }, appendTick),
+      { wrapper: makeWrapper(), initialProps: { paused: false } },
+    );
+    await waitFor(() => expect(channels.length).toBeGreaterThan(0));
+    await emit(OPEN);
+    await emit(NEXT(1));
+    expect(state(r).data).toEqual([1]);
+
+    act(() => r.rerender({ paused: true }));
+    expect(state(r).data).toBeUndefined();
+  });
+
+  // Pausing tears the subscription down; re-executing the same op key starts clean.
   it('does not reuse a retained accumulator when the same operation pauses and reopens (P2)', async () => {
     const r = renderHook(
       ({ paused }: { paused: boolean }) =>
@@ -247,6 +281,223 @@ describe('useWatchSubscription', () => {
 
     await emit(NEXT(9));
     expect(state(r).data).toEqual([9]); // fresh — not [1, 2, 9]
+  });
+
+  // Frames arrive one per IPC task, so a snapshot of N objects is N frames. The hook folds
+  // each as it lands but publishes once per flush, so consumers render (and re-sort) once.
+  describe('batching', () => {
+    // Capture the scheduled flush instead of running it.
+    let flush: (() => void) | undefined;
+    beforeEach(() => {
+      flush = undefined;
+      setWatchFlushScheduler((fn) => {
+        flush = fn;
+        return () => {
+          flush = undefined;
+        };
+      });
+    });
+
+    it('publishes the frames received since the last flush in one render', async () => {
+      const renders = vi.fn();
+      const r = renderHook(
+        () => {
+          renders();
+          return useWatchSubscription<{ tick: number }, number[]>({ query: TICK, variables: {} }, appendTick);
+        },
+        { wrapper: makeWrapper() },
+      );
+      await waitFor(() => expect(channels.length).toBeGreaterThan(0));
+      await emit(OPEN);
+      renders.mockClear();
+
+      await emit(NEXT(1));
+      await emit(NEXT(2));
+      await emit(NEXT(3));
+      expect(renders).not.toHaveBeenCalled();
+      expect(state(r).data).toBeUndefined();
+
+      act(() => flush!());
+      expect(renders).toHaveBeenCalledTimes(1);
+      expect(state(r).data).toEqual([1, 2, 3]);
+    });
+
+    // One fold per flush, so a reducer copies its map once per batch, not once per frame.
+    it('reduces the batch in one call', async () => {
+      const reduce = vi.fn(appendTick);
+      const r = renderHook(
+        () => useWatchSubscription<{ tick: number }, number[]>({ query: TICK, variables: {} }, reduce),
+        {
+          wrapper: makeWrapper(),
+        },
+      );
+      await waitFor(() => expect(channels.length).toBeGreaterThan(0));
+      await emit(OPEN);
+      await emit(NEXT(1));
+      await emit(NEXT(2));
+      expect(reduce).not.toHaveBeenCalled();
+
+      act(() => flush!());
+      expect(reduce).toHaveBeenCalledTimes(1);
+      expect(reduce).toHaveBeenLastCalledWith(undefined, [{ tick: 1 }, { tick: 2 }]);
+      expect(state(r).data).toEqual([1, 2]);
+    });
+
+    // A dead connection's frames never reach the reducer: the new connection replays everything.
+    it('drops frames received before a reconnect that lands in the same batch', async () => {
+      vi.useFakeTimers();
+      const r = renderWatch();
+      await vi.waitFor(() => expect(channels.length).toBeGreaterThan(0));
+      await emit(OPEN);
+      await emit(NEXT(1));
+      act(() => flush!());
+      expect(state(r).data).toEqual([1]);
+
+      await emit(NEXT(2)); // pending when the transport drops
+      await emit(JSON.stringify({ type: 'complete' }));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(channels.length).toBe(2));
+      await emit(OPEN);
+      await emit(NEXT(7));
+      act(() => flush!());
+      expect(state(r).data).toEqual([7]); // not [1, 2, 7], not [2, 7]
+    });
+
+    // The dead connection's flush is cancelled with its frames. Left scheduled, it would run
+    // after the reconnect's own flush had emptied the queue and fold an empty batch — which
+    // `perFrame` reads as `frames[0]` being undefined.
+    it('cancels the pending flush of the connection it drops', async () => {
+      vi.useFakeTimers();
+      const queued: (() => void)[] = [];
+      setWatchFlushScheduler((fn) => {
+        queued.push(fn);
+        return () => {
+          const i = queued.indexOf(fn);
+          if (i >= 0) queued.splice(i, 1);
+        };
+      });
+      const reduce = vi.fn(appendTick);
+      const r = renderHook(
+        () => useWatchSubscription<{ tick: number }, number[]>({ query: TICK, variables: {} }, reduce),
+        { wrapper: makeWrapper() },
+      );
+      await vi.waitFor(() => expect(channels.length).toBeGreaterThan(0));
+      await emit(OPEN);
+      await emit(NEXT(1)); // schedules a flush that never runs
+
+      await emit(JSON.stringify({ type: 'complete' }));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(channels.length).toBe(2));
+      await emit(OPEN);
+      await emit(NEXT(7));
+
+      expect(queued).toHaveLength(1);
+      act(() => queued.splice(0).forEach((fn) => fn()));
+      expect(reduce).toHaveBeenCalledTimes(1);
+      expect(reduce).toHaveBeenLastCalledWith(undefined, [{ tick: 7 }]);
+      expect(state(r).data).toEqual([7]);
+    });
+  });
+});
+
+// `context` is part of UseSubscriptionArgs, so it has to reach the exchanges — a wrapper
+// that accepted it and dropped it would fail silently.
+describe('operation context', () => {
+  // Records what each subscription operation carried, and answers nothing.
+  const captureExchange =
+    (seen: OperationContext[]): Exchange =>
+    () =>
+    (ops$) =>
+      pipe(
+        ops$,
+        tap((op) => {
+          if (op.kind === 'subscription') seen.push(op.context);
+        }),
+        filter(() => false),
+      ) as unknown as Source<OperationResult>;
+
+  function renderWithContext(seen: OperationContext[], initial: Partial<OperationContext>) {
+    const client = new Client({ url: 'tauri://graphql', exchanges: [captureExchange(seen)] });
+    return renderHook(
+      ({ ctx }: { ctx: Partial<OperationContext> }) =>
+        useWatchSubscription<{ tick: number }, number[]>({ query: TICK, variables: {}, context: ctx }, appendTick),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => createElement(Provider, { value: client }, children),
+        initialProps: { ctx: initial },
+      },
+    );
+  }
+
+  it('forwards it to the exchanges', async () => {
+    const seen: OperationContext[] = [];
+    renderWithContext(seen, { requestPolicy: 'network-only' });
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0].requestPolicy).toBe('network-only');
+  });
+
+  it('re-executes when it changes', async () => {
+    const seen: OperationContext[] = [];
+    const r = renderWithContext(seen, { requestPolicy: 'network-only' });
+    await waitFor(() => expect(seen).toHaveLength(1));
+
+    act(() => r.rerender({ ctx: { requestPolicy: 'cache-and-network' } }));
+    await waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen[1].requestPolicy).toBe('cache-and-network');
+  });
+});
+
+// The production scheduler. A minimized window gets no animation frames, so the frames
+// every watch is queueing have to reach the reducer some other way.
+describe('scheduleFlush', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('flushes on the animation frame when the window is drawing', () => {
+    vi.useFakeTimers();
+    const frames: (() => void)[] = [];
+    vi.stubGlobal('requestAnimationFrame', (fn: () => void) => frames.push(fn));
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    const flush = vi.fn();
+
+    scheduleFlush(flush);
+    frames[0]();
+    expect(flush).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(10_000); // the fallback was cancelled by the frame that ran
+    expect(flush).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes on the fallback timer when no animation frame arrives', () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('requestAnimationFrame', () => 0); // suspended: never calls back
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    const flush = vi.fn();
+
+    scheduleFlush(flush);
+    expect(flush).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1_000);
+    expect(flush).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels both paths', () => {
+    vi.useFakeTimers();
+    let frame: (() => void) | undefined;
+    vi.stubGlobal('requestAnimationFrame', (fn: () => void) => {
+      frame = fn;
+      return 1;
+    });
+    vi.stubGlobal('cancelAnimationFrame', () => {
+      frame = undefined;
+    });
+    const flush = vi.fn();
+
+    scheduleFlush(flush)();
+    frame?.();
+    vi.advanceTimersByTime(10_000);
+    expect(flush).not.toHaveBeenCalled();
   });
 });
 
