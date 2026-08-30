@@ -5,6 +5,7 @@ import js from '@eslint/js';
 import { configs, plugins } from 'eslint-config-airbnb-extended';
 import { rules as prettierConfigRules } from 'eslint-config-prettier';
 import prettierPlugin from 'eslint-plugin-prettier';
+import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
 
 const gitignorePath = path.resolve(import.meta.dirname, '.gitignore');
@@ -19,7 +20,18 @@ const jsConfig = [
   ...configs.base.recommended,
 ];
 
-const reactConfig = [plugins.react, plugins.reactHooks, plugins.reactA11y, ...configs.react.recommended];
+// The React compiler's lint rules ship inside eslint-plugin-react-hooks, and diagnose the same
+// things the Vite/babel transform (`vite.config.ts`) bails out on. Applied here rather than left to
+// airbnb's react-hooks block, which enables most of them but not all — and states no intent to.
+// `recommended-latest` is the set matching the installed plugin; both use the compiler's defaults,
+// as does the build.
+const reactConfig = [
+  plugins.react,
+  plugins.reactHooks,
+  plugins.reactA11y,
+  ...configs.react.recommended,
+  reactHooks.configs.flat['recommended-latest'],
+];
 
 const typescriptConfig = [
   plugins.typescriptEslint,
@@ -73,7 +85,9 @@ const customRulesConfig = [
       'react/prop-types': 'off',
       'react/react-in-jsx-scope': 'off',
       'react/require-default-props': 'off',
-      'react-hooks/exhaustive-deps': 'off',
+      // On, and an error: the compiler is a speed-up, not the thing keeping a dep array
+      // honest. Code here is written to be correct without it.
+      'react-hooks/exhaustive-deps': 'error',
       'react-refresh/only-export-components': 'off',
       '@typescript-eslint/no-use-before-define': 'off',
     },

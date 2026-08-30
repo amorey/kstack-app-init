@@ -118,6 +118,16 @@ Vitest + `@testing-library/react` (jsdom), co-located (`*.test.ts[x]`). Mock the
 ### Lint / build
 
 - `pnpm lint` (ESLint: airbnb-extended + prettier) → `make lint-js`. Run before committing.
+- The **React compiler** is on in two places that must stay in step: the Vite/babel transform
+  (`vite.config.ts`) and its lint rules, which ship inside `eslint-plugin-react-hooks` — there is no
+  separate compiler plugin to install. `eslint.config.ts` applies the plugin's `recommended-latest`
+  on top of airbnb's narrower set. So a bail-out the transform would take silently is a lint error
+  instead: mutating a prop, reading a ref in render, `setState` during render.
+- **Write as though the compiler weren't there.** It is a speed-up, not a correctness guarantee —
+  it bails per-function, silently. So `react-hooks/exhaustive-deps` is an **error**, and manual
+  `useMemo`/`useCallback` are ordinary tools, not smells: the compiler rules never discourage them
+  (`preserve-manual-memoization` exists to protect one). `void-use-memo` flags only a `useMemo`
+  returning nothing — a `useEffect` written as a memo.
 - `pnpm build` = `tsc -b && vite build`. Dev: `pnpm dev` (webview) or `pnpm tauri dev` (full app).
 
 [urql]: https://commerce.nearform.com/open-source/urql/
