@@ -199,3 +199,96 @@ func TestASweepSurvivesAVacuumItCannotRun(t *testing.T) {
 
 	assert.NotPanics(t, func() { sweep(ctx, "1", f, Retention{StatusHistoryTTL: time.Hour}) })
 }
+
+// addDeleteEntry logs one delete at a given age, standing in for the entry a delete left.
+func addDeleteEntry(t *testing.T, s *Store, kind, uid string, seq int64, age time.Duration) {
+	t.Helper()
+	_, err := db(t, s).ExecContext(context.Background(),
+		`INSERT INTO deletes(seq, api_version, kind, uid, at) VALUES (?, 'v1', ?, ?, ?)`,
+		seq, kind, uid, time.Now().Add(-age).UnixMilli())
+	require.NoError(t, err)
+}
+
+// trimmedMark is how far a kind's log has been trimmed, as a reader reads it.
+func trimmedMark(t *testing.T, s *Store, kind string) int64 {
+	t.Helper()
+	mark, err := trimmed(context.Background(), openFileOf(t, s).stmts(), "v1", kind)
+	require.NoError(t, err)
+	return mark
+}
+
+// A reader's cursor goes stale by time, not by count, so the log is bounded by age. What
+// it trims it must also announce: a cursor at or below the mark can no longer be trusted
+// to have seen every delete above it.
+func TestSweepTrimsTheDeletesLogPastItsTTL(t *testing.T) {
+	store := newTestStore(t)
+	addDeleteEntry(t, store, "Pod", "uid-old", 7, 48*time.Hour)
+	addDeleteEntry(t, store, "Pod", "uid-older", 4, 49*time.Hour)
+	addDeleteEntry(t, store, "Pod", "uid-fresh", 9, time.Minute)
+
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+
+	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM deletes`), "only the fresh entry stays")
+	assert.Equal(t, int64(7), trimmedMark(t, store, "Pod"), "the highest position removed")
+}
+
+// Cursors are per kind, so the marks are too: a global one would have a busy kind's
+// deletes push every quiet kind's cursor into the diff within minutes.
+func TestSweepMarksEachKindSeparately(t *testing.T) {
+	store := newTestStore(t)
+	addDeleteEntry(t, store, "Pod", "uid-1", 3, 48*time.Hour)
+	addDeleteEntry(t, store, "ConfigMap", "uid-2", 8, 48*time.Hour)
+	addDeleteEntry(t, store, "Secret", "uid-3", 9, time.Minute)
+
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+
+	assert.Equal(t, int64(3), trimmedMark(t, store, "Pod"))
+	assert.Equal(t, int64(8), trimmedMark(t, store, "ConfigMap"))
+	assert.Zero(t, trimmedMark(t, store, "Secret"), "a kind with nothing removed has no mark")
+}
+
+// Retention's fields are independent, so a manager given one TTL and not the other must
+// leave the unset table alone. A cutoff of now trims the whole log and raises every kind's
+// mark to the head of it, invalidating every reader's cursor in one sweep.
+func TestAZeroTTLTrimsNothing(t *testing.T) {
+	store := newTestStore(t)
+	addDeleteEntry(t, store, "Pod", "uid-1", 5, 48*time.Hour)
+	addStatusRow(t, store, "uid-1", 48*time.Hour)
+
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{})
+
+	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM deletes`))
+	assert.Zero(t, trimmedMark(t, store, "Pod"), "nothing went, so nothing is marked")
+	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM status_history`))
+}
+
+// A mark only ever goes up: a later sweep that takes nothing from a kind must not lower
+// what an earlier one recorded, or a cursor below it would read as valid again.
+func TestASweepThatRemovesNothingLeavesTheMarkAlone(t *testing.T) {
+	store := newTestStore(t)
+	addDeleteEntry(t, store, "Pod", "uid-1", 5, 48*time.Hour)
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+
+	assert.Equal(t, int64(5), trimmedMark(t, store, "Pod"))
+}
+
+// `at` and `seq` rise together only within one file lifetime: the clock stamp is forced
+// upward in memory and starts again from the wall clock on reopen, while the counter is on
+// disk and does not. So a burst that ran the stamps ahead of the clock leaves entries whose
+// age and position disagree, and a later sweep can take a LOWER position than an earlier
+// one. The mark must not follow it down — a cursor between the two marks would read as
+// valid over deletes that are already gone.
+func TestASweepNeverLowersAKindsMark(t *testing.T) {
+	store := newTestStore(t)
+	addDeleteEntry(t, store, "Pod", "uid-high", 200, 90*time.Minute)
+	addDeleteEntry(t, store, "Pod", "uid-low", 100, 30*time.Minute)
+
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	require.Equal(t, int64(200), trimmedMark(t, store, "Pod"))
+	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: 10 * time.Minute})
+
+	assert.Equal(t, int64(200), trimmedMark(t, store, "Pod"), "the older entry's lower position")
+	assert.Zero(t, countRows(t, store, `SELECT COUNT(*) FROM deletes`), "both entries went")
+}

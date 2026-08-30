@@ -885,14 +885,16 @@ func TestOpenReportsAReadStatementItCannotPrepare(t *testing.T) {
 		CREATE TABLE objects(uid TEXT PRIMARY KEY, api_version TEXT, kind TEXT, namespace TEXT,
 			name TEXT, resource_version TEXT, generation INT, created_at INT, updated_at INT,
 			status_summary TEXT, ready_count INT, total_count INT, restart_count INT, host TEXT,
-			raw_json BLOB);
+			write_seq INT, raw_json BLOB);
 		CREATE TABLE owner_refs(child_uid TEXT, owner_uid TEXT, is_controller INT,
 			PRIMARY KEY(child_uid, owner_uid));
 		CREATE TABLE labels(uid TEXT, key TEXT, value TEXT, PRIMARY KEY(uid, key));
 		CREATE TABLE status_history(uid TEXT, at INT, summary TEXT);
+		CREATE TABLE deletes(seq INT, api_version TEXT, kind TEXT, uid TEXT, at INT);
 		CREATE TABLE events(uid TEXT PRIMARY KEY, involved_uid TEXT, involved_kind TEXT,
 			involved_ns TEXT, involved_name TEXT, type TEXT, reason TEXT, message TEXT,
-			first_seen INT, last_seen INT, count INT, raw_json BLOB, updated_at INT);
+			first_seen INT, last_seen INT, count INT, raw_json BLOB, updated_at INT,
+			resource_version TEXT, write_seq INT);
 		CREATE TABLE kind_catalog(api_version TEXT, kind TEXT, resource TEXT, scope TEXT,
 			is_crd INT, schema_json TEXT, printer_columns TEXT, PRIMARY KEY(api_version, kind));
 		CREATE TABLE kind_counts(api_version TEXT, kind TEXT, PRIMARY KEY(api_version, kind));`)

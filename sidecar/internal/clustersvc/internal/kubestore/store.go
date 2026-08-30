@@ -142,6 +142,27 @@ func (f *file) stamp() int64 {
 	return next
 }
 
+// writeStamp is what one write transaction marks its rows with, taken once before
+// anything it writes so rows committed together carry the same pair. The two rise together
+// within one file's life and not across a reopen, since only the counter is on disk —
+// nothing may assume an order in one from the other (see trimDeletes).
+type writeStamp struct {
+	// at is the wall clock in millis — what a relist prunes by.
+	at int64
+	// seq is the position a reader resumes from.
+	seq int64
+}
+
+// writeStamp takes this transaction's pair. The counter read is a write, so it must run
+// on the transaction that will use the number, not beside it.
+func (f *file) writeStamp(ctx context.Context, st stmts) (writeStamp, error) {
+	seq, err := nextSeq(ctx, st)
+	if err != nil {
+		return writeStamp{}, err
+	}
+	return writeStamp{at: f.stamp(), seq: seq}, nil
+}
+
 // notify pings one key after a commit. Failure is a closed hub — a store shutting down,
 // which the subscriber learns from its own receiver.
 func (f *file) notify(key string) { _ = f.hub.Sender().Send(key, struct{}{}) }
@@ -307,6 +328,11 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 	st := f.tx(tx)
 
+	stamp, err := f.writeStamp(ctx, st)
+	if err != nil {
+		return fmt.Errorf("apply %s: %w", k.Kind, err)
+	}
+
 	if t == watch.Deleted {
 		// An unkeyable delete errors rather than no-opping: booking progress for a delta
 		// whose row never went would resume the next watch past it.
@@ -315,14 +341,16 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 			return fmt.Errorf("apply %s delete: empty UID", k.Kind)
 		}
 		if k.isCoreEvents() {
-			_, err = st.exec(ctx, stmtDeleteEvent, uid)
+			if err = logDeletes(ctx, st, stmtLogDeleteEvent, stamp, uid); err == nil {
+				_, err = st.exec(ctx, stmtDeleteEvent, uid)
+			}
 		} else {
-			err = deleteObjectRow(ctx, st, uid)
+			err = deleteObjectRow(ctx, st, uid, stamp)
 		}
 	} else if k.isCoreEvents() {
-		err = f.writeEvent(ctx, st, u)
+		err = f.writeEvent(ctx, st, u, stamp)
 	} else {
-		err = f.writeObject(ctx, st, k, u)
+		err = f.writeObject(ctx, st, k, u, stamp)
 	}
 	// A body the projection rejects is skipped, exactly as a relist page skips it. The cookie
 	// still advances over it: the server replays from that position, so a run that failed here
@@ -344,21 +372,21 @@ func (s *Store) ApplyChange(ctx context.Context, k Kind, t watch.EventType, u *u
 }
 
 // writeObject projects and upserts one object body.
-func (f *file) writeObject(ctx context.Context, st stmts, k Kind, u *unstructured.Unstructured) error {
+func (f *file) writeObject(ctx context.Context, st stmts, k Kind, u *unstructured.Unstructured, stamp writeStamp) error {
 	row, err := projectObject(u)
 	if err != nil {
 		return err
 	}
-	return insertObjectRow(ctx, st, k, row, f.stamp())
+	return insertObjectRow(ctx, st, k, row, stamp)
 }
 
 // writeEvent projects and upserts one event body.
-func (f *file) writeEvent(ctx context.Context, st stmts, u *unstructured.Unstructured) error {
+func (f *file) writeEvent(ctx context.Context, st stmts, u *unstructured.Unstructured, stamp writeStamp) error {
 	row, err := extractEvent(u)
 	if err != nil {
 		return err
 	}
-	return insertEventRow(ctx, st, row, f.stamp())
+	return insertEventRow(ctx, st, row, stamp)
 }
 
 // CountKind returns one kind's cached rows, off the trigger-maintained kind_counts
@@ -426,9 +454,17 @@ func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 	st := f.tx(tx)
 
+	stamp, err := f.writeStamp(ctx, st)
+	if err != nil {
+		return fmt.Errorf("clear kind: %w", err)
+	}
+
 	// Core events are not in objects: they have their own table, which this collection
 	// owns outright.
 	if k.isCoreEvents() {
+		if err := logDeletes(ctx, st, stmtLogDeleteAllEvents, stamp); err != nil {
+			return fmt.Errorf("clear kind: log events: %w", err)
+		}
 		if _, err := st.exec(ctx, stmtDeleteAllEvents); err != nil {
 			return fmt.Errorf("clear kind: delete events: %w", err)
 		}
@@ -438,6 +474,9 @@ func (s *Store) ClearKind(ctx context.Context, k Kind) error {
 		// that child says, and only rewriting the child could put it back. Traversals
 		// join against objects, where a missing owner reads the same as one whose kind is
 		// not mirrored at all.
+		if err := logDeletes(ctx, st, stmtLogClearObjectsOfKind, stamp, k.APIVersion, k.Kind); err != nil {
+			return fmt.Errorf("clear kind: log rows: %w", err)
+		}
 		for _, id := range []stmtID{
 			stmtClearOwnerRefsOfKind, stmtClearLabelsOfKind,
 			stmtClearStatusHistoryOfKind, stmtClearObjectsOfKind,
@@ -526,13 +565,16 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 			return fmt.Errorf("write page: clear cookie: %w", err)
 		}
 	}
-	now := r.f.stamp()
+	stamp, err := r.f.writeStamp(ctx, st)
+	if err != nil {
+		return fmt.Errorf("write page: %w", err)
+	}
 	for _, u := range items {
 		var err error
 		if r.kind.isCoreEvents() {
-			err = r.writeEvent(ctx, st, u, now)
+			err = r.writeEvent(ctx, st, u, stamp)
 		} else {
-			err = r.writeObject(ctx, st, u, now)
+			err = r.writeObject(ctx, st, u, stamp)
 		}
 		if err != nil {
 			return fmt.Errorf("write page: %w", err)
@@ -553,25 +595,25 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 }
 
 // writeObject lands one page item, skipping a body that will not project.
-func (r *ReplaceSession) writeObject(ctx context.Context, st stmts, u *unstructured.Unstructured, now int64) error {
+func (r *ReplaceSession) writeObject(ctx context.Context, st stmts, u *unstructured.Unstructured, stamp writeStamp) error {
 	row, err := projectObject(u)
 	if errors.Is(err, errUnprojectable) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return insertObjectRow(ctx, st, r.kind, row, now)
+	return insertObjectRow(ctx, st, r.kind, row, stamp)
 }
 
 // writeEvent is writeObject for the events table.
-func (r *ReplaceSession) writeEvent(ctx context.Context, st stmts, u *unstructured.Unstructured, now int64) error {
+func (r *ReplaceSession) writeEvent(ctx context.Context, st stmts, u *unstructured.Unstructured, stamp writeStamp) error {
 	row, err := extractEvent(u)
 	if errors.Is(err, errUnprojectable) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return insertEventRow(ctx, st, row, now)
+	return insertEventRow(ctx, st, row, stamp)
 }
 
 // Commit sweeps the rows no page rewrote, then persists the cookie in the same
@@ -585,9 +627,17 @@ func (r *ReplaceSession) Commit(ctx context.Context, resourceVersion string) (in
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 	st := r.f.tx(tx)
 
+	stamp, err := r.f.writeStamp(ctx, st)
+	if err != nil {
+		return 0, fmt.Errorf("commit relist: %w", err)
+	}
+
 	var pruned int
 	if r.kind.isCoreEvents() {
 		// The events table is this collection's outright, so the prune is unscoped.
+		if err := logDeletes(ctx, st, stmtLogPruneEvents, stamp, r.mark); err != nil {
+			return 0, fmt.Errorf("commit relist: log pruned events: %w", err)
+		}
 		res, err := st.exec(ctx, stmtPruneEvents, r.mark)
 		if err != nil {
 			return 0, fmt.Errorf("commit relist: prune events: %w", err)
@@ -598,7 +648,7 @@ func (r *ReplaceSession) Commit(ctx context.Context, resourceVersion string) (in
 		}
 		pruned = int(n)
 	} else {
-		if pruned, err = sweepObjects(ctx, st, r.kind, r.mark); err != nil {
+		if pruned, err = sweepObjects(ctx, st, r.kind, r.mark, stamp); err != nil {
 			return 0, fmt.Errorf("commit relist: prune: %w", err)
 		}
 	}

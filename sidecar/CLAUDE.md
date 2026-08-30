@@ -165,6 +165,24 @@ its write path:
   which is the object's own `metadata.generation`. Every write takes a **strictly increasing**
   stamp (`Store.stamp`): the clock has millisecond resolution, so a relist running in the same
   tick as the rows it supersedes would otherwise keep every one of them.
+- **Every row carries the position of its last effective write** — `write_seq`, off a counter in
+  `cluster_meta` that each write transaction takes one number from — so a reader asks "what moved
+  past X?" as an index range rather than by re-reading a kind. **The stamp moves only when
+  `resource_version` does**, which is the whole of it: a relist rewrites every row, and a stamp that
+  moved on each rewrite would make a cold list read as one change per object. It is ours and is not
+  `resource_version` itself, which is the cluster's own string, neither ordered nor comparable.
+  **Unchanged means unchanged in full**: an *empty* version is equal to itself forever and nothing
+  upstream rejects one, and the upsert rewrites `api_version`/`kind` in the same SET list — so both
+  ride the stamp's condition, or a row keeps a position below the readers looking for it and no
+  delete is logged either.
+- **A delete takes its row with it, so it leaves an entry in `deletes`** — the uid, its kind, and
+  the same position. Every delete path logs first, in the same transaction and off the delete's own
+  predicate, so the two cannot disagree about which rows went; events log under the fixed
+  `('v1', 'Event')` the count triggers use. **A row and an entry for one uid coexist** — `ClearKind`
+  logs a delete per row and the restarted sync lists the same objects back above it — so a reader
+  applies deletes BEFORE writes: a uid whose last action was a delete has no row, so the writes
+  range only ever returns rows that still exist. Writes-first would drop a live row, and on a quiet
+  kind nothing would re-send it.
 - **Core `v1` events are written to the `events` table**, routed by api version and plural rather
   than by the Kind name — any group may serve a Kind called `Event`, and a CRD's rows are ordinary
   objects. **Nothing ages them out and nothing bounds the read**: a cache holds what the server
@@ -219,8 +237,8 @@ another pool's statement) — none exists, and adding one is a design decision, 
 **One janitor per open file**, started in `openFile` and stopped in `(*file).close` — so its
 lifetime is the file's, and a `Clear`'s fresh file gets one like any other (`openFile` has two
 call sites, and the reopen mid-clear is the one a start at the call site misses). It trims
-`status_history` past `Retention.StatusHistoryTTL`, then hands free pages back with
-`PRAGMA incremental_vacuum`. Three rules hold it together:
+`status_history` past `Retention.StatusHistoryTTL` and `deletes` past `Retention.DeletesTTL`, then
+hands free pages back with `PRAGMA incremental_vacuum`. Four rules hold it together:
 
 - **Gate on `PRAGMA freelist_count`, never on what the sweep itself deleted.** The writers that
   actually free pages — a relist's prune, `ClearKind`, a `Remove` — do not vacuum, so a
@@ -230,13 +248,25 @@ call sites, and the reopen mid-clear is the one a start at the call site misses)
   freelist is biggest right after a relist, when blocking it hurts most. A backlog drains over
   the following sweeps. The `status_history` delete is not bounded: one statement over a table
   that is small by construction.
+- **The deletes trim records how far it got, per kind**, in the trim's own transaction — so a
+  reader that takes a kind's mark and the entries above it in one transaction of its own cannot be
+  trimmed between the two, and a cursor at or below the mark can no longer be trusted. Per kind
+  because cursors are: one global mark would have a busy kind's deletes push every quiet kind's
+  cursor past it within minutes. **A mark only ever rises, and the upsert is what enforces it** —
+  `write_seq` is on disk and `updated_at` is forced upward in memory from the wall clock, so the two
+  disagree across a reopen and a later sweep can take a lower position than an earlier one. Both the
+  trim and the raise are writes (`DELETE … RETURNING`, a `CASE` on the upsert) rather than a read
+  beside them, since a read has no home inside a write transaction. By age, because what it bounds
+  is how stale a cursor may be.
 - **Nothing waits under `m.mu`.** The stop is a cancel, and the sweep runs on the janitor's own
   context, so it aborts mid-statement — all three exits (`Clear`, `Remove`, `Manager.Close`) hold
   the lock across the close, and a wait there would stall `Stats` behind a vacuum. For the same
   reason the first sweep runs inside the goroutine rather than inline in `openFile`.
 
 `NewManager(dir, Retention{...})` is the whole plumbing; production passes `DefaultRetention` and
-a zero `Interval` runs no janitor, which is what a test about anything else opens with.
+a zero `Interval` runs no janitor, which is what a test about anything else opens with. The two
+TTLs are independent and a zero one keeps its table whole — a cutoff of now would trim everything,
+and for `deletes` raise every kind's mark to the head of the log.
 
 **The store owns the change signal, and it is a coalesced ping, not a row delta.** Writers notify
 after commit, keyed per kind (`objects/<apiVersion>/<resource>`) or on the events bus; a reader
@@ -276,8 +306,8 @@ again in an autoindex, and ordering the edge tables by their uid prefix turns th
 `WHERE uid = ?` into one contiguous descent. The saving is partly paid back — a secondary index on
 such a table carries the full key where it carried an 8-byte rowid — so adding a wide index to one
 of these four is what would turn the trade. `objects`, `events`, `kind_catalog` and
-`status_history` keep their rowid, each for a reason written beside it (a wide row, an FTS index
-declared `content_rowid`, no key at all). Nothing has shipped, so a form change is an edit to
+`status_history` and `deletes` keep their rowid, each for a reason written beside it (a wide row, an
+FTS index declared `content_rowid`, no key at all). Nothing has shipped, so a form change is an edit to
 `0001_init.sql`; after shipping it is a migration, and `ALTER TABLE … RENAME` re-parses the whole
 schema and refuses against a trigger naming the table being rebuilt — five triggers name
 `kind_counts`. → [ADR: editing the initial schema](../docs/adr/2026-08-29-schema-edit-not-migration.md).

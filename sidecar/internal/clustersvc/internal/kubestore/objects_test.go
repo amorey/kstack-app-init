@@ -318,3 +318,80 @@ func TestSanitizeLeavesASecretWhoseDataIsNotAMap(t *testing.T) {
 
 	assert.Equal(t, "not-a-map", got.Object["data"])
 }
+
+// writeSeq is one object's stamp, and 0 when the row is gone.
+func writeSeq(t *testing.T, s *Store, uid string) int64 {
+	t.Helper()
+	return int64(countRows(t, s, `SELECT COALESCE(MAX(write_seq), 0) FROM objects WHERE uid = ?`, uid))
+}
+
+// The stamp is what a reader resumes from: it must move for a write that changed the
+// object, and stay put for one that did not.
+func TestAnObjectIsStampedWithItsWritePosition(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+	first := writeSeq(t, s, "uid-1")
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified, pod("uid-1", "api-0", "42")))
+	same := writeSeq(t, s, "uid-1")
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified, pod("uid-1", "api-0", "43")))
+	moved := writeSeq(t, s, "uid-1")
+
+	assert.Positive(t, first)
+	assert.Equal(t, first, same, "the same body carries no news")
+	assert.Greater(t, moved, first, "a new resourceVersion is a change")
+}
+
+// Nothing upstream rejects a body with no resourceVersion, and an empty one is equal to
+// itself forever — so it must never read as "unchanged", or the row would keep the stamp
+// of its first write for the life of the cache and no reader past that position would
+// ever see it again.
+func TestAnObjectWithNoResourceVersionIsAlwaysAChange(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "")))
+	first := writeSeq(t, s, "uid-1")
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified, pod("uid-1", "api-0", "")))
+
+	assert.Greater(t, writeSeq(t, s, "uid-1"), first)
+}
+
+// The upsert rewrites api_version and kind, so the stamp has to move when they do: a
+// preferred-version flip reaching the write path before the old kind's rows are cleared
+// would otherwise leave the row below every reader of the kind it now belongs to, with no
+// delete logged under the kind it left.
+func TestAnObjectThatChangesKindMovesItsStamp(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	renamed := Kind{APIVersion: "v1beta1", Kind: "Pod", Resource: "pods"}
+
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+	first := writeSeq(t, s, "uid-1")
+	require.NoError(t, s.ApplyChange(ctx, renamed, watch.Modified, pod("uid-1", "api-0", "42")))
+
+	assert.Greater(t, writeSeq(t, s, "uid-1"), first)
+}
+
+// A relist rewrites every row of a kind. Moving the stamp on each rewrite would turn a
+// cold list into one change per object, and a reader would take all of them to learn
+// that nothing moved.
+func TestARelistThatChangesNothingLeavesEveryStamp(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	rows := []*unstructured.Unstructured{pod("uid-1", "api-0", "42"), pod("uid-2", "api-1", "43")}
+	session := beginReplace(t, s, podKind)
+	require.NoError(t, session.WritePage(ctx, rows))
+	_, err := session.Commit(ctx, "100")
+	require.NoError(t, err)
+	before := []int64{writeSeq(t, s, "uid-1"), writeSeq(t, s, "uid-2")}
+
+	again := beginReplace(t, s, podKind)
+	require.NoError(t, again.WritePage(ctx, rows))
+	_, err = again.Commit(ctx, "101")
+	require.NoError(t, err)
+
+	assert.Equal(t, before, []int64{writeSeq(t, s, "uid-1"), writeSeq(t, s, "uid-2")})
+	assert.NotZero(t, before[0])
+}

@@ -32,8 +32,12 @@ var vacuumPagesPerSweep int64 = 2048
 // tables nothing upstream owns.
 type Retention struct {
 	// StatusHistoryTTL caps the per-object status timeline. A relist rewrites every row
-	// and inserts nothing, so volume is small and a week is cheap.
+	// and inserts nothing, so volume is small and a week is cheap. Zero keeps everything.
 	StatusHistoryTTL time.Duration
+	// DeletesTTL caps the deletes log. By age rather than by count, because what it
+	// bounds is how stale a reader's cursor may be before it has to diff again. Zero
+	// keeps everything.
+	DeletesTTL time.Duration
 	// Interval is the sweep cadence. Zero runs no janitor at all, which is what a test
 	// about anything else opens its manager with.
 	Interval time.Duration
@@ -42,6 +46,7 @@ type Retention struct {
 // DefaultRetention is the production setting.
 var DefaultRetention = Retention{
 	StatusHistoryTTL: 7 * 24 * time.Hour,
+	DeletesTTL:       time.Hour,
 	Interval:         5 * time.Minute,
 }
 
@@ -67,14 +72,26 @@ func runJanitor(ctx context.Context, id string, f *file, ret Retention) {
 // sweep trims what this cache's own tables hold past their retention. Sweeps are ordinary
 // writes, so they serialize with the syncs behind the writer pool's single connection.
 func sweep(ctx context.Context, id string, f *file, ret Retention) {
-	// Unbounded, unlike the vacuum below: `at` carries no index, so this is a full scan —
-	// but the table is append-on-change and small by construction, and one statement is
-	// cheaper than a page-by-page walk. If it ever stops being small the answer is an index
-	// on `at`, not a chunked delete.
-	if _, err := f.stmts().exec(ctx, stmtSweepStatusHistory,
-		time.Now().Add(-ret.StatusHistoryTTL).UnixMilli(),
-	); err != nil {
-		slog.Warn("kubestore: status_history sweep failed", "cacheID", id, "err", err)
+	// A zero TTL is a table this manager was not given a retention for, and the fields are
+	// independent — so a partial Retention must leave each unset one alone. Without the
+	// guard the cutoff is now, which trims the whole table: for deletes that also raises
+	// every kind's mark to the head of the log, invalidating every reader's cursor at once.
+	if ret.StatusHistoryTTL > 0 {
+		// Unbounded, unlike the vacuum below: `at` carries no index, so this is a full scan
+		// — but the table is append-on-change and small by construction, and one statement
+		// is cheaper than a page-by-page walk. If it ever stops being small the answer is an
+		// index on `at`, not a chunked delete.
+		if _, err := f.stmts().exec(ctx, stmtSweepStatusHistory,
+			time.Now().Add(-ret.StatusHistoryTTL).UnixMilli(),
+		); err != nil {
+			slog.Warn("kubestore: status_history sweep failed", "cacheID", id, "err", err)
+		}
+	}
+
+	if ret.DeletesTTL > 0 {
+		if err := trimDeletes(ctx, f, time.Now().Add(-ret.DeletesTTL).UnixMilli()); err != nil {
+			slog.Warn("kubestore: deletes sweep failed", "cacheID", id, "err", err)
+		}
 	}
 
 	// Hand freed pages back to the OS; under auto_vacuum=INCREMENTAL this walks only the

@@ -34,6 +34,14 @@ const (
 	stmtInsertStatusTransition
 	stmtDeleteObject
 	stmtSweepObjects
+	// The deletes log, one id per delete path: each copies the doomed rows off the
+	// delete's own predicate, and runs before it.
+	stmtLogDeleteObject
+	stmtLogDeleteEvent
+	stmtLogSweepObjects
+	stmtLogPruneEvents
+	stmtLogClearObjectsOfKind
+	stmtLogDeleteAllEvents
 	// The per-object cascade: one point delete per side table.
 	stmtDeleteLabelsOfObject
 	stmtDeleteOwnerRefsOfChild
@@ -58,11 +66,14 @@ const (
 	stmtPruneEvents
 	stmtUpsertMeta
 	stmtDeleteMeta
+	stmtMarkTrimmedDeletes
+	stmtNextSeq
 	stmtResolveKindRename
 	stmtUpsertKind
 	stmtDeleteAllKinds
 	stmtPruneKinds
 	stmtSweepStatusHistory
+	stmtTrimDeletes
 	stmtSelectMeta
 	stmtCountKind
 	stmtSelectKinds
@@ -78,14 +89,27 @@ var stmtText = [numStmts]string{
 		INSERT INTO objects (
 			uid, api_version, kind, namespace, name,
 			resource_version, generation, created_at, updated_at, raw_json,
-			status_summary, ready_count, total_count, restart_count, host
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			status_summary, ready_count, total_count, restart_count, host, write_seq
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(uid) DO UPDATE SET
 			api_version=excluded.api_version,
 			kind=excluded.kind,
 			namespace=excluded.namespace,
 			name=excluded.name,
 			resource_version=excluded.resource_version,
+			-- The stamp moves only when the version does: a relist rewrites every row of
+			-- a kind, and moving it on each rewrite would make a cold list read as one
+			-- change per object. Two ways a row would otherwise keep a position it has
+			-- outgrown, both silent — a reader asks for what moved past its cursor and the
+			-- row is never in the range, with no delete logged either. An EMPTY version
+			-- (nothing upstream rejects one) is equal to itself forever, so the row would
+			-- freeze at its first write. And identity is rewritten by this same SET list,
+			-- so a uid that moved kind would sit below the new kind's readers.
+			write_seq=CASE WHEN excluded.resource_version <> ''
+			                AND excluded.resource_version = objects.resource_version
+			                AND excluded.api_version = objects.api_version
+			                AND excluded.kind = objects.kind
+			               THEN objects.write_seq ELSE excluded.write_seq END,
 			generation=excluded.generation,
 			-- creationTimestamp is immutable, so a body without it carries no news;
 			-- projectObject leaves it 0, which would otherwise overwrite a good value
@@ -105,6 +129,27 @@ var stmtText = [numStmts]string{
 		WHERE NOT EXISTS (SELECT 1 FROM objects WHERE uid = ? AND status_summary = ?)`,
 
 	stmtDeleteObject: `DELETE FROM objects WHERE uid=?`,
+
+	stmtLogDeleteObject: `
+		INSERT INTO deletes (seq, api_version, kind, uid, at)
+		SELECT ?, api_version, kind, uid, ? FROM objects WHERE uid = ?`,
+	stmtLogDeleteEvent: `
+		INSERT INTO deletes (seq, api_version, kind, uid, at)
+		SELECT ?, 'v1', 'Event', uid, ? FROM events WHERE uid = ?`,
+	stmtLogSweepObjects: `
+		INSERT INTO deletes (seq, api_version, kind, uid, at)
+		SELECT ?, api_version, kind, uid, ?
+		FROM objects WHERE api_version=? AND kind=? AND updated_at < ?`,
+	stmtLogPruneEvents: `
+		INSERT INTO deletes (seq, api_version, kind, uid, at)
+		SELECT ?, 'v1', 'Event', uid, ? FROM events WHERE updated_at < ?`,
+	stmtLogClearObjectsOfKind: `
+		INSERT INTO deletes (seq, api_version, kind, uid, at)
+		SELECT ?, api_version, kind, uid, ? FROM objects WHERE api_version = ? AND kind = ?`,
+	stmtLogDeleteAllEvents: `
+		INSERT INTO deletes (seq, api_version, kind, uid, at)
+		SELECT ?, 'v1', 'Event', uid, ? FROM events`,
+
 	stmtSweepObjects: `DELETE FROM objects WHERE api_version=? AND kind=? AND updated_at < ? RETURNING uid`,
 
 	stmtDeleteLabelsOfObject:        `DELETE FROM labels WHERE uid=?`,
@@ -137,9 +182,17 @@ var stmtText = [numStmts]string{
 	stmtUpsertEvent: `
 		INSERT INTO events (
 			uid, involved_uid, involved_kind, involved_ns, involved_name,
-			type, reason, message, first_seen, last_seen, count, raw_json, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			type, reason, message, first_seen, last_seen, count, raw_json, updated_at,
+			resource_version, write_seq
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(uid) DO UPDATE SET
+			resource_version=excluded.resource_version,
+			-- As on objects: a re-observed event that has not moved keeps its stamp, so a
+			-- relist of the table is not one change per event — and an empty version is
+			-- never "unchanged", or the row freezes at the position of its first write.
+			write_seq=CASE WHEN excluded.resource_version <> ''
+			                AND excluded.resource_version = events.resource_version
+			               THEN events.write_seq ELSE excluded.write_seq END,
 			involved_uid=excluded.involved_uid,
 			involved_kind=excluded.involved_kind,
 			involved_ns=excluded.involved_ns,
@@ -160,6 +213,25 @@ var stmtText = [numStmts]string{
 		INSERT INTO cluster_meta (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 	stmtDeleteMeta: `DELETE FROM cluster_meta WHERE key = ?`,
+	// The trim's marks, read from the rows the delete beside it is about to take — same
+	// predicate, same transaction, so the two cannot disagree about which entries went.
+	// The key mirrors deletesTrimmedKey; trimmedMark reads through it, so a drift fails
+	// every janitor mark test. Raise-only: `at` and `seq` rise together only within one
+	// file lifetime (the clock stamp restarts on reopen, the counter is on disk), so a
+	// later sweep can compute a LOWER mark, and following it down would revalidate a
+	// cursor whose deletes are gone.
+	stmtMarkTrimmedDeletes: `
+		INSERT INTO cluster_meta (key, value)
+		SELECT 'deletes/trimmed/' || api_version || '/' || kind, CAST(MAX(seq) AS TEXT)
+		FROM deletes WHERE at < ?
+		GROUP BY api_version, kind
+		ON CONFLICT(key) DO UPDATE SET
+			value = CASE WHEN CAST(excluded.value AS INTEGER) > CAST(cluster_meta.value AS INTEGER)
+			             THEN excluded.value ELSE cluster_meta.value END`,
+	// A write that returns a row, so it runs on the writer like any other. The key is
+	// spliced from seqKey rather than spelled again: a drift would match no row, and every
+	// write in the store would end in a bare sql.ErrNoRows.
+	stmtNextSeq: `UPDATE cluster_meta SET value = value + 1 WHERE key = '` + seqKey + `' RETURNING value`,
 
 	stmtResolveKindRename: `DELETE FROM kind_catalog WHERE api_version = ? AND resource = ? AND kind <> ?`,
 	// schema_json is deliberately absent from the update: nothing here fills it, and
@@ -178,6 +250,7 @@ var stmtText = [numStmts]string{
 		WHERE (api_version, kind) NOT IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))`,
 
 	stmtSweepStatusHistory: `DELETE FROM status_history WHERE at < ?`,
+	stmtTrimDeletes:        `DELETE FROM deletes WHERE at < ?`,
 
 	stmtSelectMeta: `SELECT value FROM cluster_meta WHERE key = ?`,
 	stmtCountKind:  `SELECT count FROM kind_counts WHERE api_version=? AND kind=?`,
@@ -211,6 +284,12 @@ var stmtWrites = [numStmts]bool{
 	stmtUpsertObject:                 true,
 	stmtInsertStatusTransition:       true,
 	stmtDeleteObject:                 true,
+	stmtLogDeleteObject:              true,
+	stmtLogDeleteEvent:               true,
+	stmtLogSweepObjects:              true,
+	stmtLogPruneEvents:               true,
+	stmtLogClearObjectsOfKind:        true,
+	stmtLogDeleteAllEvents:           true,
 	stmtSweepObjects:                 true,
 	stmtDeleteLabelsOfObject:         true,
 	stmtDeleteOwnerRefsOfChild:       true,
@@ -233,11 +312,14 @@ var stmtWrites = [numStmts]bool{
 	stmtPruneEvents:                  true,
 	stmtUpsertMeta:                   true,
 	stmtDeleteMeta:                   true,
+	stmtMarkTrimmedDeletes:           true,
+	stmtNextSeq:                      true,
 	stmtResolveKindRename:            true,
 	stmtUpsertKind:                   true,
 	stmtDeleteAllKinds:               true,
 	stmtPruneKinds:                   true,
 	stmtSweepStatusHistory:           true,
+	stmtTrimDeletes:                  true,
 }
 
 // prepareStatements compiles the half of the set one pool serves — the writer takes the

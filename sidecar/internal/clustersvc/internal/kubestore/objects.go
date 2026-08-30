@@ -212,8 +212,8 @@ func redact(u *unstructured.Unstructured, r redaction) {
 // Edges are DELETEd then re-inserted, not upserted: an object that lost a label or an
 // ownerReference must lose the row too. Both tables are uid-keyed, so it is a point
 // lookup.
-func insertObjectRow(ctx context.Context, st stmts, k Kind, row objectRow, now int64) error {
-	if err := recordStatusTransition(ctx, st, row, now); err != nil {
+func insertObjectRow(ctx context.Context, st stmts, k Kind, row objectRow, stamp writeStamp) error {
+	if err := recordStatusTransition(ctx, st, row, stamp.at); err != nil {
 		return err
 	}
 	rawJSON, err := compressRaw(row.RawJSON)
@@ -222,9 +222,9 @@ func insertObjectRow(ctx context.Context, st stmts, k Kind, row objectRow, now i
 	}
 	_, err = st.exec(ctx, stmtUpsertObject,
 		row.UID, k.APIVersion, k.Kind, row.Namespace, row.Name,
-		row.ResourceVersion, row.Generation, row.CreatedAt, now, rawJSON,
+		row.ResourceVersion, row.Generation, row.CreatedAt, stamp.at, rawJSON,
 		nullIfEmpty(row.status.Summary), row.status.Ready, row.status.Total,
-		row.status.Restart, nullIfEmpty(row.status.Host),
+		row.status.Restart, nullIfEmpty(row.status.Host), stamp.seq,
 	)
 	if err != nil {
 		return err
@@ -307,7 +307,10 @@ var cascadeTables = []struct {
 
 // deleteObjectRow removes one object and its edges; the objects delete fires the
 // kind_counts trigger, keeping the per-kind tally exact.
-func deleteObjectRow(ctx context.Context, st stmts, uid string) error {
+func deleteObjectRow(ctx context.Context, st stmts, uid string, stamp writeStamp) error {
+	if err := logDeletes(ctx, st, stmtLogDeleteObject, stamp, uid); err != nil {
+		return err
+	}
 	for _, c := range cascadeTables {
 		if _, err := st.exec(ctx, c.byUID, uid); err != nil {
 			return err
@@ -324,7 +327,10 @@ func deleteObjectRow(ctx context.Context, st stmts, uid string) error {
 // once rather than once per side table. Safe in that order because nothing references
 // objects — the side tables are uid-keyed with no foreign key — and the caller's
 // transaction rolls the whole sweep back on any failure.
-func sweepObjects(ctx context.Context, st stmts, k Kind, mark int64) (int, error) {
+func sweepObjects(ctx context.Context, st stmts, k Kind, mark int64, stamp writeStamp) (int, error) {
+	if err := logDeletes(ctx, st, stmtLogSweepObjects, stamp, k.APIVersion, k.Kind, mark); err != nil {
+		return 0, err
+	}
 	rows, err := st.query(ctx, stmtSweepObjects, k.APIVersion, k.Kind, mark)
 	if err != nil {
 		return 0, err

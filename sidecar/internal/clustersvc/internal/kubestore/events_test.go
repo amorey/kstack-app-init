@@ -23,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/watch"
 )
 
@@ -204,4 +205,60 @@ func TestAnEventWithNoTimesStoresNull(t *testing.T) {
 
 	assert.Equal(t, 1, countRows(t, s,
 		`SELECT COUNT(*) FROM events WHERE first_seen IS NULL AND last_seen IS NULL`))
+}
+
+// eventSeq is one event's stamp, and 0 when the row is gone.
+func eventSeq(t *testing.T, s *Store, uid string) int64 {
+	t.Helper()
+	return int64(countRows(t, s, `SELECT COALESCE(MAX(write_seq), 0) FROM events WHERE uid = ?`, uid))
+}
+
+// firing re-fires an event: same uid, a higher count, and the resourceVersion the server
+// moves along with it.
+func firing(uid, rv string, count int64) *unstructured.Unstructured {
+	return obj(map[string]any{
+		"apiVersion": "v1", "kind": "Event",
+		"metadata":       map[string]any{"uid": uid, "resourceVersion": rv},
+		"involvedObject": map[string]any{"uid": "pod-1", "kind": "Pod", "name": "api-0"},
+		"reason":         "BackOff", "message": "restarting", "count": count,
+		"lastTimestamp": "2026-08-01T00:05:00Z",
+	})
+}
+
+// Events carry the same "did it change" fact as objects, so the stamp answers the same
+// question on both tables: an event that re-fires moves it, a re-observed one does not.
+func TestAReFiringEventMovesItsStamp(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, firing("ev-1", "10", 1)))
+	first := eventSeq(t, s, "ev-1")
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Modified, firing("ev-1", "10", 1)))
+	same := eventSeq(t, s, "ev-1")
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Modified, firing("ev-1", "11", 2)))
+	moved := eventSeq(t, s, "ev-1")
+
+	assert.Positive(t, first)
+	assert.Equal(t, first, same)
+	assert.Greater(t, moved, first, "a count bump moves the resourceVersion with it")
+}
+
+// As on objects: an empty resourceVersion is equal to itself forever, so reading it as
+// "unchanged" would pin the row at the position of its first write.
+func TestAnEventWithNoResourceVersionIsAlwaysAChange(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, firing("ev-1", "", 1)))
+	first := eventSeq(t, s, "ev-1")
+	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Modified, firing("ev-1", "", 2)))
+
+	assert.Greater(t, eventSeq(t, s, "ev-1"), first)
+}
+
+func TestExtractEventReadsTheResourceVersion(t *testing.T) {
+	row, err := extractEvent(firing("ev-1", "10", 1))
+
+	require.NoError(t, err)
+	assert.Equal(t, "10", row.ResourceVersion)
 }

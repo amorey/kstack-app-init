@@ -28,6 +28,10 @@ CREATE TABLE cluster_meta (
     value TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
 
+-- The file's write counter, seeded here so nothing has to initialize it at open. Every
+-- write transaction takes the next number and stamps everything it writes with it.
+INSERT INTO cluster_meta (key, value) VALUES ('seq', '0');
+
 -- One row per Kubernetes object (built-in or CRD). The universal entry point.
 --
 -- status_summary and the four count/host fields are cross-kind materialized values,
@@ -78,6 +82,10 @@ CREATE TABLE objects (
     generation       INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,    -- object's creationTimestamp
     updated_at       INTEGER NOT NULL,    -- last sync write
+    -- Position of the last write that CHANGED the object, off the file's counter. It
+    -- moves only when resource_version does, so a relist that rewrites the kind unchanged
+    -- leaves every stamp alone. A delete takes the row with it; see the deletes table.
+    write_seq        INTEGER NOT NULL,
     status_summary   TEXT,
     ready_count      INTEGER,
     total_count      INTEGER,
@@ -89,6 +97,8 @@ CREATE INDEX objects_kind_ns_name ON objects(api_version, kind, namespace, name)
 CREATE INDEX objects_kind_host    ON objects(api_version, kind, host);
 CREATE INDEX objects_kind_ready   ON objects(api_version, kind, ready_count, total_count) WHERE ready_count IS NOT NULL;
 CREATE INDEX objects_ns_kind      ON objects(namespace, api_version, kind);
+-- "what moved in this kind past position X" as a range scan, not a scan of the kind.
+CREATE INDEX objects_kind_seq     ON objects(api_version, kind, write_seq);
 
 -- Ownership graph (Deployment → ReplicaSet → Pod, Job → Pod, CRD → CRD).
 -- Pre-extracted from metadata.ownerReferences so JOINs replace JSON parsing.
@@ -130,6 +140,10 @@ CREATE INDEX labels_kv ON labels(key, value);
 -- new.rowid/old.rowid. A WITHOUT ROWID table has none, so the full-text index would break.
 CREATE TABLE events (
     uid           TEXT PRIMARY KEY,
+    -- The event's own resourceVersion and the position of the last write that moved it —
+    -- the same pair objects carries, so "did it change" is one question on both tables.
+    resource_version TEXT NOT NULL,
+    write_seq        INTEGER NOT NULL,
     involved_uid  TEXT,
     involved_kind TEXT,
     involved_ns   TEXT,
@@ -146,6 +160,7 @@ CREATE TABLE events (
 CREATE INDEX events_involved        ON events(involved_uid, last_seen DESC);
 CREATE INDEX events_kind_ns_name    ON events(involved_kind, involved_ns, involved_name, last_seen DESC);
 CREATE INDEX events_last_seen       ON events(last_seen DESC);
+CREATE INDEX events_seq             ON events(write_seq);
 
 -- Full-text search over event messages/reasons so the agent can ask
 -- "anything ImagePullBackOff anywhere?" with one query.
@@ -177,6 +192,23 @@ CREATE TABLE status_history (
     summary TEXT NOT NULL
 ) STRICT;
 CREATE INDEX status_history_uid_at ON status_history(uid, at DESC);
+
+-- One entry per deleted object or event row. A write's position is on the row itself
+-- (write_seq); the row is gone by the time a reader learns of a delete, so the uid is kept
+-- here. Identity only: the reader holds the row's last-known state and keys the removal by
+-- uid. Events log under the fixed ('v1', 'Event') the count triggers use, for the same
+-- reason -- the events table conflates both spellings of an event into one row shape.
+--
+-- The janitor trims by age and records how far per kind, so a cursor at or below its kind's
+-- mark can no longer be trusted to have seen every delete above it.
+CREATE TABLE deletes (
+    seq          INTEGER NOT NULL,       -- the counter write_seq is stamped from
+    api_version  TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    uid          TEXT NOT NULL,
+    at           INTEGER NOT NULL        -- unix millis, for the retention sweep
+) STRICT;
+CREATE INDEX deletes_kind_seq ON deletes(api_version, kind, seq);
 
 -- Catalog of the kinds this cache holds (built-ins + CRDs). Each kind's sync
 -- registers its own row when its worker starts and removes it when the kind stops

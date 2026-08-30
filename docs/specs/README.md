@@ -30,12 +30,18 @@ Each spec is self-contained: read one and you can build it. Each header states w
 what it hands on — a numbered spec that needs nothing is ordered by priority rather than by
 dependency, so it can be built out of turn at a cost you can read off its header.
 
-**Sequenced.** Nothing. The line of work that ran here — the SQLite techniques beehive uses that
-`kubestore` did not — has landed in full.
+**Sequenced — the build order.** One line of work: the cached-data watches stop re-reading a
+whole collection per burst. Spec 1 stamps rows with their write position and logs deletes; spec 2
+has the watch read what moved past its cursor. Nothing a client sees changes. A paged or
+resumable watch would build on the same log and be numbered after.
+
+| Spec | Scope | Status |
+| --- | --- | --- |
+| [1 — Every row carries its write position, and a delete leaves a log entry](1-write-positions-and-deletes-log.md) | sidecar | Landed |
+| [2 — The watch reads what moved past its cursor](2-watch-reads-what-moved.md) | sidecar | Planned |
 
 **Independent.**
 
 | Spec | Scope | Status |
 | --- | --- | --- |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
-| [Virtualized tables](virtualized-tables.md) | frontend | Planned |

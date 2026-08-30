@@ -456,8 +456,8 @@ func TestStoreClearKindDeletesObjectsAndTheirDependentRows(t *testing.T) {
 			kind.apiVersion, kind.kind, kind.resource)
 		require.NoError(t, err)
 		_, err = db.ExecContext(ctx,
-			`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-			 VALUES (?, ?, ?, 'x', '1', 0, 0, x'7b7d')`,
+			`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, write_seq, raw_json)
+			 VALUES (?, ?, ?, 'x', '1', 0, 0, 1, x'7b7d')`,
 			kind.uid, kind.apiVersion, kind.kind)
 		require.NoError(t, err)
 		_, err = db.ExecContext(ctx, `INSERT INTO owner_refs (child_uid, owner_uid) VALUES (?, 'owner')`, kind.uid)
@@ -511,7 +511,8 @@ func TestStoreClearKindClearsTheEventsTable(t *testing.T) {
 		`INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd) VALUES ('v1', 'Event', 'events', 'Namespaced', 0)`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO events (uid, reason, message, raw_json, updated_at) VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0)`)
+		`INSERT INTO events (uid, reason, message, raw_json, updated_at, resource_version, write_seq)
+		 VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0, '1', 1)`)
 	require.NoError(t, err)
 
 	require.NoError(t, store.ClearKind(ctx, eventsKind))
@@ -539,12 +540,12 @@ func TestStoreClearKindKeepsARetainedChildsEdgeIntoTheClearedKind(t *testing.T) 
 		`INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd) VALUES ('apps/v1', 'Deployment', 'deployments', 'Namespaced', 0)`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		 VALUES ('uid-dep', 'apps/v1', 'Deployment', 'web', '1', 0, 0, x'7b7d')`)
+		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, write_seq, raw_json)
+		 VALUES ('uid-dep', 'apps/v1', 'Deployment', 'web', '1', 0, 0, 1, x'7b7d')`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		 VALUES ('uid-pod', 'v1', 'Pod', 'web-1', '1', 0, 0, x'7b7d')`)
+		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, write_seq, raw_json)
+		 VALUES ('uid-pod', 'v1', 'Pod', 'web-1', '1', 0, 0, 1, x'7b7d')`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, `INSERT INTO owner_refs (child_uid, owner_uid) VALUES ('uid-pod', 'uid-dep')`)
 	require.NoError(t, err)
@@ -580,11 +581,12 @@ func TestStoreClearKindLeavesEventsAloneForANonCoreEventKind(t *testing.T) {
 		`INSERT INTO kind_catalog (api_version, kind, resource, scope, is_crd) VALUES ('example.com/v1', 'Event', 'events', 'Namespaced', 1)`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, raw_json)
-		 VALUES ('uid-crd', 'example.com/v1', 'Event', 'x', '1', 0, 0, x'7b7d')`)
+		`INSERT INTO objects (uid, api_version, kind, name, resource_version, created_at, updated_at, write_seq, raw_json)
+		 VALUES ('uid-crd', 'example.com/v1', 'Event', 'x', '1', 0, 0, 1, x'7b7d')`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO events (uid, reason, message, raw_json, updated_at) VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0)`)
+		`INSERT INTO events (uid, reason, message, raw_json, updated_at, resource_version, write_seq)
+		 VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0, '1', 1)`)
 	require.NoError(t, err)
 
 	require.NoError(t, store.ClearKind(ctx, Kind{APIVersion: "example.com/v1", Kind: "Event", Resource: "events"}))
@@ -611,7 +613,8 @@ func TestStoreClearKindClearsEventsWithNoCatalogRow(t *testing.T) {
 
 	db := db(t, store)
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO events (uid, reason, message, raw_json, updated_at) VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0)`)
+		`INSERT INTO events (uid, reason, message, raw_json, updated_at, resource_version, write_seq)
+		 VALUES ('uid-ev', 'Pulled', 'ok', x'7b7d', 0, '1', 1)`)
 	require.NoError(t, err)
 
 	require.NoError(t, store.ClearKind(ctx, eventsKind))

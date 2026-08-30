@@ -29,18 +29,20 @@ import (
 
 // eventRow is one row of the events table, flattened from an Event body.
 type eventRow struct {
-	UID          string
-	InvolvedUID  string
-	InvolvedKind string
-	InvolvedNS   string
-	InvolvedName string
-	Type         string
-	Reason       string
-	Message      string
-	FirstSeen    int64
-	LastSeen     int64
-	Count        int
-	RawJSON      []byte
+	UID string
+	// ResourceVersion is the event's own, and the fact the stamp moves on.
+	ResourceVersion string
+	InvolvedUID     string
+	InvolvedKind    string
+	InvolvedNS      string
+	InvolvedName    string
+	Type            string
+	Reason          string
+	Message         string
+	FirstSeen       int64
+	LastSeen        int64
+	Count           int
+	RawJSON         []byte
 }
 
 // extractEvent flattens an Event body into the events columns, normalising both the
@@ -55,7 +57,7 @@ func extractEvent(u *unstructured.Unstructured) (eventRow, error) {
 	if err != nil {
 		return eventRow{}, fmt.Errorf("%w: %w", errUnprojectable, err)
 	}
-	row := eventRow{UID: string(u.GetUID()), RawJSON: rawJSON}
+	row := eventRow{UID: string(u.GetUID()), ResourceVersion: u.GetResourceVersion(), RawJSON: rawJSON}
 	if row.UID == "" {
 		return eventRow{}, fmt.Errorf("%w: event has empty UID", errUnprojectable)
 	}
@@ -126,7 +128,7 @@ func firstParsedTime(u *unstructured.Unstructured, paths ...[]string) int64 {
 
 // insertEventRow upserts one event by UID — the chokepoint both the watch-delta and
 // relist-page paths route through.
-func insertEventRow(ctx context.Context, st stmts, row eventRow, now int64) error {
+func insertEventRow(ctx context.Context, st stmts, row eventRow, stamp writeStamp) error {
 	rawJSON, err := compressRaw(row.RawJSON)
 	if err != nil {
 		return err
@@ -135,7 +137,8 @@ func insertEventRow(ctx context.Context, st stmts, row eventRow, now int64) erro
 		row.UID, nullIfEmpty(row.InvolvedUID), nullIfEmpty(row.InvolvedKind),
 		nullIfEmpty(row.InvolvedNS), nullIfEmpty(row.InvolvedName),
 		nullIfEmpty(row.Type), nullIfEmpty(row.Reason), nullIfEmpty(row.Message),
-		nullableInt64(row.FirstSeen), nullableInt64(row.LastSeen), row.Count, rawJSON, now,
+		nullableInt64(row.FirstSeen), nullableInt64(row.LastSeen), row.Count, rawJSON, stamp.at,
+		row.ResourceVersion, stamp.seq,
 	)
 	return err
 }
