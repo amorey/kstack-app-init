@@ -87,6 +87,10 @@ type fakeKubeconn struct {
 
 	released []string
 	retried  []string
+	// retryCtx is the context the last retry was given, and retryErr what it answers with:
+	// the wait is the probe's round trip now, so both cross this seam.
+	retryCtx context.Context
+	retryErr error
 	// connErr is what every claim's Conn answers, for a fleet nothing reached.
 	connErr error
 }
@@ -96,7 +100,11 @@ func (f *fakeKubeconn) Acquire(contextName string) kubeconn.Lease {
 	return &fakeLease{svc: f, contextName: contextName, state: f.states[contextName], connErr: f.connErr}
 }
 
-func (f *fakeKubeconn) Retry(contextName string) { f.retried = append(f.retried, contextName) }
+func (f *fakeKubeconn) RetryAndWait(ctx context.Context, contextName string) error {
+	f.retried = append(f.retried, contextName)
+	f.retryCtx = ctx
+	return f.retryErr
+}
 
 // Subscribe is the fleet feed the trigger reads. publish is the probe landing on it.
 func (f *fakeKubeconn) Subscribe() kubeconn.Subscription { return f.moved().Receiver() }

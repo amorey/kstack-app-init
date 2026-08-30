@@ -1252,6 +1252,10 @@ func (e *Supervisor) commit(k key, held *subject, h *runHandle, sp spec, started
 		}
 	}
 
+	if ran {
+		a.LastRunAt = startedAt
+	}
+
 	switch res.kind {
 	case resultRecord:
 		a.record(attemptOf(res, startedAt, h.readyAt, now))

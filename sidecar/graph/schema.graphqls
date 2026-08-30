@@ -887,7 +887,7 @@ type Mutation {
   "Enable or disable syncing for a cluster. Disabling stops sync and freezes the cache. Returns the updated cluster."
   clusterSyncEnabledSet(id: ObjectID!, syncEnabled: Boolean!): Cluster!
 
-  "Force an immediate reconnection attempt, resetting any backoff. Returns true once scheduled."
+  "Force an immediate reconnection attempt, resetting any backoff. Resolves once the probe it asked for has finished — not when it was scheduled — so a caller can show the retry as busy for exactly that long. What the probe found arrives on the cluster's conditions. Returns true."
   clusterConnectionRetry(id: ObjectID!): Boolean!
 
   "Forget an orphaned cluster: delete its cache and its registry record. Refused for a cluster its source still declares — the discovery pass would re-import it under a fresh id, losing the user's toggles to the new record's defaults; stop tracking it at the source, or disable it. Deleting a record already gone is not an error. Returns true."

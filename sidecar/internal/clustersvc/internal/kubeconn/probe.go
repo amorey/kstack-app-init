@@ -68,11 +68,16 @@ type connInfo struct {
 	fingerprint string
 }
 
+// connectionTimeout is how long one dial may take. Named because a caller waiting on a probe
+// sizes its own ceiling off it (RetryAndWait), and a second literal would let a change here
+// silently undersize that wait.
+const connectionTimeout = 10 * time.Second
+
 func registerProbes(e *supervisor.Supervisor, kubecfg kubeconfigService) {
 	// A reachability check that has taken ten seconds has answered, so the timeout is
 	// shorter than the supervisor's default (a whole interval).
 	supervisor.RegisterJob(e, nameConnection, &connectionProbe{kubecfgSvc: kubecfg},
-		supervisor.WithInterval(30*time.Second), supervisor.WithTimeout(10*time.Second))
+		supervisor.WithInterval(30*time.Second), supervisor.WithTimeout(connectionTimeout))
 
 	// The four behind reachability declare both edges on it: they cannot run without a
 	// connection, and a connection that moves must re-run them.

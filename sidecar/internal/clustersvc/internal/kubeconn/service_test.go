@@ -17,6 +17,7 @@ package kubeconn
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -770,7 +771,7 @@ func TestRetryRerunsEveryProbe(t *testing.T) {
 		}
 	}
 
-	s.Retry("prod")
+	require.NoError(t, s.RetryAndWait(within(t), "prod"))
 
 	want := map[string]bool{
 		apiDiscoveryPath: true, readyzPath: true, kubeSystemPath: true,
@@ -784,18 +785,164 @@ func TestRetryRerunsEveryProbe(t *testing.T) {
 	}
 }
 
-// A context nobody claims is not tracked, so there is no probe to re-run — and asking is
-// not an error, since the caller cannot know who holds what.
-func TestRetryIgnoresAContextNobodyClaims(t *testing.T) {
+// A wake on a subject nothing tracks is a no-op, so the call takes its own claim — otherwise it
+// would wait out its ceiling for a run that is never dispatched. The claim is the call's, and
+// goes back when it returns.
+func TestRetryAndWaitClaimsTheContextItProbes(t *testing.T) {
 	c := serveCluster(t)
 	s := New(serving(c.Server, "prod", "key-1"))
 	startService(t, s)
 
-	s.Retry("prod")
+	require.NoError(t, s.RetryAndWait(within(t), "prod"))
+
+	s.mu.Lock()
+	held := len(s.claimed)
+	s.mu.Unlock()
+	assert.Zero(t, held, "the claim is released with the call")
+}
+
+// parkDials makes every dial wait for the test to let it through, so the runs below are ordered
+// by the test rather than by how fast the server answers. Installed before anything claims the
+// context, so the first dial is the first probe.
+func parkDials(t *testing.T, c *cluster) (dialing *testutil.Probe[struct{}], gate chan struct{}) {
+	t.Helper()
+	dialing, gate = testutil.NewProbe[struct{}](4), make(chan struct{}, 4)
+	c.route(apiDiscoveryPath, func(w http.ResponseWriter, _ *http.Request) {
+		dialing.Fire(struct{}{})
+		<-gate
+		_, _ = io.WriteString(w, apiVersions)
+	})
+	return dialing, gate
+}
+
+// The case every client-side attempt at this got wrong. A wake landing while a run is in flight
+// finds the key held and is redelivered, so the run the caller asked for is the NEXT one to
+// begin — and the one already out must not answer for it.
+func TestRetryAndWaitIsNotSatisfiedByARunAlreadyInFlight(t *testing.T) {
+	c := serveCluster(t)
+	dialing, gate := parkDials(t, c)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+	// After the service's own cleanup, so a parked dial is released before stop joins it.
+	t.Cleanup(func() { close(gate) })
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	testutil.Recv(t, dialing.Chan(), "the first dial")
+
+	done := make(chan error, 1)
+	go func() { done <- s.RetryAndWait(within(t), "prod") }()
+	gate <- struct{}{}
+	// The second dial having landed proves the first committed and published.
+	testutil.Recv(t, dialing.Chan(), "the dial the ask bought")
 
 	// A negative assertion has no event to wait for, so it needs a bounded window: this
-	// fails the instant a request lands rather than at the end of the wait.
-	testutil.NoRecv(t, c.requests.Chan(), 50*time.Millisecond, "a probe request")
+	// fails the instant the call returns rather than at the end of the wait.
+	testutil.NoRecv(t, done, 50*time.Millisecond, "a return on a run it did not ask for")
+
+	gate <- struct{}{}
+	require.NoError(t, testutil.Recv(t, done, "the call to return"))
+}
+
+// The wait is the caller's; the run is the supervisor's. A caller that goes away leaves the probe
+// running — a Wake is not a Restart, and cancelling it would tear down work another watcher wants.
+func TestRetryAndWaitLeavesTheRunAloneWhenItsCallerGoesAway(t *testing.T) {
+	c := serveCluster(t)
+	dialing, gate := parkDials(t, c)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+	t.Cleanup(func() { close(gate) })
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	testutil.Recv(t, dialing.Chan(), "the first dial")
+	gate <- struct{}{}
+	settled(t, lease)
+	first := lease.State().Connection.LastAttempt
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- s.RetryAndWait(ctx, "prod") }()
+	testutil.Recv(t, dialing.Chan(), "the dial the ask bought")
+	cancel()
+
+	require.ErrorIs(t, testutil.Recv(t, done, "the call to return"), context.Canceled)
+	gate <- struct{}{}
+	require.Eventually(t, func() bool {
+		return lease.State().Connection.LastAttempt.StartedAt.After(first.StartedAt)
+	}, testutil.Timeout, time.Millisecond, "the abandoned run still finishes")
+}
+
+// A run that has begun and does not end is what the ceiling is for. Reporting success there would
+// tell the caller a probe finished when none had.
+func TestRetryAndWaitGivesUpOnARunThatNeverFinishes(t *testing.T) {
+	c := serveCluster(t)
+	dialing, gate := parkDials(t, c)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+	t.Cleanup(func() { close(gate) })
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	testutil.Recv(t, dialing.Chan(), "the first dial")
+	gate <- struct{}{}
+	settled(t, lease)
+
+	// The dial the ask buys parks, so its run begins and never ends. The ceiling is a parameter
+	// for exactly this: the test never outwaits the production one.
+	err := s.retryAndWait(t.Context(), "prod", 50*time.Millisecond)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// A Skip is a finished run that records nothing — the connection probe declines on an unread
+// kubeconfig rather than reporting every context gone. The probe the caller asked for has run, so
+// waiting it out would fail a retry that was already answered.
+func TestRetryAndWaitReturnsOnARunThatRecordedNothing(t *testing.T) {
+	cfg := resolving("prod", "key-1")
+	cfg.setErr(kubeconfig.ErrNotRead)
+	s := New(cfg)
+	startService(t, s)
+
+	// A short ceiling, so a wait that cannot see the Skip fails rather than drags.
+	require.NoError(t, s.retryAndWait(within(t), "prod", 100*time.Millisecond))
+}
+
+// **The ceiling starts when the run does, never at the ask.** Dispatch waits for one of the
+// supervisor's fleet-wide start slots, so a fleet with enough queued probes to fill them delays
+// the requested run by however long those take — bounded by their own timeouts, but by no number
+// this call can name. A ceiling run from the ask reports a failure for a probe nobody has tried.
+func TestRetryAndWaitDoesNotGiveUpOnARunStillWaitingToStart(t *testing.T) {
+	c := serveCluster(t)
+	dialing, gate := parkDials(t, c)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+	t.Cleanup(func() { close(gate) })
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	// Parked, so it holds the key: the run the ask buys cannot begin behind it.
+	testutil.Recv(t, dialing.Chan(), "the first dial")
+
+	done := make(chan error, 1)
+	go func() { done <- s.retryAndWait(t.Context(), "prod", 20*time.Millisecond) }()
+
+	// A negative assertion has no event to wait for, so it needs a bounded window — sized well
+	// past the ceiling, which is what would end the wait if it ran from the ask.
+	testutil.NoRecv(t, done, 100*time.Millisecond, "a give-up while the requested run was still owed a slot")
+}
+
+// The whole point of waiting: the call returns on a run of its own, not on whatever the last
+// one left behind.
+func TestRetryAndWaitReturnsOnARunItAskedFor(t *testing.T) {
+	c := serveCluster(t)
+	s := New(serving(c.Server, "prod", "key-1"))
+	startService(t, s)
+	lease := s.Acquire("prod")
+	defer lease.Release()
+	probed(t, lease)
+	before := lease.State().Connection.LastAttempt
+
+	require.NoError(t, s.RetryAndWait(within(t), "prod"))
+
+	assert.True(t, lease.State().Connection.LastAttempt.StartedAt.After(before.StartedAt),
+		"the attempt it returned on began after the ask")
 }
 
 // --- ConnFor ---
@@ -899,7 +1046,7 @@ func TestConnForRefusesAConnectionWhoseServerWasReplaced(t *testing.T) {
 
 	// Same endpoint, same credentials, a different cluster behind them.
 	cs.answer(kubeSystemPath, `{"metadata":{"name":"kube-system","uid":"uid-2"}}`)
-	s.Retry("prod")
+	require.NoError(t, s.RetryAndWait(within(t), "prod"))
 	awaitState(t, watched, func(st State) bool { return st.ServerUID.Value == "uid-2" })
 
 	_, oldErr := lease.ConnFor(t.Context(), "uid-1")
@@ -973,7 +1120,7 @@ func TestRotationSignalsTheFleet(t *testing.T) {
 
 	// Same cluster, new credentials: the connection is replaced and nothing else moves.
 	cfg.rotate("prod", "key-2")
-	s.Retry("prod")
+	require.NoError(t, s.RetryAndWait(within(t), "prod"))
 
 	testutil.Recv(t, moved.Chan(), "the rotation's signal")
 }
@@ -992,7 +1139,7 @@ func TestRotationRestoresTheStamp(t *testing.T) {
 	awaitIdentified(t, watched)
 
 	cfg.rotate("prod", "key-2")
-	s.Retry("prod")
+	require.NoError(t, s.RetryAndWait(within(t), "prod"))
 
 	require.Eventually(t, func() bool {
 		_, err := lease.ConnFor(t.Context(), "uid-1")

@@ -844,6 +844,39 @@ describe('ClusterSyncPanel', () => {
     );
   });
 
+  // The mutation resolves when the probe it asked for has finished, so the button binds to
+  // `fetching` and needs nothing of its own: it is busy for exactly as long as the probe is.
+  it('keeps the retry busy for as long as its probe is out', async () => {
+    let answer!: () => void;
+    const probing = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string, arg: unknown) => {
+      if (cmd === 'graphql_subscribe') return 1;
+      if (cmd === 'graphql_unsubscribe') return undefined;
+      if (cmd === 'graphql_query') {
+        if (String((arg as { body: string }).body).includes('clusterConnectionRetry')) await probing;
+        return { status: 200, body: JSON.stringify({ data: { clusterConnectionRetry: true } }) };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const user = await openWith([
+      { uuid: 'u-retry', name: 'remote', enabled: true, present: true, connected: 'False', connMessage: 'refused' },
+    ]);
+    await user.click(await screen.findByRole('button', { name: /disconnected/i }));
+
+    await user.click(await screen.findByRole('button', { name: /retry now/i }));
+
+    expect(await screen.findByRole('button', { name: /retrying…/i })).toBeDisabled();
+
+    await act(async () => {
+      answer();
+      await flush();
+    });
+
+    expect(await screen.findByRole('button', { name: /retry now/i })).toBeEnabled();
+  });
+
   it('reveals recent sync events when a cached cluster’s sync status is opened', async () => {
     const user = await openWith([{ uuid: 'u-sync', name: 'prod', enabled: true, present: true }]);
 

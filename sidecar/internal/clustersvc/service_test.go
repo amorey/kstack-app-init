@@ -202,10 +202,25 @@ func TestRetryConnectionReprobesTheRecordsContext(t *testing.T) {
 	obj := createCluster(t, d.clusterClient, "prod")
 	pool := d.kubeconnSvc.(*fakeKubeconn)
 
-	require.NoError(t, serviceOver(t, d).RetryConnection(context.Background(), ClusterID(obj.ID)))
+	ctx := context.Background()
+	require.NoError(t, serviceOver(t, d).RetryConnection(ctx, ClusterID(obj.ID)))
 
 	assert.Equal(t, []string{"prod"}, pool.retried)
 	assert.Empty(t, pool.asked, "a retry reaches the probe, not the claim")
+	assert.Equal(t, ctx, pool.retryCtx, "the caller's deadline bounds the wait")
+}
+
+// The call is the probe's whole round trip now, so a wait that ends without one — its ceiling, or
+// a caller that went away — is the caller's answer rather than something to swallow.
+func TestRetryConnectionReportsAProbeThatNeverAnswered(t *testing.T) {
+	d := newTestDeps(t)
+	obj := createCluster(t, d.clusterClient, "prod")
+	pool := d.kubeconnSvc.(*fakeKubeconn)
+	pool.retryErr = errors.New("nothing committed")
+
+	err := serviceOver(t, d).RetryConnection(context.Background(), ClusterID(obj.ID))
+
+	assert.ErrorIs(t, err, pool.retryErr)
 }
 
 // The gate is one rule, asserted over every method that goes through it: a caller must

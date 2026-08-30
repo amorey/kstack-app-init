@@ -108,8 +108,9 @@ type Service interface {
 	// Where the record gates a dial: an id naming nothing, a disabled cluster, and one
 	// awaiting deletion are refused here rather than handed a connection.
 	AcquireConnection(ctx context.Context, id ClusterID) (Lease, error)
-	// RetryConnection forces an out-of-band re-probe. The outcome lands on the
-	// record's conditions and reaches watchers through Clusters().Watch, not here.
+	// RetryConnection re-probes now and returns when that probe has finished, so it
+	// blocks for the probe's round trip. The outcome lands on the record's conditions
+	// and reaches watchers through Clusters().Watch, not here.
 	RetryConnection(ctx context.Context, id ClusterID) error
 
 	// The event timeline of any record that has one — Cluster, ClusterCache,
@@ -572,19 +573,19 @@ func (s *service) AcquireConnection(ctx context.Context, id ClusterID) (Lease, e
 	return s.kubeconnSvc.Acquire(contextName), nil
 }
 
-// RetryConnection re-probes id's context now. It reports only that the record allows a
-// probe: what the probe then finds lands on the record's conditions, which is where a
-// caller reads it.
+// RetryConnection re-probes id's context and returns when that probe has finished, so a
+// caller showing the retry as busy shows it for exactly as long as the probe took. What
+// the probe found lands on the record's conditions, which is where a caller reads it.
 //
-// A cluster nothing claims is not probed, so this reaches nothing — the same outcome as
-// asking a cluster whose probe is already mid-run, and neither is worth an error.
+// The pool claims the context for the wait, so a cluster nothing else holds is probed too.
+// A probe already mid-run does not answer for this one: the wait is for the run the ask
+// bought, which is the next one to begin.
 func (s *service) RetryConnection(ctx context.Context, id ClusterID) error {
 	contextName, err := s.connectableContext(ctx, id)
 	if err != nil {
 		return err
 	}
-	s.kubeconnSvc.Retry(contextName)
-	return nil
+	return s.kubeconnSvc.RetryAndWait(ctx, contextName)
 }
 
 // connectableContext looks id up and reads clusterContext off it. Shared by both methods

@@ -16,7 +16,7 @@
 // Orphaned (leftover cache, context gone). Mutations write through; the resulting
 // clustersWatch push updates the table.
 import { ChevronDown, Database, Pause, Play, Power, PowerOff, RotateCw, Slash, Trash2 } from 'lucide-react';
-import { type ReactNode, useEffect, useMemo, useState } from 'react';
+import { type ReactNode, useMemo, useState } from 'react';
 import ReactTimeAgo, { type Formatter } from 'react-timeago';
 import { useMutation } from 'urql';
 
@@ -638,26 +638,16 @@ function EventRunList({
 // Expanded connection diagnostics + Retry-now. Inline, not a popover: the modal
 // dialog inerts everything outside its subtree, so a body-portaled popover would
 // be unclickable.
-function ConnectionDetail({
-  cluster,
-  connFailed,
-  onRetry,
-}: {
-  cluster: Cluster;
-  connFailed: boolean;
-  onRetry: () => void;
-}) {
+function ConnectionDetail({ cluster, connFailed }: { cluster: Cluster; connFailed: boolean }) {
   const detail = connectionDetail(cluster);
   const attempts = useConnectionAttempts(cluster.id);
   const { atMs: nextAttemptAtMs, probing } = useNextCheck(cluster.id);
-  // The re-probe runs out-of-band (mutation resolves on schedule; outcome arrives
-  // via clustersWatch) — show a brief "Retrying…" acknowledgement, then revert.
-  const [retrying, setRetrying] = useState(false);
-  useEffect(() => {
-    if (!retrying) return undefined;
-    const timer = setTimeout(() => setRetrying(false), 4_000);
-    return () => clearTimeout(timer);
-  }, [retrying]);
+  // The mutation resolves when the probe it asked for has finished, so `fetching` IS the
+  // answer to "is my re-probe still out" — no timer, and the button agrees with the
+  // "checking…" above because both follow the same run. Per row rather than per panel: one
+  // hook up in the panel would spin every open row's button. A failure needs no handling —
+  // the client's errorReportExchange puts every operation error on the bus.
+  const [{ fetching }, retry] = useMutation(ClusterConnectionRetryMutation);
 
   return (
     <div className="space-y-2 rounded-md border bg-muted/30 p-3">
@@ -694,14 +684,13 @@ function ConnectionDetail({
         type="button"
         variant="outline"
         size="sm"
-        disabled={retrying}
+        disabled={fetching}
         onClick={() => {
-          setRetrying(true);
-          onRetry();
+          retry({ id: cluster.id });
         }}
       >
-        <RotateCw className={`size-3.5 ${retrying ? 'animate-spin' : ''}`} aria-hidden />
-        {retrying ? 'Retrying…' : 'Retry now'}
+        <RotateCw className={`size-3.5 ${fetching ? 'animate-spin' : ''}`} aria-hidden />
+        {fetching ? 'Retrying…' : 'Retry now'}
       </Button>
     </div>
   );
@@ -1065,7 +1054,6 @@ function ClusterRow({
   onToggle,
   onClearCache,
   onRemove,
-  onRetry,
 }: {
   cluster: Cluster;
   group: Group;
@@ -1073,7 +1061,6 @@ function ClusterRow({
   onToggle: (enabled: boolean) => void;
   onClearCache: () => void;
   onRemove: () => void;
-  onRetry: () => void;
 }) {
   const name = displayName(cluster);
   // ONE cache-contents subscription per row, shared by the size cell and the sync
@@ -1188,7 +1175,7 @@ function ClusterRow({
         <TableRow className="hover:bg-transparent">
           <TableCell className={STATUS_CELL_CLASS} />
           <TableCell colSpan={COLUMN_COUNT - 1} className="pt-0">
-            <ConnectionDetail cluster={cluster} connFailed={connFailed} onRetry={onRetry} />
+            <ConnectionDetail cluster={cluster} connFailed={connFailed} />
           </TableCell>
         </TableRow>
       ) : null}
@@ -1240,7 +1227,6 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
   const [, clusterSyncEnabledSetMut] = useMutation(ClusterSyncEnabledSetMutation);
   const [, clusterCacheClearMut] = useMutation(ClusterCacheClearMutation);
   const [, clusterDeleteMut] = useMutation(ClusterDeleteMutation);
-  const [, clusterConnectionRetryMut] = useMutation(ClusterConnectionRetryMutation);
 
   return (
     <Dialog
@@ -1305,7 +1291,6 @@ export function ClusterSyncPanel({ open, onOpenChange }: AppDialogProps) {
                     if (c.activeCache) clusterCacheClearMut({ id: c.activeCache.id });
                   }}
                   onRemove={() => clusterDeleteMut({ id: c.id })}
-                  onRetry={() => clusterConnectionRetryMut({ id: c.id })}
                 />
               ))}
             </TableBody>

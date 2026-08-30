@@ -76,10 +76,11 @@ type kubeconfigService interface {
 // kubeconnService is the pool a cluster is talked to over. Acquire names a context and
 // claims its connection, which is also what arms the probe behind it; a claim outlives
 // the pass that took it, so the caller holds and releases rather than asking per pass.
-// Retry re-runs a claimed context's probes out of band.
+// RetryAndWait re-runs a context's probes now and returns when the one it asked for has
+// finished, so a caller can report the probe's own duration.
 type kubeconnService interface {
 	Acquire(contextName string) kubeconn.Lease
-	Retry(contextName string)
+	RetryAndWait(ctx context.Context, contextName string) error
 	Subscribe() kubeconn.Subscription
 }
 

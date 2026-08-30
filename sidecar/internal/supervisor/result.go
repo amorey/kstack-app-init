@@ -201,6 +201,13 @@ type Attempts struct {
 	HealthySince time.Time
 	Restarts     int
 
+	// LastRunAt is when the most recently FINISHED run started, whatever it concluded — the
+	// one thing LastAttempt cannot say, since a Skip records no attempt at all. Written at the
+	// end and stamped with the beginning, so one comparison answers both halves of the
+	// question a caller waiting on a run it asked for has: a run that began at or after the
+	// ask has finished. A level, so a reader that misses frames still sees it move.
+	LastRunAt time.Time
+
 	// skipped marks a last run that returned Skip — the one memory a Skip leaves. It records
 	// nothing, so without this the pass would read the registration as never-run and
 	// re-dispatch it at once. Cleared when a run records; a Wake goes through runQ, so it needs

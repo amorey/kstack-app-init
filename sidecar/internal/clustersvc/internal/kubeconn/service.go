@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
@@ -186,18 +187,97 @@ func (s *Service) Acquire(contextName string) Lease {
 	return &claim{svc: s, contextName: contextName, entry: e}
 }
 
-// Retry runs every probe on contextName now, whatever it was next due at and whatever suspended
-// it. For a user who fixed something no probe can observe — a VPN dialed, a credential rotated —
-// and should not have to wait out the cadence.
+// retryCeiling bounds RetryAndWait once the run it asked for has BEGUN — a run still owed a
+// worker slot is not covered, and must not be. Sized off the probe's own timeout plus slack: a
+// run that outlives its own deadline is not going to end.
+const retryCeiling = connectionTimeout + 5*time.Second
+
+// RetryAndWait runs every probe on contextName now — whatever it was next due at and whatever
+// suspended it — and returns once the connection probe it asked for has finished. For a user who
+// fixed something no probe can observe (a VPN dialed, a credential rotated) and should not have to
+// wait out the cadence, and whose button stays busy for exactly as long as their probe does.
+//
+// **ctx is what bounds the queue wait**, so a caller that will not wait forever must say so.
 //
 // All five rather than the connection alone: a connection that is already up commits nothing, so
 // waking it would leave a probe that failed on its own — a forbidden kube-system read — suspended
-// on the answer the user just fixed.
+// on the answer the user just fixed. The connection alone decides when this returns, because that
+// is what a retry asks: can we reach it.
 //
-// A context nobody claims is untracked and this does nothing. Nothing to report either way: what
-// the re-probe finds reaches watchers the way every other pass does.
-func (s *Service) Retry(contextName string) {
+// What the probe found is not returned. It reaches watchers the way every other pass does.
+func (s *Service) RetryAndWait(ctx context.Context, contextName string) error {
+	return s.retryAndWait(ctx, contextName, retryCeiling)
+}
+
+// retryAndWait takes the ceiling as a parameter so a test never outwaits the production one.
+//
+// **The ask is satisfied by the first finished run that began at or after it.** A run already in
+// flight began before, so it correctly does not answer — the supervisor holds the key and
+// redelivers the wake, so the run the caller asked for is the next one to begin. `LastRunAt` is
+// what makes that readable: the state feed keeps only the latest value per context, so edges are
+// coalesced away, but a monotonic level compared against a baseline survives it.
+//
+// **The ceiling starts when that run does, never at the ask.** Dispatch waits for one of the
+// supervisor's fleet-wide start slots, so a fleet with enough queued probes to fill them delays
+// the run by however long those take — bounded, since every job carries a timeout, but by nothing
+// this call can name. A ceiling run from the ask would report a failure for a probe nobody had
+// tried yet.
+func (s *Service) retryAndWait(ctx context.Context, contextName string, ceiling time.Duration) error {
+	// A Wake on a subject nothing tracks is a no-op, so without a claim this would wait for a
+	// run that is never dispatched. Refcounted alongside whatever else holds the context.
+	lease := s.Acquire(contextName)
+	defer lease.Release()
+
+	// Before the wake, or a pass landing between the two is missed.
+	sub := lease.WatchState()
+	defer sub.Close()
+
+	askedAt := time.Now()
 	s.supervisor.Wake(contextName, probeNames[:]...)
+
+	// The caller's context is the only bound until the run begins.
+	for {
+		ev, err := sub.RecvContext(ctx)
+		if err != nil {
+			return fmt.Errorf("retry %q: %w", contextName, err)
+		}
+		conn := ev.Value.Connection
+		if answers(conn, askedAt) {
+			return nil
+		}
+		// The in-flight frame can be coalesced away by the commit that follows it, which
+		// answers above — so missing it never strands the wait, it only leaves the caller's
+		// context as the whole bound.
+		if conn.InFlight() && !conn.NextAttempt.StartedAt.Before(askedAt) {
+			return awaitRun(ctx, sub, contextName, askedAt, ceiling)
+		}
+	}
+}
+
+// awaitRun waits out the run that has begun, under the ceiling. A run that outlives the probe's
+// own timeout is not going to end on its own.
+func awaitRun(ctx context.Context, sub StateSubscription, contextName string, askedAt time.Time, ceiling time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, ceiling)
+	defer cancel()
+
+	for {
+		ev, err := sub.RecvContext(ctx)
+		if err != nil {
+			// Nothing cancels the run: the deadline is this caller's, the run is the
+			// supervisor's, and a Wake is not a Restart.
+			return fmt.Errorf("retry %q: %w", contextName, err)
+		}
+		if answers(ev.Value.Connection, askedAt) {
+			return nil
+		}
+	}
+}
+
+// answers reports whether a run the ask bought has finished. LastRunAt rather than LastAttempt,
+// because a Skip finishes a run and records no attempt: the connection probe skips on an unread
+// kubeconfig, and a retry that waited for a record there would fail a probe that had already run.
+func answers(conn Observation[string], askedAt time.Time) bool {
+	return !conn.LastRunAt.Before(askedAt)
 }
 
 // Subscribe reports every context whose news changed, for a reader whose reaction to any of them

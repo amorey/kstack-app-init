@@ -587,6 +587,25 @@ func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	noRuns(t, e, "a skipped registration was re-dispatched")
 }
 
+// A Skip leaves no record, so LastAttempt cannot say a run happened at all. LastRunAt is what
+// does — the level a caller waiting on a run of its own reads, whatever that run concluded.
+func TestASkipStampsTheRunItLeftNoRecordOf(t *testing.T) {
+	e, p, id := single(t, Fail("ResolveFailed", assert.AnError))
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	recorded := att(t, e, id)
+	require.Equal(t, recorded.LastAttempt.StartedAt, recorded.LastRunAt)
+
+	p.set(Skip())
+	e.Wake(subj, "conn")
+	runNext(t, e)
+
+	a := att(t, e, id)
+	assert.Equal(t, recorded.LastAttempt, a.LastAttempt, "a Skip records nothing")
+	assert.True(t, a.LastRunAt.After(recorded.LastRunAt), "and still stamps that it ran")
+}
+
 // The two ways to end up with nothing due read apart, which is what a caller waking whatever is
 // parked needs: a suspension is waiting on that wake, and a Skip is waiting on the edge that
 // asks for it again.

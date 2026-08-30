@@ -37,7 +37,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   the status code alone discards what the typed half already knows (`state.go` states the rule).
   Every probe reads a raw path today, so nothing has reached it yet.
 
-- **`supervisor.Supervisor`'s `Wake`/`WakeAll` pair reads as one axis and is two.** `Wake(subjectName string, names ...string)` takes named probes on **one** subject; `WakeAll(names ...string)` takes named probes across **every** subject. The variadic means the same thing in both, and `All` varies the argument that is not there — so `WakeAll` reads as "wake every probe" when it means "wake these probes everywhere". Both call sites are correct today: `watchKubeconfig` wants `WakeAll(nameConnection)` (one probe, whole fleet) and `Retry` wants `Wake(contextName, probeNames[:]...)` (one context, every probe) — they are exact transposes, which is what makes the pair easy to reach for backwards. **Fix:** rename `WakeAll` to name its axis (`WakeEverySubject`, or `WakeSubjects`), two call sites plus `engine_test.go` and the `sidecar/CLAUDE.md` wiring line. **Weigh:** the engine is a general leaf and `WakeAll` is the shorter, more conventional spelling; the case for renaming rests on the pair being read together, which is exactly when the ambiguity bites.
+- **`supervisor.Supervisor`'s `Wake`/`WakeAll` pair reads as one axis and is two.** `Wake(subjectName string, names ...string)` takes named probes on **one** subject; `WakeAll(names ...string)` takes named probes across **every** subject. The variadic means the same thing in both, and `All` varies the argument that is not there — so `WakeAll` reads as "wake every probe" when it means "wake these probes everywhere". Both call sites are correct today: `watchKubeconfig` wants `WakeAll(nameConnection)` (one probe, whole fleet) and `RetryAndWait` wants `Wake(contextName, probeNames[:]...)` (one context, every probe) — they are exact transposes, which is what makes the pair easy to reach for backwards. **Fix:** rename `WakeAll` to name its axis (`WakeEverySubject`, or `WakeSubjects`), two call sites plus `engine_test.go` and the `sidecar/CLAUDE.md` wiring line. **Weigh:** the engine is a general leaf and `WakeAll` is the shorter, more conventional spelling; the case for renaming rests on the pair being read together, which is exactly when the ambiguity bites.
 
 - **`supervisor.Supervisor`'s run queue has no debounce.** `runQ` and `passQ` are `internal/workqueue`
   queues (`sidecar/internal/supervisor/supervisor.go`). **Deduping is not debouncing** — a key waits once,
@@ -46,7 +46,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   kubeconfig and the CA files behind it, then dials `/api`.
   - **Four producers reach one context's key today**: `Acquire` → `engine.Add` (once, per new
     context), `watchKubeconfig` → `WakeAll(nameConnection)` (every claimed context, per kubeconfig
-    change), `Retry` → `Wake` (all five probes, on demand), and the engine itself — the data edge
+    change), `RetryAndWait` → `Wake` (all five probes, on demand), and the engine itself — the data edge
     on a committed value, and the subject timer arming the next due pass.
   - **Not a problem yet**, and one throttle already exists: `WithWorkers` caps runs in flight
     fleet-wide, which is what holds back the first pass over a large kubeconfig so every cluster's
@@ -54,11 +54,12 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     runs. The producers are also quiet — a claim asks once per new context, and `kubeconfig.Service`
     polls on a ticker and publishes only when the whole loaded config differs (`reflect.DeepEqual`),
     so a hand-edited file produces one signal rather than one per write.
-  - **The trigger has partly fired.** `Retry` is the third producer and the first *user-driven*
-    one: a client that retries on a timer, or a user clicking through an outage, asks for one
-    context repeatedly, and dedup merges those asks only while the key is waiting. Still bounded by
-    what a person can click, so this is a watch item rather than work — but the next producer that
-    can ask in a loop makes it real.
+  - **The trigger has partly fired.** `RetryAndWait` is the third producer and the first
+    *user-driven* one: a client that retries on a timer, or a user clicking through an outage, asks
+    for one context repeatedly, and dedup merges those asks only while the key is waiting. Bounded
+    by more than a person's click rate now — the mutation is held open for the probe's round trip
+    and the button is disabled for all of it — so this is a watch item rather than work, until a
+    producer that can ask in a loop makes it real.
   - **Home:** `internal/workqueue`, as its own feature. The old pairing with `AddAfter` is gone:
     the engine schedules delayed work with a per-subject `time.AfterFunc` over a schedule derived
     in `pass`, so nothing wants a delayed queue add any more.

@@ -107,9 +107,10 @@ func (r *mutationResolver) ClusterSyncEnabledSet(ctx context.Context, id cluster
 	return r.ClusterSvc.Clusters().SetSyncEnabled(ctx, id, syncEnabled)
 }
 
-// ClusterConnectionRetry is the resolver for the clusterConnectionRetry field.
-// The retry's outcome lands on the record's conditions and reaches the webview
-// through the cluster watch, not here.
+// ClusterConnectionRetry is the resolver for the clusterConnectionRetry field. It
+// resolves when the probe it asked for has finished, so the request is held open for
+// that long. What the probe found lands on the record's conditions and reaches the
+// webview through the cluster watch, not here.
 func (r *mutationResolver) ClusterConnectionRetry(ctx context.Context, id clustersvc.ObjectID) (bool, error) {
 	if err := r.ClusterSvc.RetryConnection(ctx, id); err != nil {
 		return false, err

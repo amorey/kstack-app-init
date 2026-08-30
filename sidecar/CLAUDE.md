@@ -588,10 +588,21 @@ claimable, because it may name it later and the claim is how the holder finds ou
 `Conn` / `ConnFor` / `State` / `WatchState` / `Departed` / `Release`. **`Conn` never dials**: it hands out what
 the connection probe built, or `ErrNoConnection` for a context that resolves to nothing — a
 connection whose last probe *failed* is still handed out, since only the holder can tell a revoked
-credential from a control plane mid-restart. `Retry(contextName)` wakes **all five** probes on a
-claimed context: a connection that is already up commits nothing, so waking it alone would leave a
-probe that failed on its own — a forbidden `kube-system` read — sitting on the answer the user just
-fixed. A context nobody claims is untracked, so it does nothing.
+credential from a control plane mid-restart. `RetryAndWait(ctx, contextName)` wakes **all five** probes: a
+connection that is already up commits nothing, so waking it alone would leave a probe that failed
+on its own — a forbidden `kube-system` read — sitting on the answer the user just fixed. It takes
+its own claim, since a wake on a subject nothing tracks is a no-op, and **returns once the
+connection probe it asked for has finished** — the first `LastRunAt` at or after the ask, so a run
+already in flight does not answer for it (the supervisor holds the key, and the ask is redelivered
+to the next run). `LastRunAt` rather than `LastAttempt`, because a `Skip` finishes a run and
+records no attempt: the connection probe skips on an unread kubeconfig, and a wait for a record
+would fail a retry whose probe had already run. A level against a baseline is also what survives
+the state hub keeping only the latest value per context; an edge would not. **The queue wait is bounded by the caller's context alone** —
+dispatch waits for one of the supervisor's fleet-wide start slots, so a busy fleet delays the run
+by however long the probes ahead of it take, and a deadline run from the ask would fail a probe
+nobody had tried. `retryCeiling` (`connectionTimeout` plus slack) starts when that run *begins*,
+and ends one that never does rather than reporting a probe nobody saw. **Nothing cancels the run** — a caller that goes away leaves it
+running. → [ADR: retry resolves with its probe](../docs/adr/2026-08-30-retry-resolves-with-its-probe.md).
 
 **A `Connection` carries the clients built over one set of credentials** — `Dynamic`, `HTTPClient`,
 and `Discovery` — sharing one pool, which under HTTP/2 is one TCP connection to that API server.
@@ -878,6 +889,11 @@ second one: `LastAttempt` is the run that finished, `NextAttempt` the one that h
 moves between them as it completes. `ScheduledAt` is separate from `StartedAt` because a saturated
 prober lets a scheduled time slip into the past, which a single stamp compared against the clock
 would read as running.
+
+**`LastRunAt` is when the most recently finished run started**, whatever it concluded — written
+at the end and stamped with the beginning, so one comparison answers "a run that began after my
+ask has finished". It is the only record a `Skip` leaves, which is why `RetryAndWait` reads it
+rather than `LastAttempt`.
 
 **A probe that has never run is the zero `Observation`** — a zero `LastAttempt` is not `Done`, so
 every accessor answers correctly with no sentinel.
@@ -1399,7 +1415,7 @@ The schema **is** the Go shape — every GraphQL type binds 1:1 by name to its `
 - Point reads hang off the record that owns them, resolved on selection: every event timeline is an `events(category, limit)` field (`Cluster.events`, `ClusterCache.events`, `ClusterCachedKind.events`), the discovered kind catalog is `ClusterCache.kinds` (no arguments — both ids it reads with come off the record), and `Cluster.caches` / `ClusterCache.cachedKinds` walk the owner chain down (`Caches().List`, `CachedKinds().List`). So there are no root `cluster*Events` or `clusterCachedDataKinds` fields. The lookups `clusterCache(id)` and `clusterCachedKind(id)` (over `Caches().Get`/`CachedKinds().Get`) address a record by **its own** id, which a caller holding one from a watch frame uses directly.
 - **Every noun has the same pair at root: `<noun>(id)` and `<nouns>(<parent>ID)`** — `cluster`/`clusters`, `clusterCache`/`clusterCaches(clusterID)`, `clusterCachedKind`/`clusterCachedKinds(cacheID)`. The plural's scope argument is **optional**: omitted it reads the whole fleet, passed it returns exactly what the nested field serves (`Cluster.caches`, `ClusterCache.cachedKinds`). The resolver picks the boundary method the argument implies — `Caches().List` when nil, `Caches().ListByCluster` when set. Keep that shape when adding a noun.
 - **`Cluster.caches` is the set, never "the" cache.** Activeness is the live join against the parent's `status.server.uid` (`CacheIsActive`), and a probe rewrites that UID with no cache event — so a consumer that must follow it over time reads `clustersWatch` + `clusterCachesWatch` and joins them, rather than reading the query field. → [ADR: delta watches](../docs/adr/2026-08-09-delta-watch-protocol.md). The live counterparts `eventsWatch` and `clusterScheduleWatch` (countdown + `probing`) stay flat at root: only the point reads nest.
-- Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (returns immediately; outcome lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: stop that cache's workers, delete the files, then **requeue its kinds** — their passes re-arm the workers, which cold-sync, the cookie having died with the file), `clusterCachedKindSyncEnabledSet` (**one kind's** switch, taking that record's own id — pausing stops the watch and keeps the rows, where `clusterCacheClear` throws them away), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
+- Mutations: `clusterEnabledSet`, `clusterSyncEnabledSet`, `clusterConnectionRetry` (**held open for the probe's round trip**, so it resolves when that probe finished; what it found lands on conditions), `clusterCacheClear` (takes the **cache's own id**, since a UID migration leaves a cluster owning more than one: stop that cache's workers, delete the files, then **requeue its kinds** — their passes re-arm the workers, which cold-sync, the cookie having died with the file), `clusterCachedKindSyncEnabledSet` (**one kind's** switch, taking that record's own id — pausing stops the watch and keeps the rows, where `clusterCacheClear` throws them away), `clusterDelete` (GC cascades to the cache; **refused with `ErrDeclaredBySource` for a record its source still declares**, since the discovery pass would re-import it under a fresh id and the new record would carry defaults rather than the user's toggles . **The guard reads the kubeconfig, not the record's observation**, which is only a cached view of it: status is nil for exactly as long as a just-imported record has not reconciled, and the webview renders such a record as orphaned (`isPresent ?? false`) — so its Remove button is live in precisely the window a status-only check would wave through. Status is the fallback while the file is unread, and a record with neither is refused, since refusing is recoverable and allowing is not).
 - `ClusterCachedDataEvent.type` is a plain `String!` (k8s doesn't constrain it) and timestamps are nullable `Time` via `nilIfZeroTime` (`graph/util.go`) — the record keeps value `time.Time` for comparability.
 - **A watch that dies reports why** (`graph/watch_failure.go`). gqlgen builds each subscription frame as data alone and stops the instant the resolver's channel closes, so a failed watch is otherwise byte-identical to a graceful end and the webview reconnects forever with nothing shown. `WatchFailureExtension` bridges that in two halves — the resolver and the frame that would carry the reason never share a response context: `InterceptOperation` hangs a slot on the operation ctx (gqlgen threads it into the resolvers *and* every later frame), `watchStream` files `Stream.Err()` into it as the frames run out, and `InterceptResponse` claims it once the stream is spent, emitting one errors-only `graphql.Response` before the transport completes. Claimed once, so the next poll ends the subscription instead of looping. The reason goes through `AddError`, so the server's error presenter logs it. The client treats that frame as a drop with a reason — reported, last-known data held, reconnect — see the root `CLAUDE.md`. → [ADR: watch-failure reporting](../docs/adr/2026-08-14-watch-failure-reporting.md).
 
