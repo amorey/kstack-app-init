@@ -49,7 +49,7 @@ func TestObjectChangesReturnsOnlyWhatMovedPastTheCursor(t *testing.T) {
 	got, err := s.ObjectChanges(ctx, "v1", "pods", at)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"uid-2"}, uids(got.Written))
-	assert.Equal(t, storeHead(t, s), got.Head, "the read is current at the head it returns")
+	assert.Equal(t, storeHead(t, s), got.At.Seq, "the read is current at the head it returns")
 	assert.True(t, got.KindResolved)
 }
 
@@ -146,6 +146,6 @@ func TestEventChangesReturnsWhatMovedAndWhatWent(t *testing.T) {
 	require.Len(t, got.Written, 1)
 	assert.Equal(t, "ev-1", got.Written[0].UID)
 	assert.Equal(t, []string{"ev-2"}, got.Deleted)
-	assert.Equal(t, storeHead(t, s), got.Head)
+	assert.Equal(t, storeHead(t, s), got.At.Seq)
 	assert.True(t, got.KindResolved, "the events collection is always addressable")
 }

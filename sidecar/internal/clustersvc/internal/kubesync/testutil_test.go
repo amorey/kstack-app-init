@@ -738,7 +738,7 @@ func objectNames(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind) []
 	require.True(t, ok, "the cache is open")
 	defer store.Release()
 
-	rows, _, err := store.ObjectsWithHead(t.Context(), k.APIVersion, k.Resource)
+	rows, _, err := store.ObjectsWithCursor(t.Context(), k.APIVersion, k.Resource)
 	require.NoError(t, err)
 	names := make([]string, 0, len(rows))
 	for _, r := range rows {
@@ -754,7 +754,7 @@ func eventsOf(t *testing.T, svc *Service, cacheID int64) []kubestore.EventRow {
 	require.True(t, ok, "the cache is open")
 	defer store.Release()
 
-	rows, _, err := store.EventsWithHead(t.Context())
+	rows, _, err := store.EventsWithCursor(t.Context())
 	require.NoError(t, err)
 	return rows
 }

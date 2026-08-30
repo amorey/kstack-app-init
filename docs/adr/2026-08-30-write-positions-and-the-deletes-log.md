@@ -38,9 +38,11 @@ trigger (`objects_identity_change_log`): a reader takes a kind's rows and its de
 kind's mark has lost deletes it never saw and can no longer be trusted.
 
 **The watch reads what moved past its cursor.** `ObjectChanges`/`EventChanges` return the rows
-written above a cursor, the uids deleted above it, the head, and the kind's trim mark, all from one
-read transaction. The loop applies **deletes before writes** and resumes from the head, falling back
-to the full read-and-diff when the kind no longer resolves or the cursor is below the mark. The
+written above a cursor, the uids deleted above it, the new cursor, and the kind's trim mark, all
+from one read transaction. A cursor is a position **and** the Kind it was read under, since both
+ranges are keyed by that Kind. The loop applies **deletes before writes** and resumes from the
+cursor it was handed, falling back to the full read-and-diff when the kind no longer resolves, the
+cursor is below the mark, or the read answers under a different Kind. The
 protocol a client sees is unchanged: snapshot as `Added`, one `Bookmark`, then
 `Added`/`Modified`/`Deleted`.
 
@@ -84,6 +86,10 @@ The obligations this creates are all about the stamp meaning what it says:
   row and the restarted sync lists the same objects back above it. The writes range only ever
   returns rows that still exist, so this order lands on the live row; the other drops it, and on a
   quiet kind nothing would send it again.
+- **A cursor is only usable under the identity it was taken with.** A CRD whose Kind is renamed
+  keeps its plural, and the catalog remaps to the new Kind — so the rows the watch holds and the
+  deletes the old Kind's worker logged fall outside both ranges. The full diff had no such notion
+  because it re-resolved the plural every time; the cursor has to carry the Kind to keep it.
 - **The trim mark only ever rises**, enforced in SQL, because `at` and `seq` disagree across a
   reopen and a later sweep can compute a lower position.
 - **The positions fail closed.** An unparseable mark and a missing counter are errors, not zeros:

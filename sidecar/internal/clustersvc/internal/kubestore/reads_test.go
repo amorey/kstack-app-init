@@ -114,7 +114,7 @@ func TestEventsBreaksLastSeenTiesByUID(t *testing.T) {
 		require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, event(uid, "2026-08-26T10:00:00Z")))
 	}
 
-	got, _, err := s.EventsWithHead(ctx)
+	got, _, err := s.EventsWithCursor(ctx)
 	require.NoError(t, err)
 
 	require.Len(t, got, 3)
@@ -130,13 +130,13 @@ func TestObjectsResolveThePluralThroughTheCatalog(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 
-	got, _, err := s.ObjectsWithHead(ctx, "v1", "pods")
+	got, _, err := s.ObjectsWithCursor(ctx, "v1", "pods")
 	require.NoError(t, err)
 	assert.Empty(t, got, "no catalog row, so the plural names no Kind")
 
 	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 
-	got, _, err = s.ObjectsWithHead(ctx, "v1", "pods")
+	got, _, err = s.ObjectsWithCursor(ctx, "v1", "pods")
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "uid-1", got[0].UID)
@@ -180,7 +180,7 @@ func TestObjectsAreOrderedByNamespaceAndName(t *testing.T) {
 		require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-"+name, name, "42")))
 	}
 
-	got, _, err := s.ObjectsWithHead(ctx, "v1", "pods")
+	got, _, err := s.ObjectsWithCursor(ctx, "v1", "pods")
 	require.NoError(t, err)
 
 	require.Len(t, got, 3)
@@ -252,23 +252,25 @@ func TestObjectBodyReportsAStoredBodyItCannotDecompress(t *testing.T) {
 
 // A snapshot is read at a position: the rows and the head come out of one transaction, so
 // the cursor the reader keeps covers exactly the rows it was handed. Two reads instead
-// would let a write land between them, and the cursor would claim rows nobody sent.
-func TestASnapshotIsReadAtTheHead(t *testing.T) {
+// would let a write land between them, and the cursor would claim rows nobody sent. The
+// cursor also carries the Kind the rows were read under, which is the other half of "what
+// is prev current with": a plural can be remapped onto a renamed Kind.
+func TestASnapshotIsReadAtACursor(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	require.NoError(t, s.SyncKinds(ctx, []KindRow{podRow}, true, 7))
 	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
 	require.NoError(t, s.ApplyChange(ctx, eventsKind, watch.Added, firing("ev-1", "10", 1)))
 
-	objects, objectsAt, err := s.ObjectsWithHead(ctx, "v1", "pods")
+	objects, objectsAt, err := s.ObjectsWithCursor(ctx, "v1", "pods")
 	require.NoError(t, err)
-	events, eventsAt, err := s.EventsWithHead(ctx)
+	events, eventsAt, err := s.EventsWithCursor(ctx)
 	require.NoError(t, err)
 
 	require.Len(t, objects, 1)
 	require.Len(t, events, 1)
 	at := storeHead(t, s)
-	assert.Equal(t, at, objectsAt)
-	assert.Equal(t, at, eventsAt)
+	assert.Equal(t, Cursor{Seq: at, Kind: "Pod"}, objectsAt)
+	assert.Equal(t, Cursor{Seq: at, Kind: "Event"}, eventsAt)
 	assert.Equal(t, at, eventSeq(t, s, "ev-1"), "the head is the last write's position")
 }

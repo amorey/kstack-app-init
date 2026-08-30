@@ -323,16 +323,21 @@ early or late one costs an idempotent read rather than a wrong frame — which i
 coupling to the store's transactions. What that read is differs by watch:
 
 - **Objects and events read past a cursor** (`Store.ObjectChanges`/`EventChanges`): the rows written
-  above it, the uids deleted above it, the head, and the kind's trim mark, out of one read
+  above it, the uids deleted above it, the new cursor, and the kind's trim mark, out of one read
   transaction. **Deletes are applied before writes** — a uid can be in both ranges — and the cursor
   moves only once every frame is out, so a consumer that left mid-burst re-reads the same changes.
-  The snapshot is `ObjectsWithHead`/`EventsWithHead`, which is where the first cursor comes from; a
-  watch that bound after an empty snapshot starts at 0.
+  The snapshot is `ObjectsWithCursor`/`EventsWithCursor`, which is where the first cursor comes
+  from; a watch that bound after an empty snapshot starts at the zero cursor.
+- **A `kubestore.Cursor` is a position AND the Kind it was read under**, because both ranges are
+  keyed by that Kind and a plural can be remapped onto a renamed one (`stmtResolveKindRename`).
+  Nothing here may treat the position alone as the cursor.
 - **The kinds watch re-reads and diffs** (`changes` nil): ~150 rows carrying counts that move under
   them, so there is nothing to gain.
-- **Two answers send it back to the full read**, both of them empty and neither a fault: a cursor
-  *below* the kind's trim mark (deletes it never saw are gone from the log) and a kind whose catalog
-  row is gone (its rows are the client's to drop, which the diff against an empty read produces).
+- **Three answers send it back to the full read**, all of them empty and none a fault: a cursor
+  *below* the kind's trim mark (deletes it never saw are gone from the log), a kind whose catalog
+  row is gone (its rows are the client's to drop, which the diff against an empty read produces),
+  and a read answering under a **different Kind** (the rows this watch holds, and the deletes the
+  old Kind's worker logged, are in neither range).
   → [ADR: write positions and the deletes log](../docs/adr/2026-08-30-write-positions-and-the-deletes-log.md).
 
 Four rules carry the loop itself:

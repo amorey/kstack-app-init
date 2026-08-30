@@ -108,29 +108,29 @@ type EventRow struct {
 	InvolvedName string
 }
 
-// EventsWithHead reads every cached event, newest first, beside the position it is current
+// EventsWithCursor reads every cached event, newest first, beside the position it is current
 // at. The uid tiebreak makes that order total: last_seen has one-second resolution, and a
 // relist re-inserts every row with fresh rowids, so rows tied on a second would otherwise
 // reshuffle between two reads.
 //
-// **The rows and the head come out of one transaction**, as in KindsWithFingerprint: the
+// **The rows and the cursor come out of one transaction**, as in KindsWithFingerprint: the
 // caller resumes from that position, so a write landing between two reads would leave the
 // cursor claiming rows nobody was sent.
-func (s *Store) EventsWithHead(ctx context.Context) ([]EventRow, int64, error) {
+func (s *Store) EventsWithCursor(ctx context.Context) ([]EventRow, Cursor, error) {
 	f, err := s.file()
 	if err != nil {
-		return nil, 0, err
+		return nil, Cursor{}, err
 	}
 	var (
 		out []EventRow
-		at  int64
+		at  = Cursor{Kind: eventsLogKind}
 	)
 	err = inReadTx(ctx, f, "read events", func(st stmts) error {
 		var err error
 		if out, err = scanEvents(ctx, st, stmtSelectEvents); err != nil {
 			return err
 		}
-		at, err = head(ctx, st)
+		at.Seq, err = head(ctx, st)
 		return err
 	})
 	return out, at, err
@@ -216,8 +216,8 @@ func (s *Store) ObjectBody(ctx context.Context, uid string) ([]byte, bool, error
 	return body, true, nil
 }
 
-// ObjectsWithHead reads one kind's whole cached set, ordered by (namespace, name), beside
-// the position it is current at — one transaction, for the reason EventsWithHead states.
+// ObjectsWithCursor reads one kind's whole cached set, ordered by (namespace, name), beside
+// the cursor it is current at — one transaction, for the reason EventsWithCursor states.
 //
 // The caller names the plural while the table is keyed by Kind, so the resource translates
 // through kind_catalog — whose one writer is the discovery sweep. A kind with no catalog row
@@ -226,21 +226,29 @@ func (s *Store) ObjectBody(ctx context.Context, uid string) ([]byte, bool, error
 // **No body.** A caller that wants whole rows gets its own query rather than putting
 // raw_json back on this one — the watch's diff would then hold and re-read every body in the
 // collection to learn that three rows moved.
-func (s *Store) ObjectsWithHead(ctx context.Context, apiVersion, resource string) ([]ObjectRow, int64, error) {
+// The cursor carries the Kind the plural resolved to, which is what a later changes read is
+// compared against: a rename remaps the plural, and the rows read here are the old Kind's.
+// A plural naming no catalog row reads empty under an empty Kind, and the first changes read
+// that resolves one is then a difference — which is a full read, correctly.
+func (s *Store) ObjectsWithCursor(ctx context.Context, apiVersion, resource string) ([]ObjectRow, Cursor, error) {
 	f, err := s.file()
 	if err != nil {
-		return nil, 0, err
+		return nil, Cursor{}, err
 	}
 	var (
 		out []ObjectRow
-		at  int64
+		at  Cursor
 	)
 	err = inReadTx(ctx, f, "read objects", func(st stmts) error {
-		var err error
+		kind, _, err := resolveKind(ctx, st, apiVersion, resource)
+		if err != nil {
+			return err
+		}
+		at.Kind = kind
 		if out, err = scanObjects(ctx, st, stmtSelectObjects, apiVersion, apiVersion, resource); err != nil {
 			return err
 		}
-		at, err = head(ctx, st)
+		at.Seq, err = head(ctx, st)
 		return err
 	})
 	return out, at, err

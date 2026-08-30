@@ -34,16 +34,29 @@ import (
 type Changes[T any] struct {
 	Written []T
 	Deleted []string
-	// Head is the position this read is current at — the caller's next cursor, and only
-	// after every frame it produced is out.
-	Head int64
-	// Trimmed is how far this collection's deletes log has been trimmed. A cursor at or
-	// below it has lost deletes it never saw, so the caller falls back to a full read.
+	// At is where this read leaves the caller — its next cursor, and only once every frame
+	// the read produced is out.
+	At Cursor
+	// Trimmed is how far this collection's deletes log has been trimmed. A cursor below it
+	// has lost deletes it never saw, so the caller falls back to a full read.
 	Trimmed int64
 	// KindResolved is false when the plural names no catalog row. Not an empty answer: the
 	// rows are keyed by Kind, so an unresolved name matches nothing in either range and
 	// would report a kind the cache has stopped serving as one that simply did not move.
 	KindResolved bool
+}
+
+// Cursor is what a set of rows is current with: the write position they were read at, and
+// the identity they were read under.
+//
+// **The Kind is half the cursor, not a label on it.** Both ranges are keyed by it, and a
+// plural can be remapped onto a renamed Kind (stmtResolveKindRename) — so a cursor taken
+// under the old one names rows and log entries the new one's ranges do not cover, and only
+// comparing the two says so.
+type Cursor struct {
+	Seq int64
+	// Kind is empty for a plural naming no catalog row, which is a cursor over nothing.
+	Kind string
 }
 
 // ObjectChanges reads one kind's changes above since. Everything comes out of one read
@@ -62,7 +75,7 @@ func (s *Store) ObjectChanges(ctx context.Context, apiVersion, resource string, 
 		if err != nil || !ok {
 			return err
 		}
-		out.KindResolved = true
+		out.KindResolved, out.At.Kind = true, kind
 		if out.Written, err = scanObjects(ctx, st, stmtSelectObjectsSince, apiVersion, kind, since); err != nil {
 			return err
 		}
@@ -72,7 +85,7 @@ func (s *Store) ObjectChanges(ctx context.Context, apiVersion, resource string, 
 		if out.Trimmed, err = trimmed(ctx, st, apiVersion, kind); err != nil {
 			return err
 		}
-		out.Head, err = head(ctx, st)
+		out.At.Seq, err = head(ctx, st)
 		return err
 	})
 	return out, err
@@ -86,7 +99,7 @@ func (s *Store) EventChanges(ctx context.Context, since int64) (Changes[EventRow
 	if err != nil {
 		return Changes[EventRow]{}, err
 	}
-	out := Changes[EventRow]{KindResolved: true}
+	out := Changes[EventRow]{KindResolved: true, At: Cursor{Kind: eventsLogKind}}
 	err = inReadTx(ctx, f, "read event changes", func(st stmts) error {
 		var err error
 		if out.Written, err = scanEvents(ctx, st, stmtSelectEventsSince, since); err != nil {
@@ -98,7 +111,7 @@ func (s *Store) EventChanges(ctx context.Context, since int64) (Changes[EventRow
 		if out.Trimmed, err = trimmed(ctx, st, eventsLogAPIVersion, eventsLogKind); err != nil {
 			return err
 		}
-		out.Head, err = head(ctx, st)
+		out.At.Seq, err = head(ctx, st)
 		return err
 	})
 	return out, err

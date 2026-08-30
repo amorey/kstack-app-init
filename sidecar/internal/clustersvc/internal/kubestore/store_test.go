@@ -653,9 +653,9 @@ func TestAStoreWhoseFileIsGoneAnswersErrClosed(t *testing.T) {
 	assert.ErrorIs(t, store.SyncKinds(ctx, nil, true, 1), ErrClosed)
 	_, err = store.Kinds(ctx)
 	assert.ErrorIs(t, err, ErrClosed)
-	_, _, err = store.EventsWithHead(ctx)
+	_, _, err = store.EventsWithCursor(ctx)
 	assert.ErrorIs(t, err, ErrClosed)
-	_, _, err = store.ObjectsWithHead(ctx, "v1", "pods")
+	_, _, err = store.ObjectsWithCursor(ctx, "v1", "pods")
 	assert.ErrorIs(t, err, ErrClosed)
 	_, _, err = store.ObjectBody(ctx, "uid-1")
 	assert.ErrorIs(t, err, ErrClosed)
@@ -871,11 +871,11 @@ func TestEveryOperationReportsAStorageFault(t *testing.T) {
 			return err
 		},
 		"Events": func(ctx context.Context, s *Store) error {
-			_, _, err := s.EventsWithHead(ctx)
+			_, _, err := s.EventsWithCursor(ctx)
 			return err
 		},
 		"Objects": func(ctx context.Context, s *Store) error {
-			_, _, err := s.ObjectsWithHead(ctx, "v1", "pods")
+			_, _, err := s.ObjectsWithCursor(ctx, "v1", "pods")
 			return err
 		},
 		"ObjectBody": func(ctx context.Context, s *Store) error {

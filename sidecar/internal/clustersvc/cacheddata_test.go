@@ -434,3 +434,34 @@ func TestWatchObjectsKeepsRowsThatWereClearedAndRelisted(t *testing.T) {
 	}
 	assert.Equal(t, map[string]bool{"uid-1": true}, held, "the relisted row was dropped")
 }
+
+// A CRD whose Kind is renamed keeps its plural, and the catalog remaps to the new Kind
+// (stmtResolveKindRename). The rows and the deletes the old worker logged are keyed by the
+// OLD Kind, so a cursor read under the new one sees neither — the watch would hold the old
+// rows for as long as it stayed connected.
+func TestWatchObjectsDropsRowsWhenTheKindBehindThePluralIsRenamed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newDataFixture(t)
+	was := kubestore.Kind{APIVersion: "v1", Kind: "Widget", Resource: "widgets"}
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
+		{APIVersion: "v1", Kind: "Widget", Resource: "widgets", Scope: kubestore.ScopeNamespaced},
+	}, true, 7))
+	require.NoError(t, f.store.ApplyChange(ctx, was, watch.Added, dataPod("uid-1", "api-0", "42")))
+
+	stream, err := f.data().WatchObjects(ctx, f.clusterID, f.cacheID, "v1", "widgets")
+	require.NoError(t, err)
+	testutil.Recv(t, stream.Frames, "the object")
+	require.Equal(t, DeltaFrameBookmark, testutil.Recv(t, stream.Frames, "the bookmark").Type)
+
+	// The sweep remaps the plural onto the new Kind, and the old kind's worker clears its
+	// rows on the way out.
+	require.NoError(t, f.store.SyncKinds(ctx, []kubestore.KindRow{
+		{APIVersion: "v1", Kind: "Gadget", Resource: "widgets", Scope: kubestore.ScopeNamespaced},
+	}, true, 8))
+	require.NoError(t, f.store.ClearKind(ctx, was))
+
+	gone := testutil.Recv(t, stream.Frames, "the removal")
+	assert.Equal(t, DeltaFrameDeleted, gone.Type)
+	assert.Equal(t, "uid-1", gone.Object.UID)
+}

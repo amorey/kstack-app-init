@@ -54,8 +54,8 @@ type watchFixture struct {
 	// reads counts the FULL read calls, so a test can pin a debounce collapsing a burst —
 	// and, once the changes hook is in, that the loop did not fall back to one.
 	reads int
-	// at is the position the full read answers at, and what the changes hook counts from.
-	at int64
+	// at is the cursor the full read answers at, and what the changes hook counts from.
+	at kubestore.Cursor
 	// next is what the changes hook answers, and changesErr fails it. Hand-driven, so a
 	// loop test says what moved without going through a store.
 	next       kubestore.Changes[row]
@@ -85,6 +85,13 @@ func (f *watchFixture) set(rows ...row) {
 	f.rows, f.err = rows, nil
 }
 
+// readAs is the identity the full read answers under — the Kind a plural resolves to.
+func (f *watchFixture) readAs(kind string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.at.Kind = kind
+}
+
 // fail makes the next reads fail until set is called again.
 func (f *watchFixture) fail(err error) {
 	f.mu.Lock()
@@ -92,12 +99,12 @@ func (f *watchFixture) fail(err error) {
 	f.err = err
 }
 
-func (f *watchFixture) read(context.Context, *kubestore.Store) ([]row, int64, error) {
+func (f *watchFixture) read(context.Context, *kubestore.Store) ([]row, kubestore.Cursor, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads++
 	if f.err != nil {
-		return nil, 0, f.err
+		return nil, kubestore.Cursor{}, f.err
 	}
 	return append([]row(nil), f.rows...), f.at, nil
 }
@@ -107,8 +114,8 @@ func (f *watchFixture) read(context.Context, *kubestore.Store) ([]row, int64, er
 func (f *watchFixture) push(c kubestore.Changes[row]) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.at++
-	c.Head, c.KindResolved = f.at, true
+	f.at.Seq++
+	c.At, c.KindResolved = f.at, true
 	f.next, f.changesErr = c, nil
 }
 
@@ -134,8 +141,8 @@ func (f *watchFixture) readChanges(_ context.Context, _ *kubestore.Store, since 
 	if f.changesErr != nil {
 		return kubestore.Changes[row]{}, f.changesErr
 	}
-	if since >= f.next.Head && f.next.KindResolved {
-		return kubestore.Changes[row]{Head: since, KindResolved: true}, nil
+	if since >= f.next.At.Seq && f.next.KindResolved {
+		return kubestore.Changes[row]{At: f.next.At, KindResolved: true}, nil
 	}
 	return f.next, nil
 }
@@ -617,7 +624,7 @@ func TestCacheWatchFallsBackWhenItsCursorWasTrimmed(t *testing.T) {
 
 	// The mark is above the cursor, and the changes answer is deliberately empty: taking it
 	// at face value would send nothing at all.
-	f.pushRaw(kubestore.Changes[row]{Head: 99, Trimmed: 99, KindResolved: true})
+	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99}, Trimmed: 99, KindResolved: true})
 	f.set(row{UID: "a", Data: "2"})
 	f.ping()
 
@@ -704,4 +711,33 @@ func TestCacheWatchBoundLateReadsTheKindFromZero(t *testing.T) {
 	assert.Equal(t, DeltaFrameAdded, fr.Type)
 	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row)
 	assert.Zero(t, f.readCount(), "the empty snapshot left a cursor the changes read could not use")
+}
+
+// A read answering under a different identity is a plural remapped onto a renamed Kind. Both
+// ranges are keyed by it, so the rows this watch holds and the deletes the old Kind's worker
+// logged are in neither — taking the empty answer would leave those rows on screen for as
+// long as the watch stayed connected.
+func TestCacheWatchFallsBackWhenTheKindBehindThePluralChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newWatchFixture(t)
+	f.open()
+	f.readAs("Widget")
+	f.set(row{UID: "a", Data: "1"})
+
+	s := f.startWithChanges(ctx, time.Millisecond, time.Millisecond)
+	recvFrame(t, s)
+	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+	require.Equal(t, 1, f.readCount())
+
+	// The renamed Kind's ranges carry neither the old row nor the delete its worker logged.
+	f.pushRaw(kubestore.Changes[row]{At: kubestore.Cursor{Seq: 99, Kind: "Gadget"}, KindResolved: true})
+	f.readAs("Gadget")
+	f.set()
+	f.ping()
+
+	fr := recvFrame(t, s)
+	assert.Equal(t, DeltaFrameDeleted, fr.Type, "the rows of the Kind the plural left were kept")
+	assert.Equal(t, row{UID: "a", Data: "1"}, *fr.Row)
+	assert.Equal(t, 2, f.readCount())
 }

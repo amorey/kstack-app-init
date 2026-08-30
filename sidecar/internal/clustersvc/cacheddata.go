@@ -247,9 +247,9 @@ func (a cachedDataAPI) WatchKinds(ctx context.Context, clusterID ClusterID, cach
 		debounce: dataKindsDebounce,
 		retry:    dataRetryInterval,
 		key:      func(r kubestore.KindRow) string { return r.APIVersion + "/" + r.Resource },
-		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.KindRow, int64, error) {
+		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.KindRow, kubestore.Cursor, error) {
 			rows, err := s.Kinds(ctx)
-			return rows, 0, err
+			return rows, kubestore.Cursor{}, err
 		},
 		frame: func(_ context.Context, _ *kubestore.Store, t DeltaFrameType, r kubestore.KindRow) ClusterCachedDataKindWatchFrame {
 			kind := toCachedDataKind(r)
@@ -277,8 +277,8 @@ func (a cachedDataAPI) WatchObjects(ctx context.Context, clusterID ClusterID, ca
 		debounce: dataObjectsDebounce,
 		retry:    dataRetryInterval,
 		key:      func(r kubestore.ObjectRow) string { return r.UID },
-		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.ObjectRow, int64, error) {
-			return s.ObjectsWithHead(ctx, apiVersion, resource)
+		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.ObjectRow, kubestore.Cursor, error) {
+			return s.ObjectsWithCursor(ctx, apiVersion, resource)
 		},
 		changes: func(ctx context.Context, s *kubestore.Store, since int64) (kubestore.Changes[kubestore.ObjectRow], error) {
 			return s.ObjectChanges(ctx, apiVersion, resource, since)
@@ -309,8 +309,8 @@ func (a cachedDataAPI) WatchEvents(ctx context.Context, clusterID ClusterID, cac
 		debounce: dataEventsDebounce,
 		retry:    dataRetryInterval,
 		key:      func(r kubestore.EventRow) string { return r.UID },
-		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.EventRow, int64, error) {
-			return s.EventsWithHead(ctx)
+		read: func(ctx context.Context, s *kubestore.Store) ([]kubestore.EventRow, kubestore.Cursor, error) {
+			return s.EventsWithCursor(ctx)
 		},
 		changes: func(ctx context.Context, s *kubestore.Store, since int64) (kubestore.Changes[kubestore.EventRow], error) {
 			return s.EventChanges(ctx, since)
