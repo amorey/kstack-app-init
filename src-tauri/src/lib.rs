@@ -42,7 +42,8 @@ mod window_manager;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tauri::{Manager, RunEvent};
+use tauri::webview::PageLoadEvent;
+use tauri::{Manager, RunEvent, WindowEvent};
 use tokio_util::sync::CancellationToken;
 
 use crate::services::sidecar::SidecarService;
@@ -109,6 +110,19 @@ fn spawn_signal_handler(app: &tauri::AppHandle) {
     });
 }
 
+/// Drops every subscription a webview opened. A reload replaces the page's JS
+/// without running any teardown, and a closed window runs none either, so
+/// without this the host keeps streaming SSE frames at a webview that can no
+/// longer route them — leaking a sidecar connection and a cluster watch per
+/// subscription, and (on reload) filling the console with the Tauri runtime's
+/// "Couldn't find callback id N" for every frame.
+fn cancel_webview_subscriptions(app: &tauri::AppHandle, label: &str) {
+    // `try_state`: the first page load can beat `setup`'s `manage`.
+    if let Some(state) = app.try_state::<AppState>() {
+        state.sidecar.cancel_webview(label);
+    }
+}
+
 /// Builds, configures, and runs the Tauri application (the host's entry
 /// point).
 ///
@@ -144,6 +158,13 @@ pub fn run() {
     }
 
     let app = builder
+        // `Started` fires as a navigation commits, so it covers the reload the
+        // webview never tells us about.
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), PageLoadEvent::Started) {
+                cancel_webview_subscriptions(webview.app_handle(), webview.label());
+            }
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
@@ -214,6 +235,11 @@ pub fn run() {
                     }
                 }
             }
+            RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::Destroyed,
+                ..
+            } => cancel_webview_subscriptions(app_handle, &label),
             RunEvent::ExitRequested { api, code, .. } => {
                 match code {
                     // Keep app open in background when the last window is closing

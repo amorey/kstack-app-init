@@ -191,17 +191,25 @@ impl SidecarService {
 
     /// Registers a GraphQL subscription on its own SSE connection, forwarding
     /// envelopes to `channel`. Returns the op id for
-    /// [`SidecarService::unsubscribe`].
+    /// [`SidecarService::unsubscribe`]. `webview` is the label of the webview
+    /// that owns the channel, so [`SidecarService::cancel_webview`] can reach
+    /// it.
     pub async fn subscribe(
         &self,
         query: String,
         variables: serde_json::Value,
         channel: Channel<String>,
+        webview: String,
     ) -> Result<u64> {
         // `FrameSink` is the delivery seam; the webview's `Channel` is wrapped
         // in `TauriChannelSink`.
         self.subscription_client
-            .subscribe(query, variables, Arc::new(TauriChannelSink(channel)))
+            .subscribe(
+                query,
+                variables,
+                Arc::new(TauriChannelSink(channel)),
+                webview,
+            )
             .await
     }
 
@@ -209,6 +217,12 @@ impl SidecarService {
     /// [`SubscriptionClient::unsubscribe`].
     pub async fn unsubscribe(&self, id: u64) {
         self.subscription_client.unsubscribe(id).await;
+    }
+
+    /// Cancels every subscription a webview opened — see
+    /// [`SubscriptionClient::cancel_webview`].
+    pub fn cancel_webview(&self, webview: &str) {
+        self.subscription_client.cancel_webview(webview);
     }
 
     /// Runs the sidecar's synchronous login setup (loopback bind + browser

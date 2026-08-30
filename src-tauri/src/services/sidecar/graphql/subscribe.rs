@@ -34,10 +34,17 @@
 //! No shared session or demultiplexing — a drop ends one subscription and the
 //! frontend reconnects. The only state is the cancel-handle table for
 //! `unsubscribe`.
+//!
+//! Every handle is tagged with the webview that opened it. A reload wipes the
+//! page's JS without any teardown reaching us, so the host cancels that
+//! webview's subscriptions itself (`lib.rs`) — otherwise each one keeps
+//! streaming into a callback id the new page has never heard of, which the
+//! Tauri JS runtime reports as "Couldn't find callback id N", once per frame,
+//! for as long as the app runs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eventsource_stream::Eventsource;
@@ -46,7 +53,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 
 use super::super::ipc::{self, Endpoint, DEFAULT_CONNECT_BUDGET};
 use crate::error::{AppError, Result};
@@ -69,12 +76,29 @@ const CLOSED_FRAME: &str = r#"{"type":"closed"}"#;
 /// a failed dial. The frontend resets accumulators on it; see module docs.
 const OPEN_FRAME: &str = r#"{"type":"open"}"#;
 
+/// A live subscription: the webview that opened it, so
+/// [`SubscriptionClient::cancel_webview`] can find it, and the cancel sender —
+/// never read, only dropped, which is what ends the task.
+struct Sub {
+    webview: String,
+    _cancel: oneshot::Sender<()>,
+}
+
+type Subs = Arc<Mutex<HashMap<u64, Sub>>>;
+
+/// Locks `subs`, recovering a poisoned lock — the guarded map is a plain table
+/// of handles, so a panicking holder leaves nothing half-updated.
+fn lock(subs: &Subs) -> std::sync::MutexGuard<'_, HashMap<u64, Sub>> {
+    subs.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Opens one SSE connection per subscription and tracks a cancel handle for
 /// each so [`SubscriptionClient::unsubscribe`] can tear it down.
 pub struct SubscriptionClient {
     path: Endpoint,
-    /// Cancel handles by host-side op id; dropping the sender ends the task.
-    subs: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
+    /// Live subscriptions by host-side op id; dropping an entry's sender ends
+    /// its task.
+    subs: Subs,
     /// Monotonic for the process lifetime — distinct ids across reconnects.
     next_id: AtomicU64,
     /// Dial budget before emitting an `error` frame; tests shrink it.
@@ -105,6 +129,7 @@ impl SubscriptionClient {
         query: String,
         variables: serde_json::Value,
         sink: Arc<dyn FrameSink>,
+        webview: String,
     ) -> Result<u64> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = serde_json::json!({ "query": query, "variables": variables }).to_string();
@@ -112,7 +137,13 @@ impl SubscriptionClient {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         // Register before spawning — the frontend only learns `id` after this
         // returns, so `unsubscribe(id)` can't race ahead of the insert.
-        self.subs.lock().await.insert(id, cancel_tx);
+        lock(&self.subs).insert(
+            id,
+            Sub {
+                webview,
+                _cancel: cancel_tx,
+            },
+        );
 
         let path = self.path.clone();
         let budget = self.connect_budget;
@@ -127,7 +158,13 @@ impl SubscriptionClient {
     /// ids — urql can race teardown with the subscribe resolve.
     pub async fn unsubscribe(&self, id: u64) {
         // Removing drops the cancel sender → the task's cancel future fires.
-        let _ = self.subs.lock().await.remove(&id);
+        let _ = lock(&self.subs).remove(&id);
+    }
+
+    /// Cancels every subscription `webview` opened — its page reloaded or its
+    /// window closed, so nothing is left to receive them.
+    pub fn cancel_webview(&self, webview: &str) {
+        lock(&self.subs).retain(|_, sub| sub.webview != webview);
     }
 }
 
@@ -139,13 +176,13 @@ async fn run_subscription(
     body: String,
     sink: Arc<dyn FrameSink>,
     mut cancel_rx: oneshot::Receiver<()>,
-    subs: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
+    subs: Subs,
     id: u64,
 ) {
     // Honor an unsubscribe that lands while we're still dialing.
     let opened = tokio::select! {
         biased;
-        _ = &mut cancel_rx => { subs.lock().await.remove(&id); return; }
+        _ = &mut cancel_rx => { lock(&subs).remove(&id); return; }
         r = open_stream(&path, budget, body) => r,
     };
 
@@ -163,7 +200,7 @@ async fn run_subscription(
         }
     }
 
-    subs.lock().await.remove(&id);
+    lock(&subs).remove(&id);
 }
 
 /// Dials the sidecar and issues the SSE `POST /graphql`, returning the live
@@ -380,6 +417,7 @@ mod tests {
                 "subscription { tick }".to_string(),
                 serde_json::json!({}),
                 sink,
+                "main".to_string(),
             )
             .await
             .expect("subscribe");
@@ -420,6 +458,7 @@ mod tests {
                 "subscription { tick }".to_string(),
                 serde_json::json!({}),
                 sink,
+                "main".to_string(),
             )
             .await
             .expect("subscribe");
@@ -454,6 +493,7 @@ mod tests {
                 "subscription { tick }".to_string(),
                 serde_json::json!({}),
                 sink,
+                "main".to_string(),
             )
             .await
             .expect("subscribe");
@@ -493,6 +533,7 @@ mod tests {
                 "subscription { tick }".to_string(),
                 serde_json::json!({}),
                 sink,
+                "main".to_string(),
             )
             .await
             .expect("subscribe");
@@ -514,9 +555,43 @@ mod tests {
         }
 
         // The entry is gone from the table.
-        assert!(client.subs.lock().await.is_empty());
+        assert!(lock(&client.subs).is_empty());
         let _ = release_tx.send(());
         let _ = std::fs::remove_file(arg);
+    }
+
+    /// A reloaded (or closed) webview takes its own subscriptions down and
+    /// leaves every other webview's alone — the host has no other way to learn
+    /// the page is gone.
+    #[tokio::test]
+    async fn cancel_webview_drops_only_that_webviews_subscriptions() {
+        // Never dialed: `subscribe` returns as soon as the task is spawned, and
+        // the table is populated before that, so a dead socket exercises the
+        // bookkeeping without a server.
+        let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
+        let client = SubscriptionClient::new_with_budget(path, Duration::from_millis(150));
+
+        let mut ids = Vec::new();
+        for webview in ["main", "main", "logs"] {
+            let (sink, _rx) = sink_pair();
+            ids.push(
+                client
+                    .subscribe(
+                        "subscription { tick }".to_string(),
+                        serde_json::json!({}),
+                        sink,
+                        webview.to_string(),
+                    )
+                    .await
+                    .expect("subscribe"),
+            );
+        }
+
+        client.cancel_webview("main");
+
+        let remaining = lock(&client.subs);
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains_key(&ids[2]));
     }
 
     /// A dead socket surfaces as an `error` frame (not a hang) within the
@@ -533,6 +608,7 @@ mod tests {
                 "subscription { tick }".to_string(),
                 serde_json::json!({}),
                 sink,
+                "main".to_string(),
             )
             .await
             .expect("subscribe returns Ok even when the socket is dead");

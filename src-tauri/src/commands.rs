@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
 use crate::error::Result;
 use crate::host_file::{self, HostFile, HostFilePatch};
@@ -73,14 +73,22 @@ pub async fn graphql_query(state: State<'_, AppState>, body: String) -> Result<G
 /// Registers a GraphQL subscription (one SSE connection to the sidecar).
 /// Returns the op id for [`graphql_unsubscribe`]. Shape matches
 /// `src/lib/graphql/subscribe-exchange.ts`.
+///
+/// Tagged with the calling webview's label so the host can tear the
+/// subscription down when that page goes away — a reload or a window close
+/// runs no JS teardown (see `lib.rs`).
 #[tauri::command]
 pub async fn graphql_subscribe(
     state: State<'_, AppState>,
+    webview: Webview,
     query: String,
     variables: serde_json::Value,
     channel: Channel<String>,
 ) -> Result<u64> {
-    state.sidecar.subscribe(query, variables, channel).await
+    state
+        .sidecar
+        .subscribe(query, variables, channel, webview.label().to_string())
+        .await
 }
 
 /// Cancels a subscription. Tolerant of unknown ids — the frontend can race
