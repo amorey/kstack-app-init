@@ -190,6 +190,23 @@ func TestAClearedKindRelistedLeavesTheRowAboveItsDelete(t *testing.T) {
 	assert.Greater(t, writeSeq(t, s, "uid-1"), entries[0].Seq)
 }
 
+// A reader takes both a kind's rows and its deletes by (api_version, kind), so a row that
+// moved out of one has to leave an entry behind under the kind it left — it is gone from
+// that kind as surely as a deleted row is, and nothing else would say so.
+func TestAnObjectThatChangesKindLogsADeleteUnderTheKindItLeft(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	renamed := Kind{APIVersion: "v1beta1", Kind: "Pod", Resource: "pods"}
+	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
+
+	require.NoError(t, s.ApplyChange(ctx, renamed, watch.Modified, pod("uid-1", "api-0", "42")))
+
+	entries := loggedDeletes(t, s)
+	require.Len(t, entries, 1)
+	assert.Equal(t, deleteEntry{Seq: entries[0].Seq, APIVersion: "v1", Kind: "Pod", UID: "uid-1"}, entries[0])
+	assert.Equal(t, entries[0].Seq, writeSeq(t, s, "uid-1"), "the row's new position is the departure's")
+}
+
 // A mark that will not parse is not a fresh file. The mark is there because entries went,
 // so answering 0 would tell a reader every cursor it holds is still valid — the missed
 // delete the whole log exists to prevent. An error sends it down its own recovery path.

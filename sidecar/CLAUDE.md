@@ -173,12 +173,14 @@ its write path:
   `resource_version` itself, which is the cluster's own string, neither ordered nor comparable.
   **Unchanged means unchanged in full**: an *empty* version is equal to itself forever and nothing
   upstream rejects one, and the upsert rewrites `api_version`/`kind` in the same SET list — so both
-  ride the stamp's condition, or a row keeps a position below the readers looking for it and no
-  delete is logged either.
+  ride the stamp's condition, or a row keeps a position no reader will look below.
 - **A delete takes its row with it, so it leaves an entry in `deletes`** — the uid, its kind, and
   the same position. Every delete path logs first, in the same transaction and off the delete's own
   predicate, so the two cannot disagree about which rows went; events log under the fixed
-  `('v1', 'Event')` the count triggers use. **A row and an entry for one uid coexist** — `ClearKind`
+  `('v1', 'Event')` the count triggers use. **A row that leaves a kind logs one too**
+  (`objects_identity_change_log`, a trigger beside the kind-count one): a reader takes a kind's
+  rows and its deletes by `(api_version, kind)`, so a uid rewritten under another identity would
+  otherwise be in neither range. **A row and an entry for one uid coexist** — `ClearKind`
   logs a delete per row and the restarted sync lists the same objects back above it — so a reader
   applies deletes BEFORE writes: a uid whose last action was a delete has no row, so the writes
   range only ever returns rows that still exist. Writes-first would drop a live row, and on a quiet

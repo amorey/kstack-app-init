@@ -51,15 +51,24 @@ CREATE INDEX events_seq       ON events(write_seq);
 `events` also gains `resource_version TEXT NOT NULL`, read in `extractEvent` the way
 `projectObject` reads it, so both tables have the same "did it change" fact.
 
-**A row's `write_seq` moves only when its `resource_version` does.** A relist rewrites every row
-of a kind unchanged. Moving the stamp on every rewrite would turn each cold list into one change
-per object, and a reader would receive all of them to learn that nothing moved. Both upserts keep
-the old stamp on a matching version:
+**A row's `write_seq` moves only when the write was effective.** A relist rewrites every row of a
+kind unchanged. Moving the stamp on every rewrite would turn each cold list into one change per
+object, and a reader would receive all of them to learn that nothing moved. So both upserts keep
+the old stamp on a re-observation, and unchanged means unchanged in full:
 
 ```sql
-    write_seq = CASE WHEN excluded.resource_version = objects.resource_version
+    write_seq = CASE WHEN excluded.resource_version <> ''
+                      AND excluded.resource_version = objects.resource_version
+                      AND excluded.api_version = objects.api_version
+                      AND excluded.kind = objects.kind
                      THEN objects.write_seq ELSE excluded.write_seq END
 ```
+
+An *empty* `resource_version` is equal to itself forever and nothing upstream rejects one, so
+reading it as unchanged would freeze the row at its first write, invisible to every later cursor.
+Identity is rewritten by the same `SET` list, so a uid that moved kind has to take a fresh stamp
+or it sits below its new kind's readers. The events upsert has no identity columns — its log key
+is the fixed `('v1', 'Event')` — so it carries the non-empty test alone.
 
 A new uid takes the fresh stamp by definition. A re-firing event moves its `resource_version`, so
 a count bump moves the stamp. This line is the whole design: without it the stamp is a write log
@@ -70,7 +79,7 @@ would read is deleted. So every path that removes a row first copies the doomed 
 into `deletes`, in the same transaction:
 
 ```sql
--- One entry per deleted object or event row. A write's position is on the row itself
+-- One entry per row a reader can no longer reach. A write's position is on the row itself
 -- (write_seq); the row is gone by the time a reader learns of a delete, so the uid is kept
 -- here. Identity only: the reader holds the row's last-known state and keys the removal by uid.
 CREATE TABLE deletes (
@@ -94,10 +103,22 @@ The paths, and what each logs:
 | watch delete | `deleteObjectRow` / `stmtDeleteEvent` | one |
 | relist prune | `sweepObjects` / `stmtPruneEvents` | one per pruned row |
 | kind eviction | `stmtClearObjectsOfKind` / `stmtDeleteAllEvents` | one per row |
+| identity change | `objects_identity_change_log` (trigger) | one, under the old kind |
 
-Each is `INSERT INTO deletes … SELECT … FROM <table> WHERE <the delete's own predicate>`
-followed by the delete, so the two cannot disagree. Events log under the fixed `('v1', 'Event')`
-the count triggers already use.
+Each of the three delete paths is
+`INSERT INTO deletes … SELECT … FROM <table> WHERE <the delete's own predicate>` followed by the
+delete, so the two cannot disagree. Events log under the fixed `('v1', 'Event')` the count
+triggers already use.
+
+**A row that leaves a kind is a delete to that kind's readers**, since a reader takes both a
+kind's rows and its deletes by `(api_version, kind)`. A uid whose identity is rewritten in place —
+a preferred-version flip reaching the upsert before the old kind's `ClearKind` — would otherwise
+be in neither range: it stops matching the old kind's rows, and no path deleted it. A trigger
+beside `objects_kind_count_update`, on the same `WHEN`, logs the departure under the kind the row
+left, at `new.write_seq` — which is the transaction's position because the `CASE` above moves the
+stamp for exactly this case. A trigger and not a statement: it is not a delete path, so no call
+site would think to log it, and the write path pays nothing on the rewrites that do not move
+identity.
 
 **A uid's last action is what the tables say about it.** A row and a log entry for the same
 uid can coexist — `Clear` logs a delete per row, then the restarted sync cold-lists the same
@@ -117,7 +138,9 @@ sweep gains one transaction: read the highest `seq` being removed for each `(api
 `cluster_meta` under `deletes/trimmed/<api_version>/<kind>`. A single mark would not do: cursors
 are per kind, and one busy kind's deletes would push a global mark past every quiet kind's cursor
 within minutes. A mark only ever goes up; a kind that has never trimmed has none, which reads as
-`0`. `Retention.DeletesTTL` is one hour. Age rather than count, because a reader's cursor goes
+`0`. `Retention.DeletesTTL` is one hour, and a zero one trims nothing — the TTLs are independent,
+so a partial `Retention` must leave the table it says nothing about alone rather than take a
+cutoff of now to the whole log. Age rather than count, because a reader's cursor goes
 stale by time. No index on `at`: the table holds an hour of deletes and the sweep runs every five
 minutes — the same trade `status_history`'s sweep makes, with the same escape hatch. The trim and
 its marks are one transaction: a reader that reads a mark and the entries above it in one
@@ -129,6 +152,11 @@ row per kind ever seen is not worth a sweep of its own.
 up to and including this position." Every delete above it must still be in the log, so nothing
 at or below the mark may be relied on. What a reader does with an invalid cursor is spec 2's.
 
+**Both positions fail closed.** A mark that will not parse, and a head that is missing (the
+migration seeds the counter, so absence means the file is not one we wrote), are errors rather
+than zeros. Zero is the answer that says every cursor is still valid and nothing has ever been
+written — the silently missed delete this log exists to prevent.
+
 ## Tests
 
 In `kubestore`, beside the write paths they cover:
@@ -136,12 +164,17 @@ In `kubestore`, beside the write paths they cover:
 - A first write stamps the row at the transaction's position; the same body written again leaves
   the stamp; a body with a new `resource_version` moves it above every earlier stamp.
 - A relist that rewrites the kind unchanged leaves every stamp as it was.
+- A body with no `resource_version` moves its stamp on every write, on both tables.
+- An object whose `(api_version, kind)` changes moves its stamp and logs a delete under the kind
+  it left, at that same position.
 - Each delete path logs one entry per removed row, at a position above every stamp written
   before it.
 - The head after a write then a delete is the delete's position.
 - A re-firing event (same uid, new count) moves its stamp; an unchanged one does not.
 - Entries older than `DeletesTTL` go, newer ones stay, and each kind's mark is its highest removed
-  `seq`; a kind with nothing removed keeps its mark; a sweep that removes nothing writes none.
+  `seq`; a kind with nothing removed keeps its mark; a sweep that removes nothing writes none; a
+  zero TTL removes nothing at all.
+- An unparseable mark and a missing counter are errors, not zeros.
 
 ## When it lands
 

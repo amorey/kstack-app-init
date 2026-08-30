@@ -97,14 +97,14 @@ var stmtText = [numStmts]string{
 			namespace=excluded.namespace,
 			name=excluded.name,
 			resource_version=excluded.resource_version,
-			-- The stamp moves only when the version does: a relist rewrites every row of
-			-- a kind, and moving it on each rewrite would make a cold list read as one
-			-- change per object. Two ways a row would otherwise keep a position it has
-			-- outgrown, both silent — a reader asks for what moved past its cursor and the
-			-- row is never in the range, with no delete logged either. An EMPTY version
-			-- (nothing upstream rejects one) is equal to itself forever, so the row would
-			-- freeze at its first write. And identity is rewritten by this same SET list,
-			-- so a uid that moved kind would sit below the new kind's readers.
+			-- The stamp moves only when the write was effective: a relist rewrites every
+			-- row of a kind, and moving it on each rewrite would make a cold list read as
+			-- one change per object. Two ways a row would otherwise keep a position no
+			-- reader will look below. An EMPTY version (nothing upstream rejects one) is
+			-- equal to itself forever, so the row would freeze at its first write. And
+			-- identity is rewritten by this same SET list, so a uid that moved kind would
+			-- sit below its new kind's readers — objects_identity_change_log logs the
+			-- departure to the old kind at the position this CASE hands the row.
 			write_seq=CASE WHEN excluded.resource_version <> ''
 			                AND excluded.resource_version = objects.resource_version
 			                AND excluded.api_version = objects.api_version

@@ -193,7 +193,9 @@ CREATE TABLE status_history (
 ) STRICT;
 CREATE INDEX status_history_uid_at ON status_history(uid, at DESC);
 
--- One entry per deleted object or event row. A write's position is on the row itself
+-- One entry per row a reader can no longer reach: a deleted object or event, and an object
+-- whose identity moved out of the kind it was read under (objects_identity_change_log). A
+-- write's position is on the row itself
 -- (write_seq); the row is gone by the time a reader learns of a delete, so the uid is kept
 -- here. Identity only: the reader holds the row's last-known state and keys the removal by
 -- uid. Events log under the fixed ('v1', 'Event') the count triggers use, for the same
@@ -298,6 +300,16 @@ WHEN old.api_version <> new.api_version OR old.kind <> new.kind BEGIN
     INSERT INTO kind_counts (api_version, kind, count)
     VALUES (new.api_version, new.kind, 1)
     ON CONFLICT(api_version, kind) DO UPDATE SET count = count + 1;
+END;
+
+-- The same identity change, logged as a delete under the kind the row LEFT. A reader
+-- takes both a kind's rows and its deletes by (api_version, kind), so without this the row
+-- is in neither: it stops matching the old kind's rows, and nothing took it away. The
+-- position is new.write_seq, which the upsert's CASE moves for exactly this case.
+CREATE TRIGGER objects_identity_change_log AFTER UPDATE ON objects
+WHEN old.api_version <> new.api_version OR old.kind <> new.kind BEGIN
+    INSERT INTO deletes (seq, api_version, kind, uid, at)
+    VALUES (new.write_seq, old.api_version, old.kind, old.uid, new.updated_at);
 END;
 
 -- Events live in their own table (they have unique columns + a distinct access
