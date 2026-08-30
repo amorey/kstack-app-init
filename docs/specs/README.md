@@ -38,3 +38,4 @@ dependency, so it can be built out of turn at a cost you can read off its header
 | Spec | Scope | Status |
 | --- | --- | --- |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
+| [CRD printer columns](crd-printer-columns.md) | sidecar + frontend | Planned |
