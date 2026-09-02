@@ -4,7 +4,6 @@ package ipc
 
 import (
 	"os"
-	"path/filepath"
 	"syscall"
 	"testing"
 
@@ -22,7 +21,7 @@ func TestListen_IsOwnerOnly(t *testing.T) {
 			prev := syscall.Umask(umask)
 			defer syscall.Umask(prev)
 
-			path := filepath.Join(t.TempDir(), "s.sock")
+			path := testEndpoint(t)
 			ln, err := Listen(path)
 			require.NoError(t, err)
 			defer ln.Close()
