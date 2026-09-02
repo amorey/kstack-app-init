@@ -112,3 +112,4 @@ usually just documentation in the wrong place.
 | 2026-09-02 | [A kind sync proves itself by a frame, resumes off its cookie, and is judged at read time](2026-09-02-kind-sync-verdicts.md) | sidecar | Accepted |
 | 2026-09-02 | [Cache health is a read-side fold over the records, with paused kinds resolved first](2026-09-02-cache-health-fold.md) | sidecar | Accepted |
 | 2026-09-02 | [Three event timelines, written unconditionally and read by id alone](2026-09-02-event-timelines.md) | sidecar | Accepted |
+| 2026-09-02 | [Let the profile ACL protect the cache files on Windows](2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) | cross-cutting | Accepted |
