@@ -30,6 +30,8 @@ Cluster data streams as **Kubernetes-style delta watches** (an `Added` snapshot,
 >
 > **Rationale lives in ADRs, not here.** These files state *what is true now* — invariants, conventions, commands, traps. *Why* a design was chosen, and what we rejected, goes in `docs/adr/` (see [`docs/adr/README.md`](docs/adr/README.md)) and is linked from here. When a decision changes, write a new ADR, flip the old one's status, and repoint every link in the same commit — a `CLAUDE.md` must never link to a superseded ADR.
 >
+> **Security is recorded in two files.** [`docs/security-model.md`](docs/security-model.md) states what is protected now and which protections a test actually pins; [`docs/security/`](docs/security/) holds dated review records, append-only like ADRs. Gaps live in [`docs/TODO.md`](docs/TODO.md#security), and a risk we decide to accept becomes an ADR — so an accepted risk never reads as an unnoticed one. When you change a boundary or land a protection, move its row in the same change.
+>
 > **Keep comments current — describe the present, not the past.** Code comments (and these docs) must describe only the *current* state of the code. **`docs/adr/` is the sole exemption** — ADRs are an append-only historical record and are meant to say what we rejected, replaced, and believed at the time. When you change something, update the comments around it instead of layering on history: don't leave notes about how the code *used to* work, what a field was *renamed from*, what machinery was *removed*, or which past refactor got you here. A reader should never have to reason about a prior version. State current design and rationale directly; drop "used to", "no longer", "formerly", "superseded", and similar backward-looking framing. (Contrasts with *external* systems — e.g. "unlike apimachinery's default" — are fine; they describe present behavior.)
 
 ## Writing standards
@@ -62,6 +64,14 @@ Two shapes are *not* magic sleeps, and both must say so in a comment:
 
 - **A negative assertion** ("must NOT happen") has no event to wait for, so it needs a bounded window. Write it as a `select` on the tripwire channel versus `time.After` — it fails the instant the thing happens rather than at the end — and size the window as a multiple of the (shrunk) cadence, never a bare guess. Sample the baseline off the same channel, not by polling a counter, or the baseline read races the bug and swallows it.
 - **Latency injected into the code under test** — a fake that takes a moment on purpose so a join-vs-no-join race has a determinate answer. The test's own assertion path stays immediate.
+
+## Security invariants
+
+The whole picture is [`docs/security-model.md`](docs/security-model.md). What an ordinary frontend change can break:
+
+- **Anything running in the webview holds the full cluster surface.** `graphql_query` forwards the operation string unexamined, so a dependency that executes is a dependency that can read every mirrored object and call every mutation. The CSP in `src-tauri/tauri.conf.json` is the containment — never widen `script-src`/`connect-src` to a remote origin, and never load a script the bundle doesn't ship.
+- **Cluster data is attacker-controlled text.** Names, labels, annotations and event messages come from whoever controls the cluster. There is no HTML sink in `src/` today — no `innerHTML`, no `dangerouslySetInnerHTML`, no `eval` — and that is a property to keep, not a coincidence. Printer columns go through the restricted reader in `src/lib/jsonpath.ts`, never a template engine.
+- **The log-tail and exec windows inherit this.** When they land, treat their output as untrusted bytes: no HTML interpretation, and strip terminal control sequences.
 
 ## Frontend (`src/`)
 

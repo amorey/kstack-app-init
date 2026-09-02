@@ -135,6 +135,86 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 - **Startup URLs don't reference the active kube context.** A fresh window lands on a bare `/chat` (`index.tsx` redirects `/` → `DEFAULT_ROUTE` with no search); `useActiveKubeContext` resolves the context by *falling back* to `kubeConfig.currentContext` but only *writes* `?kubeContext=` on an explicit pick. Consequence: the landing URL isn't self-describing or deep-linkable until the user interacts, and two windows on different default-resolved contexts look identical in the URL. Fix: seed `kubeContext` from the resolved current-context at boot (e.g. `index.tsx` redirect or an `_app` `beforeLoad`). Catch: at `beforeLoad` the clusters stream may not have delivered its first frame, so current-context isn't known synchronously — either accept a sometimes-omitted param or resolve+write once after the first frame lands.
 
+## Security
+
+The current picture — boundaries, and which protections a test actually pins — is
+[`security-model.md`](security-model.md); the findings behind these items are
+[`security/2026-09-02-threat-model.md`](security/2026-09-02-threat-model.md). An item here that we
+decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays distinguishable
+from an unnoticed one.
+
+- **Authenticate the socket's peer.** The listener serves whoever connects: any process running as
+  the user speaks GraphQL and gRPC, reads every mirrored object, and can call `StartLogin`/`Logout`
+  or a destructive mutation — without touching `~/.kube/config`. The file mode is the entire policy
+  today. **Fix:** on accept, assert the peer is the host process (or at minimum the same UID) —
+  `SO_PEERCRED` on Linux, `getpeereid` on macOS, `GetNamedPipeClientProcessId` on Windows — in
+  `sidecar/internal/ipc`, where the platform split already lives. **Weigh:** it does not stop a
+  determined same-UID attacker, who can read the socket path and the binary either way; what it
+  removes is the zero-privilege path, which is most of the practical exposure and about a day's work.
+
+- **Decide what the cluster cache is.** It holds full object bodies for every mirrored kind, and
+  write-time redaction is deliberately not exhaustive (`kubestore/objects.go` says so) — ConfigMaps,
+  inline container env values, and unlisted CRDs stay in the clear. So the file answers, offline and
+  without RBAC, questions that previously needed a live authenticated call. **The decision, not the
+  patch:** either that is acceptable and an ADR says why, or the cache is credential-bearing storage
+  and wants encryption at rest with the key in the OS keyring, plus a retention policy so a
+  cluster's contents do not outlive the user's interest in them. **Do first, either way:** chmod the
+  store files 0600 after open, the way `atomicjson` already does — today the guarantee rests on one
+  0700 directory bit, and the SQLite files (plus `-wal`/`-shm`) take the umask. A test shaped like
+  `TestListen_IsOwnerOnly` pins it.
+
+- **Gate kubeconfig `exec` credential plugins on user intent.** `clientcmd` honours `exec` blocks, and
+  the connection probe dials every declared context on startup and on every kubeconfig change — so a
+  kubeconfig an attacker can write is code execution triggered by dropping a file, across contexts
+  the user never opened. **Fix shape:** probe only contexts the user has opened, or require an
+  acknowledgement the first time a context with an `exec` block is used, surfaced as a cluster
+  condition. **Minimum:** write an event naming the binary before it runs, so the cluster timeline
+  records it. **Weigh:** `kubectl` runs the same plugins, so the bar is not "never exec" — it is
+  "not for a context nobody asked about".
+
+- **Allowlist GraphQL operations at the host boundary.** `graphql_query`/`graphql_subscribe` forward
+  the operation string unexamined, so anything running in the webview inherits the full schema —
+  every mutation included. `src/gql/` is already an exact enumeration of the operations the app
+  ships. **Fix:** compare the incoming document against that set (hash the generated documents at
+  build time) and reject the rest. **What it buys:** turns a rendering or dependency compromise from
+  "full surface" into "the operations we wrote", and gives the cost-limiting the GraphQL server
+  otherwise lacks. **Weigh:** it adds a build-time artifact and a step to the codegen loop; check it
+  does not break `pnpm codegen:watch` ergonomics before committing to it.
+
+- **Add dependency advisory scanning to CI.** `ci.yml` runs lint, vet and tests across three
+  ecosystems and scans none of them. **Fix:** `govulncheck`, `cargo audit` (or `cargo deny`) and
+  `pnpm audit` as gates, plus an SBOM at release so a future advisory can be matched against a
+  shipped build. Cheapest item here relative to what it covers.
+
+- **Land the signed updater, or stop documenting it.** `src-tauri/CLAUDE.md` describes in-app updates
+  via `tauri-plugin-updater` with signed bundles and a hosted manifest; nothing declares the plugin
+  or an update public key. Distribution is direct download, so there is no store-side integrity check
+  behind it. Until the plugin lands with its key pinned in `tauri.conf.json`, the docs should say
+  updates are manual — an assumed verification step is worse than a known missing one.
+
+- **Pass the sidecar's endpoints as arguments.** `KSTACK_CLOUD_API_URL`, `KSTACK_OAUTH_ISSUER`,
+  `KSTACK_OAUTH_CLIENT_ID` and `KSTACK_DATA_DIR` are read from inherited environment, so whoever can
+  set the app's launch environment can point sign-in at an issuer they control. **Fix:** the host
+  passes the production values in `cmd_args`, and `main.go` honours the env overrides only in debug
+  builds — the treatment `KSTACK_KEYCHAIN_SERVICE` already gets in `service.rs`.
+
+- **Add retention and a ceiling to the events table.** Core `v1` events are stored and nothing ages
+  them out, so a busy or hostile cluster grows a cache without bound. **Fix:** an age or row-count
+  window in the janitor, plus a per-cache size ceiling above which sync pauses with a visible
+  condition rather than filling the disk.
+
+- **Drop the two grants that have no use case yet.** `opener:default` is in the webview capability
+  though nothing in `src/` calls it (the tray's `open_url` is Rust-side), and `chatStream` is a
+  reachable `panic("not implemented")` in the shipped schema. Both are authority granted ahead of a
+  consumer; re-add each when its feature lands, the capability scoped to the origins it needs.
+
+- **Make the review-held invariants enforced.** Three are cheap and each converts a sentence someone
+  has to remember into a build failure: an ESLint rule banning `innerHTML`/`dangerouslySetInnerHTML`
+  in `src/`; the 0600 store-file test above; and nesting sidecar log fields under `sidecar.*` in
+  `logs.rs` so a cluster-controlled string cannot shadow a host field. **Also worth a line:** surface
+  `insecure-skip-tls-verify` on the cluster row — the fingerprint already carries the information,
+  and today an unverified connection looks like any other.
+
 ## Testing
 
 - **Keep the no-wall-clock rule.** Both `CLAUDE.md` files state it, and the tree is currently clean: the frontend suites use `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `waitFor`, or the `flush()` helper with no `setTimeout` waits; Go's three `time.Sleep` calls are all the permitted kind and each says so — a widened truncate window in `kubeconfig_test.go`, a writer racing a gauge in `caches_test.go`, and `kubesync`'s deliberate exit latency; and `src-tauri/.../sidecar/ipc.rs`'s retry test — `#[tokio::test(start_paused = true)]`, letting tokio auto-advance virtual time between parked timers — is the shape to match. **What to watch for:** not `time.Sleep` but *thin real-timer margins* — tests that never sleep yet still fail on a loaded machine because they race short real durations. The fix shape is an injectable clock/timer seam so the test advances virtual time. The ~30 `time.After(...)` uses in sidecar tests are almost all *deadlines* guarding a channel receive, which the rule explicitly permits; keep those separate from any load-bearing wait. A `-count=20` soak on a loaded machine is the cheapest way to find regressions.

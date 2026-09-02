@@ -43,6 +43,15 @@ The sidecar is a bundled child process (`service.rs::spawn`) on a per-instance s
 
 Quit cancels the app-wide `CancellationToken` before `SidecarService::graceful_shutdown`. Every app-lifetime background task holds a clone and `tokio::select!`s on `shutdown.cancelled()` in each loop/await (tray supervisor, wake supervisor, signal handler). **New background tasks must follow the same pattern.** Per-subscription teardown is separate — the `oneshot` cancel table in `graphql/subscribe.rs`, keyed by op id and tagged by webview.
 
+## Security invariants
+
+Full picture: [`docs/security-model.md`](../docs/security-model.md). What the host owns:
+
+- **The webview is trusted, so the capability set is the only limit on it.** `capabilities/default.json` grants window controls and `opener`; the shell plugin is registered for the Rust-side sidecar spawn and grants the page nothing. Add a permission only when a call site needs it, scoped as narrowly as the plugin allows — a grant with no consumer is standing authority for injected script.
+- **The sidecar inherits this process's environment,** and reads `KSTACK_CLOUD_API_URL`, `KSTACK_OAUTH_ISSUER`, `KSTACK_OAUTH_CLIENT_ID` and `KSTACK_DATA_DIR` from it. New configuration belongs in `cmd_args`, passed explicitly; env is a debug seam, as `KSTACK_KEYCHAIN_SERVICE` already shows.
+- **A webview's subscriptions are torn down by the host** on `PageLoadEvent::Started` and `WindowEvent::Destroyed` — a reload runs no JS teardown, and an orphaned subscription keeps a sidecar connection and a cluster watch alive. Pinned by `cancel_webview_drops_only_that_webviews_subscriptions`.
+- **The macOS entitlements are exceptions, not defaults.** `disable-library-validation` exists so the separately built sidecar can be exec'd; it is also what would otherwise block a substituted binary in a signed bundle. Don't add an entitlement without saying in `entitlements.plist` what needs it.
+
 ## Conventions
 
 - **No `unwrap`/`expect`** — `#![warn(clippy::unwrap_used)]`. Poisoned mutexes: `.lock().unwrap_or_else(|p| p.into_inner())`.

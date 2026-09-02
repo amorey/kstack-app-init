@@ -21,6 +21,15 @@ This file states what is true now. Why it is that way lives in `docs/adr/`; ever
 
 Shutdown order from `main.go`: `app.NotifyShutdown()` → `srv.Shutdown` → `app.DrainWithContext` → `stop(ctx)` → `app.Close()`. Two traps: grpc-go's `GracefulStop` **panics** on the h2c path, so `Stop` runs only after the drain; and never cancel via `http.Server.BaseContext`, which would tear down the shared connection mid-stream.
 
+## Security invariants
+
+Full picture: [`docs/security-model.md`](../docs/security-model.md). The sidecar holds every credential in the system, so these four are load-bearing:
+
+- **The socket's file mode is the entire access-control policy.** There is no peer check: whoever connects is served, GraphQL and gRPC alike. `ipc.Listen` tightens the umask *before* `net.Listen` so the socket is never briefly world-accessible, then chmods 0600; Windows binds the pipe owner-only (`D:P(A;;GA;;;OW)`). Both are pinned by tests. Never widen either, never move the endpoint out of a 0700 directory, and never add a TCP listener — the GET transport is registered alongside POST and SSE and is only harmless because the transport is local.
+- **Redaction happens at write time, keyed off the body's own group and kind,** so it cannot be bypassed by how an object was addressed (`kubestore/objects.go`). A new read path serves the stored body; it does not get to re-derive what to hide. The table is deliberately incomplete, so treat a cache file as holding cluster data in the clear — that is what makes its file mode and its lifetime security properties. → [ADR: secret redaction](../docs/adr/2026-08-30-secret-redaction-at-write-time.md).
+- **Reading a kubeconfig can execute code.** `clientcmd` honours `exec` credential plugins, and the connection probe dials every declared context on startup and on every file change. Anything that widens what gets probed widens what runs.
+- **Credentials never reach a log or the wire.** The error presenter logs the operation but never `variables`; the GraphQL projection carries the sign-in bit and identity, never tokens; `oauth.ParseIdentityUnverified` skips signature verification and is display-only — never an authorization input. The loopback callback compares `state` before consuming a code or an `error`, so a stray local request cannot abort the one-shot flow (`TestLoopbackRejectsInvalidCallbackWithoutConsuming`).
+
 ## Cluster subsystem (`internal/clustersvc`)
 
 ```
