@@ -34,7 +34,8 @@ Four boundaries, in the order an attacker meets them:
 ## Protections
 
 **Enforced** means a test fails if it regresses. **Held by review** means it is true today and
-nothing stops the next change undoing it. **Not built** links the work.
+nothing stops the next change undoing it. **By decision** means the gap is a risk we accepted, and
+links the ADR that accepted it. **Not built** links the work.
 
 | Protection | Where | Status |
 | --- | --- | --- |
@@ -59,7 +60,8 @@ nothing stops the next change undoing it. **Not built** links the work.
 | Tokens never appear on the GraphQL surface | `sidecar/graph/schema.graphqls` | **Held by review** |
 | Every non-watch Kubernetes request carries an idle-read bound | `kubeconn/idletimeout.go` | **Held by review** |
 | No authority granted ahead of a consumer | `src-tauri/capabilities/default.json`, `sidecar/graph/schema.graphqls` | **Held by review** — a capability file and a schema are reviewed, not tested |
-| Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [spec 12](specs/12-decide-what-the-cache-is.md) |
+| Cache contents left unencrypted, protected by file mode and the OS's disk encryption | `kubestore/manager.go`, `sqlitemigrate` | **By decision** — [the cache is ordinary application data](adr/2026-09-02-the-cache-is-ordinary-application-data.md) |
+| A retention policy, so a cache stops outliving the user's interest in its cluster | — | **Not built** — [spec 14](specs/14-cache-retention.md) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
 | Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
 | The host forwards only operations the app ships | — | **Not built** — [spec 11](specs/11-allowlist-graphql-operations.md) |

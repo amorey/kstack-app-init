@@ -39,7 +39,7 @@ and a test only a Windows runner can execute.
 **Encrypt the files (EFS, or an app-level key).** Answers a different threat — a stolen disk — and
 the answer there is full-disk encryption, which is on by default on current Windows hardware.
 Whether the cache deserves credential-grade storage is
-[spec 12](../specs/12-decide-what-the-cache-is.md)'s question, not this one.
+[a separate question](2026-09-02-the-cache-is-ordinary-application-data.md), not this one.
 
 ## Consequences
 
@@ -53,5 +53,5 @@ Windows half rests on this ADR.
 ## Revisit when
 
 The data directory moves outside the user profile, the app runs somewhere the profile ACL does not
-apply (a service account, a shared or roaming profile), or spec 12 decides the cache is
-credential-bearing storage — which would raise the bar past what any DACL answers.
+apply (a service account, a shared or roaming profile), or the cache becomes credential-bearing
+storage — which would raise the bar past what any DACL answers.

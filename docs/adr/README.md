@@ -113,4 +113,5 @@ usually just documentation in the wrong place.
 | 2026-09-02 | [Cache health is a read-side fold over the records, with paused kinds resolved first](2026-09-02-cache-health-fold.md) | sidecar | Accepted |
 | 2026-09-02 | [Three event timelines, written unconditionally and read by id alone](2026-09-02-event-timelines.md) | sidecar | Accepted |
 | 2026-09-02 | [Let the profile ACL protect the cache files on Windows](2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) | cross-cutting | Accepted |
+| 2026-09-02 | [The cluster cache is ordinary application data, not credential-bearing storage](2026-09-02-the-cache-is-ordinary-application-data.md) | sidecar | Accepted |
 | 2026-09-03 | [Status mirrors the kubeconfig; the frontend draws the verdicts](2026-09-03-status-mirrors-the-kubeconfig.md) | cross-cutting | Accepted |

@@ -148,8 +148,8 @@ repeated here:
 9. [Cached events age out](specs/9-bound-the-events-table.md)
 10. [A kubeconfig exec plugin waits for approval](specs/10-approve-exec-credential-plugins.md)
 11. [The host sends only the operations the app ships](specs/11-allowlist-graphql-operations.md)
-12. [Decide what the cluster cache is](specs/12-decide-what-the-cache-is.md)
 13. [A cache stops growing before the disk fills](specs/13-a-cache-size-ceiling.md)
+14. [A cache stops outliving the user's interest in its cluster](specs/14-cache-retention.md)
 
 An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
 distinguishable from an unnoticed one.
