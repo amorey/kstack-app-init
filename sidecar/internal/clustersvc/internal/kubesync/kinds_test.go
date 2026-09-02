@@ -720,10 +720,15 @@ func TestAPositionRefusedByTheWatchOpenIsColdListedRatherThanResumedForever(t *t
 	cluster.hasObjects(podKind, "20", object("v1", "Pod", "two", "2"))
 	cluster.listed.Drain()
 	stream.refuse(apierrors.NewResourceExpired("too old resource version"))
+	// Park the relist in its list, so the verdict it publishes stands still: Resyncing is
+	// committed on the way into the list and replaced by the refused open on the way out,
+	// a window narrower than a reader's sample.
+	held := cluster.holdList(podKind)
 	svc.RestartAll()
 
-	cluster.listed.Await(t, "the collection to be listed again rather than resumed forever")
 	awaitKindReason(t, svc, 1, podKind, ReasonResyncing)
+	held.release()
+	cluster.listed.Await(t, "the collection to be listed again rather than resumed forever")
 }
 
 // A restart is the same 410 with nothing in memory at all: the cookie is on disk and no run has
