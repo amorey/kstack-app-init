@@ -6,7 +6,7 @@ status: Planned
 
 # Decide what the cluster cache is
 
-**Needs:** [1-store-files-owner-only.md](1-store-files-owner-only.md). **Hands on:** nothing.
+**Needs:** nothing. **Hands on:** nothing.
 
 ## Goal
 
@@ -29,7 +29,7 @@ does not, and the work depends entirely on the answer.
 - **The cache outlives the credentials.** A token expires, a certificate is revoked, an employee is
   offboarded — the file still answers. That is the one way it is *not* "the same as the
   kubeconfig beside it".
-- Once [spec 1](1-store-files-owner-only.md) lands, the file is `0600` in a `0700` directory. That
+- The file is `0600` in a `0700` directory. That
   is the same protection the user's own kubeconfig has, and it protects against another account on
   the same machine and nothing else. A lost or stolen disk is protected by full-disk encryption or
   not at all; FileVault and BitLocker are on by default on current Apple and Windows hardware,

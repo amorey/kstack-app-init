@@ -46,7 +46,6 @@ spec's header says otherwise. They come from
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [1 · Cache files are owner-only on disk](1-store-files-owner-only.md) | sidecar · host | Planned |
 | [2 · CI scans all three dependency trees](2-dependency-scanning-in-ci.md) | ci | Planned |
 | [3 · A lint rule bans HTML sinks](3-ban-html-sinks-in-the-webview.md) | frontend | Planned |
 | [4 · Sidecar log fields ride under `sidecar.*`](4-namespace-sidecar-log-fields.md) | host | Planned |
