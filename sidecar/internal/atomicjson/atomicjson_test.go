@@ -3,7 +3,6 @@ package atomicjson_test
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/atomicjson"
@@ -91,23 +90,14 @@ func TestSaveLeavesNoTempFiles(t *testing.T) {
 	}
 }
 
-// The parent directory is created if absent (0700) and the file lands 0600.
-func TestSaveCreatesDirAndTightPerms(t *testing.T) {
+// A caller passes the path it wants, not a path it has prepared: the parent
+// directory is created if absent. The modes are pinned in atomicjson_unix_test.go.
+func TestSaveCreatesMissingDirs(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "nested", "deeper", "x.json")
 	if err := atomicjson.Save(p, doc{A: "v"}); err != nil {
 		t.Fatalf("Save into missing dirs: %v", err)
 	}
-	fi, err := os.Stat(p)
-	if err != nil {
+	if _, err := os.Stat(p); err != nil {
 		t.Fatal(err)
-	}
-	// Windows has no POSIX permission bits; Go's Chmod is a best-effort
-	// no-op there and Stat reports 0666 for any writable file. The 0600
-	// guarantee only holds on Unix.
-	if runtime.GOOS == "windows" {
-		return
-	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("file perm = %o, want 600", perm)
 	}
 }

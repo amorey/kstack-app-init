@@ -52,6 +52,8 @@ These apply to `src/`, `sidecar/`, and `src-tauri/` alike; each area's `CLAUDE.m
 
 **Every test file sits beside the file it covers.** `foo_test.go` / `foo.test.ts` tests `foo.go` / `foo.ts`. A test file with no counterpart means the unit under test is buried in a larger file — split the *implementation* out to match the test's name rather than renaming the test to match the monolith. The one exception is a file that exists solely to hold shared fixtures (`testutil_test.go`), which tests nothing.
 
+**In Go, a platform-specific test goes in a platform-named file, never behind a `runtime.GOOS` check.** `foo_unix_test.go` (`//go:build !windows`) beside `foo_test.go`, matching how `internal/ipc` splits its implementation. The build constraint is the mechanism the language already has: a `GOOS` skip compiles the test everywhere and then declines to run it, so the file's name no longer says who it is for and the assertion silently disappears on the platform it was written for. **Split rather than skip** — a test that is *partly* platform-specific keeps its cross-platform half in the plain file, so neither half is a subset of the other (`atomicjson`'s `TestSaveCreatesMissingDirs` and `TestSaveIsOwnerOnly`).
+
 **No magic sleeps — never block on the wall clock to let something happen.** A real delay is flaky under load and slow in aggregate, and it fails at the *end* of the wait rather than the moment the invariant breaks. Per language:
 
 - **TypeScript** — `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `await waitFor(...)`, or a `flush()`/`act` helper. Never a bare `setTimeout` wait.
