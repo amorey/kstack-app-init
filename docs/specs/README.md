@@ -23,6 +23,8 @@ only as far as they agree with each spec's own header.
 Update the spec while the work is in progress. When it lands, fold what is now true into the
 relevant `CLAUDE.md`, write an ADR if a decision needs its reasons recorded, and delete the spec.
 A spec left behind after the code ships is a second source of truth.
+A numbered security spec also has a line in [`TODO.md`](../TODO.md#security) and a row in
+[`security-model.md`](../security-model.md); its own *When it lands* section says where the row moves.
 
 ## Index
 
@@ -36,3 +38,24 @@ dependency, so it can be built out of turn at a cost you can read off its header
 | --- | --- | --- |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
 | [A burst of object frames reads its bodies in one statement](batched-body-reads.md) | sidecar | Planned |
+
+**Security hardening**, in build order — cheapest and most enforceable first, decisions last. Each
+one stands alone; the numbers are a recommended sequence, not a dependency chain, except where a
+spec's header says otherwise. They come from
+[`security/2026-09-02-threat-model.md`](../security/2026-09-02-threat-model.md).
+
+| Spec | Scope | Status |
+| --- | --- | --- |
+| [1 · Cache files are owner-only on disk](1-store-files-owner-only.md) | sidecar · host | Planned |
+| [2 · CI scans all three dependency trees](2-dependency-scanning-in-ci.md) | ci | Planned |
+| [3 · A lint rule bans HTML sinks](3-ban-html-sinks-in-the-webview.md) | frontend | Planned |
+| [4 · Sidecar log fields ride under `sidecar.*`](4-namespace-sidecar-log-fields.md) | host | Planned |
+| [5 · Drop the two grants with no consumer](5-drop-ungranted-authority.md) | host · sidecar · frontend | Planned |
+| [6 · An unverified cluster connection says so](6-surface-unverified-tls.md) | sidecar · frontend | Planned |
+| [7 · Endpoints come from arguments, not environment](7-endpoints-as-arguments.md) | host · sidecar · build · ci | Planned |
+| [8 · Updates say what they actually are](8-updates-say-what-they-are.md) | host · docs · ci | Planned |
+| [9 · Cached events age out](9-bound-the-events-table.md) | sidecar | Planned |
+| [10 · A kubeconfig exec plugin waits for approval](10-approve-exec-credential-plugins.md) | sidecar · frontend | Planned |
+| [11 · The host sends only the operations the app ships](11-allowlist-graphql-operations.md) | host · frontend · build | Planned |
+| [12 · Decide what the cluster cache is](12-decide-what-the-cache-is.md) | sidecar · decision | Planned |
+| [13 · A cache stops growing before the disk fills](13-a-cache-size-ceiling.md) | sidecar | Planned |

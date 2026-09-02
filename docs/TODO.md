@@ -139,72 +139,33 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 The current picture — boundaries, and which protections a test actually pins — is
 [`security-model.md`](security-model.md); the findings behind these items are
-[`security/2026-09-02-threat-model.md`](security/2026-09-02-threat-model.md). An item here that we
-decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays distinguishable
-from an unnoticed one.
+[`security/2026-09-02-threat-model.md`](security/2026-09-02-threat-model.md).
 
-- **Decide what the cluster cache is.** It holds full object bodies for every mirrored kind, and
-  write-time redaction is deliberately not exhaustive (`kubestore/objects.go` says so) — ConfigMaps,
-  inline container env values, and unlisted CRDs stay in the clear. So the file answers, offline and
-  without RBAC, questions that previously needed a live authenticated call. **The decision, not the
-  patch:** either that is acceptable and an ADR says why, or the cache is credential-bearing storage
-  and wants encryption at rest with the key in the OS keyring, plus a retention policy so a
-  cluster's contents do not outlive the user's interest in them. **Do first, either way:** chmod the
-  store files 0600 after open, the way `atomicjson` already does — today the guarantee rests on one
-  0700 directory bit, and the SQLite files (plus `-wal`/`-shm`) take the umask. A test shaped like
-  `TestListen_IsOwnerOnly` pins it.
+**Each item has a spec.** They live in [`docs/specs/`](specs/), numbered in build order, and are not
+repeated here:
 
-- **Gate kubeconfig `exec` credential plugins on user intent.** `clientcmd` honours `exec` blocks, and
-  the connection probe dials every declared context on startup and on every kubeconfig change — so a
-  kubeconfig an attacker can write is code execution triggered by dropping a file, across contexts
-  the user never opened. **Fix shape:** probe only contexts the user has opened, or require an
-  acknowledgement the first time a context with an `exec` block is used, surfaced as a cluster
-  condition. **Minimum:** write an event naming the binary before it runs, so the cluster timeline
-  records it. **Weigh:** `kubectl` runs the same plugins, so the bar is not "never exec" — it is
-  "not for a context nobody asked about".
+1. [Cache files are owner-only on disk](specs/1-store-files-owner-only.md)
+2. [CI scans all three dependency trees](specs/2-dependency-scanning-in-ci.md)
+3. [A lint rule bans HTML sinks in the webview](specs/3-ban-html-sinks-in-the-webview.md)
+4. [Sidecar log fields ride under `sidecar.*`](specs/4-namespace-sidecar-log-fields.md)
+5. [Drop the two grants with no consumer](specs/5-drop-ungranted-authority.md)
+6. [An unverified cluster connection says so](specs/6-surface-unverified-tls.md)
+7. [Endpoints come from arguments, not environment](specs/7-endpoints-as-arguments.md)
+8. [Updates say what they actually are](specs/8-updates-say-what-they-are.md)
+9. [Cached events age out](specs/9-bound-the-events-table.md)
+10. [A kubeconfig exec plugin waits for approval](specs/10-approve-exec-credential-plugins.md)
+11. [The host sends only the operations the app ships](specs/11-allowlist-graphql-operations.md)
+12. [Decide what the cluster cache is](specs/12-decide-what-the-cache-is.md)
+13. [A cache stops growing before the disk fills](specs/13-a-cache-size-ceiling.md)
 
-- **Allowlist GraphQL operations at the host boundary.** `graphql_query`/`graphql_subscribe` forward
-  the operation string unexamined, so anything running in the webview inherits the full schema —
-  every mutation included. `src/gql/` is already an exact enumeration of the operations the app
-  ships. **Fix:** compare the incoming document against that set (hash the generated documents at
-  build time) and reject the rest. **What it buys:** turns a rendering or dependency compromise from
-  "full surface" into "the operations we wrote", and gives the cost-limiting the GraphQL server
-  otherwise lacks. **Weigh:** it adds a build-time artifact and a step to the codegen loop; check it
-  does not break `pnpm codegen:watch` ergonomics before committing to it.
+An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
+distinguishable from an unnoticed one.
 
-- **Add dependency advisory scanning to CI.** `ci.yml` runs lint, vet and tests across three
-  ecosystems and scans none of them. **Fix:** `govulncheck`, `cargo audit` (or `cargo deny`) and
-  `pnpm audit` as gates, plus an SBOM at release so a future advisory can be matched against a
-  shipped build. Cheapest item here relative to what it covers.
-
-- **Land the signed updater, or stop documenting it.** `src-tauri/CLAUDE.md` describes in-app updates
-  via `tauri-plugin-updater` with signed bundles and a hosted manifest; nothing declares the plugin
-  or an update public key. Distribution is direct download, so there is no store-side integrity check
-  behind it. Until the plugin lands with its key pinned in `tauri.conf.json`, the docs should say
-  updates are manual — an assumed verification step is worse than a known missing one.
-
-- **Pass the sidecar's endpoints as arguments.** `KSTACK_CLOUD_API_URL`, `KSTACK_OAUTH_ISSUER`,
-  `KSTACK_OAUTH_CLIENT_ID` and `KSTACK_DATA_DIR` are read from inherited environment, so whoever can
-  set the app's launch environment can point sign-in at an issuer they control. **Fix:** the host
-  passes the production values in `cmd_args`, and `main.go` honours the env overrides only in debug
-  builds — the treatment `KSTACK_KEYCHAIN_SERVICE` already gets in `service.rs`.
-
-- **Add retention and a ceiling to the events table.** Core `v1` events are stored and nothing ages
-  them out, so a busy or hostile cluster grows a cache without bound. **Fix:** an age or row-count
-  window in the janitor, plus a per-cache size ceiling above which sync pauses with a visible
-  condition rather than filling the disk.
-
-- **Drop the two grants that have no use case yet.** `opener:default` is in the webview capability
-  though nothing in `src/` calls it (the tray's `open_url` is Rust-side), and `chatStream` is a
-  reachable `panic("not implemented")` in the shipped schema. Both are authority granted ahead of a
-  consumer; re-add each when its feature lands, the capability scoped to the origins it needs.
-
-- **Make the review-held invariants enforced.** Three are cheap and each converts a sentence someone
-  has to remember into a build failure: an ESLint rule banning `innerHTML`/`dangerouslySetInnerHTML`
-  in `src/`; the 0600 store-file test above; and nesting sidecar log fields under `sidecar.*` in
-  `logs.rs` so a cluster-controlled string cannot shadow a host field. **Also worth a line:** surface
-  `insecure-skip-tls-verify` on the cluster row — the fingerprint already carries the information,
-  and today an unverified connection looks like any other.
+**Without a spec yet:** the threat model's H-3. `src-tauri/entitlements.plist` sets
+`com.apple.security.cs.disable-library-validation` so the hardened runtime will exec the sidecar,
+but `release.yml` now signs the sidecar inside the bundle under the same Team ID, which is the
+condition that entitlement was working around. Try a release build without it; if the sidecar
+still launches, drop the entitlement, since it is also what would let an injected dylib load.
 
 ## Testing
 

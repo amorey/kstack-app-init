@@ -4,8 +4,8 @@ What the app protects, where the boundaries are, and which protections are enfor
 rather than by remembering. Present tense, like a `CLAUDE.md`: this file states what is true now.
 
 Dated findings live in [`docs/security/`](security/) and are never rewritten. Gaps live in
-[`TODO.md`](TODO.md#security); a risk we decide to accept becomes an ADR, so it can be told apart
-from one nobody has noticed.
+[`TODO.md`](TODO.md#security), each with a spec in [`docs/specs/`](specs/); a risk we decide to
+accept becomes an ADR, so it can be told apart from one nobody has noticed.
 
 ## Assets
 
@@ -48,17 +48,22 @@ nothing stops the next change undoing it. **Not built** links the work.
 | `tauri.conf.json` declares no windows; chrome decisions stay in `build_window` | `src-tauri/src/window_manager.rs` | **Enforced** — unit test in `window_manager.rs` |
 | Data directories created 0700; `host.json` and the sync files written 0600 | `atomicjson`, `clustersvc/service.go`, `appdb`, `kubestore/manager.go` | **Held by review** — the SQLite files themselves take the umask |
 | Production CSP admits no remote script, no `eval`, no frames, no form posts | `src-tauri/tauri.conf.json` | **Held by review** |
-| The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Held by review** — [TODO](TODO.md#security) proposes a lint rule |
+| The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Held by review** — [spec 3](specs/3-ban-html-sinks-in-the-webview.md) makes it a lint rule |
 | Printer columns evaluated by a restricted reader, not a template engine | `src/lib/jsonpath.ts` | **Held by review** |
 | GraphQL errors log the operation but never `variables` | `sidecar/graph/server.go` | **Held by review** |
 | ID tokens verified against the JWKS; the unverified decode is display-only | `sidecar/internal/auth/oauth/oauth.go` | **Held by review** — a comment is the only fence |
 | Tokens never appear on the GraphQL surface | `sidecar/graph/schema.graphqls` | **Held by review** |
 | Every non-watch Kubernetes request carries an idle-read bound | `kubeconn/idletimeout.go` | **Held by review** |
-| Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [TODO](TODO.md#security) |
-| A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [TODO](TODO.md#security) |
-| Retention on cached Kubernetes events | — | **Not built** — [TODO](TODO.md#security) |
-| Dependency advisory scanning in CI | — | **Not built** — [TODO](TODO.md#security) |
-| Signed in-app updates | — | **Not built** — [TODO](TODO.md#security) |
+| Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [spec 12](specs/12-decide-what-the-cache-is.md) |
+| A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
+| Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
+| Dependency advisory scanning in CI | — | **Not built** — [spec 2](specs/2-dependency-scanning-in-ci.md) |
+| Sidecar-reported log fields cannot shadow a host field | `src-tauri/src/services/sidecar/logs.rs` | **Not built** — [spec 4](specs/4-namespace-sidecar-log-fields.md) |
+| No authority granted ahead of a consumer (`opener:default`, `chatStream`) | — | **Not built** — [spec 5](specs/5-drop-ungranted-authority.md) |
+| An unverified cluster connection is visible in the UI | — | **Not built** — [spec 6](specs/6-surface-unverified-tls.md) |
+| Cloud and OAuth endpoints come from the host's arguments, not from inherited environment | — | **Not built** — [spec 7](specs/7-endpoints-as-arguments.md) |
+| The host forwards only operations the app ships | — | **Not built** — [spec 11](specs/11-allowlist-graphql-operations.md) |
+| Signed in-app updates | — | **Not built** — [spec 8](specs/8-updates-say-what-they-are.md) |
 
 ## Two facts that shape everything
 
