@@ -94,6 +94,45 @@ const customRulesConfig = [
   },
 ];
 
+// Everything the webview displays is text chosen by whoever controls the cluster, so an HTML sink
+// in `src/` hands a hostile cluster script execution in a page that holds the whole cluster
+// surface. Scoped rather than folded into `custom/rules`, which has no `files`.
+const htmlSinksConfig = [
+  {
+    name: 'custom/no-html-sinks',
+    files: ['src/**/*.{ts,tsx}'],
+    rules: {
+      // airbnb ships this as a warning, and a warning does not fail `pnpm lint`.
+      'react/no-danger': 'error',
+      'no-restricted-syntax': [
+        'error',
+        // airbnb's four, restated: flat config replaces a rule's options rather than merging
+        // them, so omitting these here would silently turn them off.
+        { selector: 'ForInStatement', message: 'Use Object.{keys,values,entries} and iterate.' },
+        { selector: 'ForOfStatement', message: 'Use array methods rather than for-of.' },
+        { selector: 'LabeledStatement', message: 'Labels obscure control flow.' },
+        { selector: 'WithStatement', message: '`with` is disallowed in strict mode.' },
+        // The DOM's HTML sinks, by dot and by bracket.
+        {
+          selector:
+            'MemberExpression[property.name=/^(innerHTML|outerHTML|insertAdjacentHTML|createContextualFragment|write|writeln)$/]',
+          message: 'Cluster data is attacker-controlled text; render it as text, never as HTML.',
+        },
+        {
+          selector:
+            'MemberExpression[computed=true][property.value=/^(innerHTML|outerHTML|insertAdjacentHTML|createContextualFragment|write|writeln)$/]',
+          message: 'Cluster data is attacker-controlled text; render it as text, never as HTML.',
+        },
+        // React spells the attribute `srcDoc`; the DOM spells it `srcdoc`.
+        { selector: 'JSXAttribute[name.name=/^srcdoc$/i]', message: 'No inline frames from data.' },
+        // Belt and braces: the CSP already refuses these at runtime.
+        { selector: "CallExpression[callee.name='eval']", message: 'No eval in the webview.' },
+        { selector: "NewExpression[callee.name='Function']", message: 'No eval in the webview.' },
+      ],
+    },
+  },
+];
+
 export default [
   includeIgnoreFile(gitignorePath),
   { ignores: ['**/dist', 'src/gql/**'] },
@@ -103,4 +142,5 @@ export default [
   ...prettierConfig,
   ...reactRefreshConfig,
   ...customRulesConfig,
+  ...htmlSinksConfig,
 ];

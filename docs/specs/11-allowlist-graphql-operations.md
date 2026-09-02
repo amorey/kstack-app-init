@@ -6,8 +6,7 @@ status: Planned
 
 # The host sends only the operations the app ships
 
-**Needs:** [3-ban-html-sinks-in-the-webview.md](3-ban-html-sinks-in-the-webview.md) is the cheap half
-of the same problem and should land first. **Hands on:** nothing.
+**Needs:** nothing. **Hands on:** nothing.
 
 ## Goal
 

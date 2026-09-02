@@ -49,7 +49,7 @@ nothing stops the next change undoing it. **Not built** links the work.
 | Data directories created 0700; `host.json` and the sync files written 0600 | `src-tauri/src/services/sidecar/service.rs`, `atomicjson`, `clustersvc/service.go`, `sqlitemigrate`, `appdb`, `kubestore/manager.go` | **Enforced** on Unix — `ensure_data_dir_creates_and_tightens_to_0700`, `TestSaveIsOwnerOnly`, `TestOpenPoolFilesAreOwnerOnly`, `TestCacheFileIsOwnerOnly`, `TestSetOwnerOnlyUmask`; on Windows the inherited profile ACL, [by decision](adr/2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) |
 | Go, Rust and npm dependency trees scanned for advisories on every pull request | `.github/workflows/ci.yml` | **Enforced** — the `Go · Audit`, `Rust · Audit` and `TypeScript · Audit` jobs |
 | Production CSP admits no remote script, no `eval`, no frames, no form posts | `src-tauri/tauri.conf.json` | **Held by review** |
-| The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Held by review** — [spec 3](specs/3-ban-html-sinks-in-the-webview.md) makes it a lint rule |
+| The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Enforced** — the `custom/no-html-sinks` config object in `eslint.config.ts` |
 | Printer columns evaluated by a restricted reader, not a template engine | `src/lib/jsonpath.ts` | **Held by review** |
 | GraphQL errors log the operation but never `variables` | `sidecar/graph/server.go` | **Held by review** |
 | ID tokens verified against the JWKS; the unverified decode is display-only | `sidecar/internal/auth/oauth/oauth.go` | **Held by review** — a comment is the only fence |

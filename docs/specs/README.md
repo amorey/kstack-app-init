@@ -46,7 +46,6 @@ spec's header says otherwise. They come from
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [3 · A lint rule bans HTML sinks](3-ban-html-sinks-in-the-webview.md) | frontend | Planned |
 | [4 · Sidecar log fields ride under `sidecar.*`](4-namespace-sidecar-log-fields.md) | host | Planned |
 | [5 · Drop the two grants with no consumer](5-drop-ungranted-authority.md) | host · sidecar · frontend | Planned |
 | [6 · An unverified cluster connection says so](6-surface-unverified-tls.md) | sidecar · frontend | Planned |
