@@ -254,7 +254,7 @@ type Option func(*settings)
 // It panics below one, as every wiring bug here does. A supervisor with no slots admits nothing —
 // every subject queues and no run is ever dispatched — and it is silent about it, which is the one
 // failure a caller cannot debug from what the supervisor reports.
-// withNow substitutes the clock, for a test asserting that a stamp moved.
+// withNow freezes or steers the clock, for a test over tick's own guarantee.
 func withNow(fn func() time.Time) Option {
 	return func(s *settings) { s.now = fn }
 }
@@ -269,9 +269,8 @@ func WithStartConcurrency(n int) Option {
 // settings is what the options write.
 type settings struct {
 	startConcurrency int
-	// now reads the clock. A seam, because Windows stamps a coarse enough clock that two
-	// runs of a trivial job can land on the same instant, and "this run re-stamped it" is
-	// then indistinguishable from "nothing wrote it".
+	// now reads the wall clock. A seam only so a test can freeze it; tick is what the
+	// supervisor calls.
 	now func() time.Time
 }
 
@@ -289,6 +288,10 @@ type Supervisor struct {
 	// there.
 	runQ  *workqueue.Queue[key]
 	passQ *workqueue.Queue[string]
+	// clockMu guards lastTick alone, so tick never waits on the supervisor's own lock.
+	clockMu  sync.Mutex
+	lastTick time.Time
+
 	// slots is the start semaphore WithStartConcurrency sizes: the dispatcher takes one before
 	// it starts a run, a job gives it back when it returns, and a worker at Ready or return,
 	// whichever comes first.
@@ -395,6 +398,24 @@ func New(opts ...Option) *Supervisor {
 	}
 	e.slots = make(chan struct{}, e.settings.startConcurrency)
 	return e
+}
+
+// tick reads the clock, never returning an instant it has already returned.
+//
+// Every stamp here is read as a level — LastRunAt promises that a reader who missed the frames
+// still sees it move, which is how a caller asks "did it run again?". A clock coarse enough to
+// hand two runs the same instant cannot answer that, and Windows' is: two runs of a job that
+// does nothing land on the same tick. The nudge is a nanosecond, and the wall clock reclaims it
+// on the next tick.
+func (e *Supervisor) tick() time.Time {
+	e.clockMu.Lock()
+	defer e.clockMu.Unlock()
+	now := e.settings.now()
+	if !now.After(e.lastTick) {
+		now = e.lastTick.Add(time.Nanosecond)
+	}
+	e.lastTick = now
+	return now
 }
 
 // OnPass sets the callback the supervisor fires after every pass, with the Snapshot that pass
@@ -881,7 +902,7 @@ func (e *Supervisor) pass(subjectName string) {
 		return
 	}
 
-	now := e.settings.now()
+	now := e.tick()
 	var soonest time.Time
 	for id := range e.specs {
 		a := &sub.obs[id].Attempts
@@ -1039,7 +1060,7 @@ func (e *Supervisor) runOne(ctx context.Context, k key, release func()) {
 
 	// Marked before the lock is dropped, so InFlight is true for as long as the run is out and
 	// a pass landing meanwhile leaves it alone.
-	startedAt := e.settings.now()
+	startedAt := e.tick()
 	a.begin(startedAt)
 	runCtx, cancel := context.WithCancel(ctx)
 	h := &runHandle{cancel: cancel, done: make(chan struct{})}
@@ -1157,7 +1178,7 @@ func (e *Supervisor) markReady(k key, held *subject, h *runHandle) {
 	// its cancelled context with a Skip would park for good.
 	fresh := e.subjects[k.subject] == held && a.run == h && h.readyAt.IsZero() && !h.timedOut
 	if fresh {
-		h.readyAt = e.settings.now()
+		h.readyAt = e.tick()
 		a.markReady(h.readyAt)
 	}
 	e.mu.Unlock()
@@ -1180,7 +1201,7 @@ func (e *Supervisor) commitLive(k key, held *subject, h *runHandle, v any) {
 		return
 	}
 	a := &held.obs[k.registration]
-	a.value, a.seen = v, e.settings.now()
+	a.value, a.seen = v, e.tick()
 	e.wakeWatchersLocked(k, held)
 	e.mu.Unlock()
 
@@ -1222,7 +1243,7 @@ func (e *Supervisor) commit(k key, held *subject, h *runHandle, sp spec, started
 
 	a := &held.obs[k.registration]
 	a.run = nil
-	now := e.settings.now()
+	now := e.tick()
 
 	// **A stop is not an attempt.** Restart, Remove and Close ask for the end, so it is not the
 	// body's own doing: the last record and the failure streak stand, and only the schedule

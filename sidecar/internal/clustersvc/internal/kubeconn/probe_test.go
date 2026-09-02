@@ -71,18 +71,14 @@ func TestAMovedConnectionReRunsTheProbesBehindIt(t *testing.T) {
 	before := awaitState(t, watched, func(st State) bool {
 		return st.ServerUID.LastAttempt.Done()
 	}).ServerUID.LastAttempt
-	require.False(t, before.ScheduledAt.IsZero(), "the first run is the ladder's, so the wait below means something")
 
 	// A departure moves the connection's value, where a re-read that found the same thing
 	// would not.
 	cfg.rotate("prod", "")
 	cfg.changed()
 
-	// The edge's run carries no scheduled time, which is what tells it from the one before
-	// it. A timestamp would not: two runs of a parked probe share an instant on a clock as
-	// coarse as Windows'.
 	after := awaitState(t, watched, func(st State) bool {
-		return st.ServerUID.LastAttempt.Done() && st.ServerUID.LastAttempt.ScheduledAt.IsZero()
+		return st.ServerUID.LastAttempt.FinishedAt.After(before.FinishedAt)
 	}).ServerUID
 	assert.Equal(t, ReasonDependencyFailed, after.LastAttempt.Reason)
 	assert.True(t, after.LastAttempt.StartedAt.IsZero(), "re-run, but still never dialed")

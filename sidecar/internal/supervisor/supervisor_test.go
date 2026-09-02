@@ -82,20 +82,6 @@ func single(t *testing.T, res Result, opts ...RegistrationOption) (*Supervisor, 
 	return e, p, "conn"
 }
 
-// tickingClock advances a fixed step per reading, for a test asserting that a stamp moved:
-// Windows' clock is coarse enough that two runs of a trivial job land on the same instant,
-// where "this run re-stamped it" and "nothing wrote it" read alike.
-func tickingClock() func() time.Time {
-	var mu sync.Mutex
-	now := time.Now()
-	return func() time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		now = now.Add(time.Millisecond)
-		return now
-	}
-}
-
 // pair is single plus a job requiring the first.
 func pair(t *testing.T, aRes, bRes Result) (e *Supervisor, a, b *steered, aName, bName string) {
 	t.Helper()
@@ -601,14 +587,22 @@ func TestASkipLeavesNoRecordAndNothingScheduled(t *testing.T) {
 	noRuns(t, e, "a skipped registration was re-dispatched")
 }
 
+// Every stamp the supervisor writes is read as a level, so two runs must never share an instant:
+// a reader comparing them is asking whether something ran again, and a repeat answers no.
+func TestTickNeverRepeatsAnInstant(t *testing.T) {
+	// A clock that never moves, which is what a coarse one looks like within one of its ticks.
+	frozen := time.Now()
+	e := New(withNow(func() time.Time { return frozen }))
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+
+	first := e.tick()
+	assert.True(t, e.tick().After(first), "a repeated reading cannot say a second run happened")
+}
+
 // A Skip leaves no record, so LastAttempt cannot say a run happened at all. LastRunAt is what
 // does — the level a caller waiting on a run of its own reads, whatever that run concluded.
 func TestASkipStampsTheRunItLeftNoRecordOf(t *testing.T) {
-	e := New(withNow(tickingClock()))
-	t.Cleanup(func() { assert.NoError(t, e.Close()) })
-	p := &steered{res: Fail("ResolveFailed", assert.AnError)}
-	id := "conn"
-	RegisterJob(e, id, p)
+	e, p, id := single(t, Fail("ResolveFailed", assert.AnError))
 	e.Add(subj)
 	e.settle()
 	runNext(t, e)
@@ -1070,7 +1064,7 @@ func TestASuccessWithNoValueEverCommittedIsNotKnown(t *testing.T) {
 // Every success dates the value, whether or not it committed a new one: a run that found the
 // answer unchanged still read it.
 func TestASuccessWithNoNewValueStillAdvancesLastSeen(t *testing.T) {
-	e := New(withNow(tickingClock()))
+	e := New()
 	t.Cleanup(func() { assert.NoError(t, e.Close()) })
 	uid := "uid-1"
 	p := &steered{res: Succeeded(), next: &uid}
