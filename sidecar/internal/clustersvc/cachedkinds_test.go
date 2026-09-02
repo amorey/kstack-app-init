@@ -176,11 +176,17 @@ func TestCachedKindsWatchListReportsADeparture(t *testing.T) {
 	assert.Equal(t, ClusterCachedKindID(7), frames[1].Kind.ID)
 }
 
-// A prune is beehive's soft delete, so the row lingers holding its name and the frame is an
-// ordinary Modified — which is what makes the missing tombstone field on this record matter:
+// A prune is beehive's soft delete, so the row lingers holding its name and the mark arrives as
+// an ordinary Modified — which is what makes the missing tombstone field on this record matter:
 // a consumer cannot tell the mark from any other spec write.
-func TestCachedKindsWatchListReportsAPruneAsAModify(t *testing.T) {
-	d := newRunningDeps(t)
+//
+// The mark is not promised on its own. beehive folds a run of writes to one object into its
+// last op, so a prune collected before the tailer reads the mark arrives as the departure
+// alone. What every shape guarantees is the departure, which is what clears the id.
+func TestCachedKindsWatchListReportsAPruneAsAModifyUntilItIsCollected(t *testing.T) {
+	// Sweeping far faster than production, because the departure is what ends the loop below
+	// and the default cadence outlasts the test's own failsafe.
+	d := newRunningDeps(t, beehive.WithGCInterval(10*time.Millisecond))
 	cluster := createCluster(t, d.clusterClient, "prod")
 	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
 	obj := createKind(t, d, cache.ID, deploymentsSpec)
@@ -191,10 +197,16 @@ func TestCachedKindsWatchListReportsAPruneAsAModify(t *testing.T) {
 
 	require.NoError(t, d.kindClient.Delete(context.Background(), obj.ID))
 
-	f := testutil.Recv(t, stream.Frames, "the prune")
-	assert.Equal(t, DeltaFrameModified, f.Type)
-	require.NotNil(t, f.Kind)
-	assert.Equal(t, ClusterCachedKindID(obj.ID), f.Kind.ID)
+	for {
+		f := testutil.Recv(t, stream.Frames, "the prune")
+		require.NotNil(t, f.Kind, "every frame of a prune names the id it is about")
+		assert.Equal(t, ClusterCachedKindID(obj.ID), f.Kind.ID)
+		if f.Type == DeltaFrameDeleted {
+			return
+		}
+		assert.Equal(t, DeltaFrameModified, f.Type)
+		assert.NotNil(t, f.Kind.DeletionRequestedAt, "the mark is all that tells a prune from a spec write")
+	}
 }
 
 // One record's own stream, for a consumer holding an id from a frame.

@@ -84,7 +84,7 @@ Three timelines, each `(ObjectID, category)`: `Cluster`/`connection`, `ClusterCa
 - Every send goes through `sendFrame` (`stream.go`). A bare channel send leaks the goroutine and the beehive watch once the consumer stops draining.
 - One pump serves every record watch: `deltaWatch[Spec, Status, Frame]`. A kind supplies a `frame` projection, a `departed` builder, and a `bookmark` value. Never a fourth pump. The pump's rules are tested once in `stream_test.go`.
 - A watch whose source can die returns `*Stream[T]` (`Frames` + `Err()`); `Err` is set before `Frames` closes. Gauges included. `NewStream` drops whatever a pump returns once ctx is done.
-- A read reports the store as it is and never filters; a tombstoned record is an ordinary `Modified`. The frontend drops those rows once. → root `CLAUDE.md`.
+- A read reports the store as it is and never filters; a tombstoned record is an ordinary `Modified`. beehive folds a run of writes to one object into its last op, so a record collected before the tailer reads its mark arrives as the `Deleted` alone — the mark is never promised, the departure always is. The frontend drops those rows once. → root `CLAUDE.md`.
 - The gauges (`WatchStats`, `WatchHealth`, `WatchSyncStatus`, `WatchSchedule`) are read-side folds on a cadence, current-on-subscribe, no `Bookmark`, nothing emitted before the first measurement. Paused kinds resolve from the record ahead of every `GetKindState`; an unanswered kind is not an offender; `LastLiveAt` is the oldest proof. → [ADR: cache health fold](../docs/adr/2026-09-02-cache-health-fold.md).
 - `clusterScheduleWatch` reads the pool's cadence, never beehive's: the connection probe's next run alone.
 
