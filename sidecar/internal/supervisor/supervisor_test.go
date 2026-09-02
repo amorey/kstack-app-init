@@ -658,12 +658,16 @@ func TestASuspensionReadsApartFromASkip(t *testing.T) {
 
 // The timer only brings the pass back; the pass decides again per registration.
 func TestTheTimerIsAWakeNotACadence(t *testing.T) {
-	e, _, _ := single(t, Fail("Unreachable", assert.AnError),
-		WithBackoff(time.Millisecond, 2, 2*time.Millisecond))
+	// Wide enough that the retry is still in the future when the pass derives the schedule:
+	// a rung shorter than a loaded machine's own scheduling noise is already due by then, and
+	// a due run is dispatched rather than timed, so there is no timer left to observe.
+	e, _, id := single(t, Fail("Unreachable", assert.AnError),
+		WithBackoff(100*time.Millisecond, 2, 100*time.Millisecond))
 	e.Add(subj)
 	e.settle()
 
 	runNext(t, e) // the failure schedules a retry, which arms the timer
+	require.True(t, att(t, e, id).Scheduled(), "a retry already due is dispatched, never timed")
 
 	name, ok := e.passQ.Next(within(t))
 	require.True(t, ok, "the timer never asked for a pass")
