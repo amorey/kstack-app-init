@@ -111,11 +111,17 @@ func assertRoundTrip(t *testing.T, accepted <-chan net.Conn, path string) {
 	require.True(t, ok, "connection should have been accepted")
 	defer server.Close()
 
-	_, err = server.Write([]byte{42})
-	require.NoError(t, err)
+	// Written from its own goroutine: a Windows named pipe holds the write until someone
+	// reads, and the reader is this goroutine.
+	written := make(chan error, 1)
+	go func() {
+		_, err := server.Write([]byte{42})
+		written <- err
+	}()
 
 	buf := make([]byte, 1)
 	_, err = client.Read(buf)
 	require.NoError(t, err)
 	assert.Equal(t, byte(42), buf[0])
+	require.NoError(t, <-written)
 }
