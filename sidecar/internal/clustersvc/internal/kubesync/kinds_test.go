@@ -830,14 +830,16 @@ func TestAPassThatMovedNothingWakesNoRecord(t *testing.T) {
 	stream.opened.Await(t, "the watch to open").Add(object("v1", "Pod", "one", "11"))
 	awaitKindReason(t, svc, 1, podKind, ReasonWatching)
 
-	// Subscribed after the verdict settled, so what follows is measured against a cache with
-	// nothing left to say.
-	news := svc.WatchKindNews()
-	t.Cleanup(news.Close)
 	subject := kindSubject(1, podKind)
 	snap, ok := svc.kindSupervisor.Read(subject)
 	require.True(t, ok)
+	// File the answer before subscribing. The verdict is readable off the supervisor before
+	// the pass that carries it has filed anything, so a publish here can be the first to
+	// record this reason — which is news, and not the news the window below is about.
 	svc.publishKind(subject, snap)
+
+	news := svc.WatchKindNews()
+	t.Cleanup(news.Close)
 	svc.publishKind(subject, snap)
 
 	testutil.NoRecv(t, news.Chan(), quietWindow, "a pass that moved nothing woke the record")
