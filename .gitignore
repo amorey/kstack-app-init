@@ -37,3 +37,6 @@ src-tauri/binaries/
 
 # Linux build outputs when developing inside the sandbox (see scripts note).
 .sandbox-linux/
+
+# custom
+.worktrees
