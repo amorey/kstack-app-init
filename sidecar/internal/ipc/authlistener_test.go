@@ -5,9 +5,12 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // listenAuth binds a real endpoint (UDS or named pipe) behind the policy, and
@@ -27,15 +30,14 @@ func listenAuth(t *testing.T, p Policy) (net.Listener, string) {
 func TestAuthenticated_RejectsForeignPeer(t *testing.T) {
 	ln, path := listenAuth(t, Policy{HostPID: os.Getpid() + 1})
 
+	// A served peer would get the byte back; a rejected one gets a closed
+	// connection. Either way the Read below returns, so nothing waits on a clock.
+	accepted := acceptOne(ln)
 	client, err := dialEndpoint(path)
 	require.NoError(t, err)
 	defer client.Close()
-
-	// Accept drives the check. A served peer would get the byte back; a
-	// rejected one gets a closed connection. Either way the Read below
-	// returns, so nothing waits on a clock.
 	go func() {
-		if conn, err := ln.Accept(); err == nil {
+		if conn, ok := <-accepted; ok {
 			_, _ = conn.Write([]byte{42})
 		}
 	}()
@@ -59,11 +61,15 @@ func TestAuthenticated_KeepsAcceptingAfterRejection(t *testing.T) {
 		return peer{pid: os.Getpid(), uid: os.Getuid()}, nil
 	}
 
+	// One Accept call spans both connections: it rejects the first and returns
+	// the second.
+	accepted := acceptOne(ln)
+
 	rejected, err := dialEndpoint(path)
 	require.NoError(t, err)
 	defer rejected.Close()
 
-	assertRoundTrip(t, ln, path)
+	assertRoundTrip(t, accepted, path)
 
 	_, err = rejected.Read(make([]byte, 1))
 	assert.Error(t, err, "first peer should have been rejected")
@@ -71,13 +77,13 @@ func TestAuthenticated_KeepsAcceptingAfterRejection(t *testing.T) {
 
 func TestAuthenticated_AcceptsHostPeer(t *testing.T) {
 	ln, path := listenAuth(t, Policy{HostPID: os.Getpid()})
-	assertRoundTrip(t, ln, path)
+	assertRoundTrip(t, acceptOne(ln), path)
 }
 
 // A standalone sidecar run has no host pid to pin, and falls back to the uid.
 func TestAuthenticated_WithoutHostPIDAcceptsSameUID(t *testing.T) {
 	ln, path := listenAuth(t, Policy{})
-	assertRoundTrip(t, ln, path)
+	assertRoundTrip(t, acceptOne(ln), path)
 }
 
 // A closed listener still reports its error, so Serve can exit.
@@ -92,14 +98,17 @@ func TestAuthenticated_PropagatesListenerClose(t *testing.T) {
 
 // assertRoundTrip dials the endpoint and checks a byte survives the trip, i.e.
 // the connection was accepted and handed to the server.
-func assertRoundTrip(t *testing.T, ln net.Listener, path string) {
+func assertRoundTrip(t *testing.T, accepted <-chan net.Conn, path string) {
 	t.Helper()
 	client, err := dialEndpoint(path)
 	require.NoError(t, err)
 	defer client.Close()
+	// Failsafe: a read that never lands means the wrong connection was served,
+	// which would otherwise hang instead of failing.
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(testutil.Timeout)))
 
-	server, err := ln.Accept()
-	require.NoError(t, err)
+	server, ok := <-accepted
+	require.True(t, ok, "connection should have been accepted")
 	defer server.Close()
 
 	_, err = server.Write([]byte{42})

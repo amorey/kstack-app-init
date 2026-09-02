@@ -3,9 +3,7 @@
 package ipc
 
 import (
-	"net"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,16 +13,18 @@ import (
 // peerOf must report the process on the other end, not this one's idea of
 // itself — the whole peer check is downstream of it being right.
 func TestPeerOf_ReportsConnectingProcess(t *testing.T) {
-	ln, err := net.Listen("unix", filepath.Join(t.TempDir(), "s.sock"))
+	path := testEndpoint(t)
+	ln, err := Listen(path)
 	require.NoError(t, err)
 	defer ln.Close()
 
-	client, err := net.Dial("unix", ln.Addr().String())
+	accepted := acceptOne(ln)
+	client, err := dialEndpoint(path)
 	require.NoError(t, err)
 	defer client.Close()
 
-	server, err := ln.Accept()
-	require.NoError(t, err)
+	server, ok := <-accepted
+	require.True(t, ok)
 	defer server.Close()
 
 	p, err := peerOf(server)
