@@ -40,6 +40,7 @@ nothing stops the next change undoing it. **Not built** links the work.
 | --- | --- | --- |
 | IPC socket bound owner-only, with no world-accessible window between bind and chmod | `sidecar/internal/ipc/listen_unix.go` | **Enforced** — `TestListen_IsOwnerOnly` |
 | Named pipe restricted to the owner by DACL | `sidecar/internal/ipc/listen_windows.go` | **Enforced** — `TestOwnerOnlyDACL_ParsesAndIsRestrictive` |
+| Only the host process may connect to the IPC endpoint | `sidecar/internal/ipc/authlistener.go` | **Enforced** — `TestAuthenticated_RejectsForeignPeer` |
 | Secret values redacted at write time, keyed off the body's own group and kind | `kubestore/objects.go` | **Enforced** — `TestProjectRedactsSecretValues`, `TestProjectRedactsOnlyCoreSecrets` |
 | `managedFields` and the last-applied annotation stripped before storage | `kubestore/objects.go` | **Enforced** — `TestProjectStripsServerNoise` |
 | Loopback callback checks `state` before consuming a code or an error | `sidecar/internal/auth/login.go` | **Enforced** — `TestLoopbackRejectsInvalidCallbackWithoutConsuming` |
@@ -53,7 +54,6 @@ nothing stops the next change undoing it. **Not built** links the work.
 | ID tokens verified against the JWKS; the unverified decode is display-only | `sidecar/internal/auth/oauth/oauth.go` | **Held by review** — a comment is the only fence |
 | Tokens never appear on the GraphQL surface | `sidecar/graph/schema.graphqls` | **Held by review** |
 | Every non-watch Kubernetes request carries an idle-read bound | `kubeconn/idletimeout.go` | **Held by review** |
-| Peer authentication on the IPC socket | — | **Not built** — [TODO](TODO.md#security) |
 | Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [TODO](TODO.md#security) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [TODO](TODO.md#security) |
 | Retention on cached Kubernetes events | — | **Not built** — [TODO](TODO.md#security) |
@@ -66,8 +66,10 @@ nothing stops the next change undoing it. **Not built** links the work.
 unexamined, so a script running in the page can read every mirrored object and call every mutation.
 The CSP is the containment, and it is one dependency deep.
 
-**The sidecar authenticates nobody.** The socket's file mode is the whole policy, so any process
-running as the user has the same access the app does — without touching `~/.kube/config`.
+**The sidecar authenticates a process, not a principal.** The endpoint serves the host process and
+nothing else — the kernel supplies the peer's pid, so it cannot be claimed. But an attacker who can
+run code *inside* the host process, or debug it, inherits the whole surface, and the file mode still
+carries the rest of the policy.
 
 Both are defensible for a single-user desktop app. Both mean one containment failure is total, which
 is why the rows above are worth keeping honest.

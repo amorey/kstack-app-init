@@ -313,12 +313,18 @@ impl SidecarService {
 
 /// CLI flags for the sidecar; a free function so the contract is unit-testable
 /// without the Tauri runtime.
+///
+/// `--host-pid` is the only process the sidecar's endpoint will serve. We are
+/// its sole client — the webview reaches it through us — so this closes the
+/// endpoint to every other process running as the user.
 fn cmd_args(socket: &Endpoint, data_dir: &std::path::Path) -> Vec<String> {
     vec![
         "--socket".to_string(),
         socket.as_arg().to_owned(),
         "--data-dir".to_string(),
         data_dir.to_string_lossy().into_owned(),
+        "--host-pid".to_string(),
+        std::process::id().to_string(),
     ]
 }
 
@@ -363,11 +369,11 @@ impl FrameSink for TauriChannelSink {
 mod tests {
     use super::*;
 
-    /// Pins the host↔sidecar CLI contract (`--socket`, `--data-dir`);
-    /// changing it without updating the sidecar silently misroutes the cache
-    /// or the socket.
+    /// Pins the host↔sidecar CLI contract (`--socket`, `--data-dir`,
+    /// `--host-pid`); changing it without updating the sidecar silently
+    /// misroutes the cache or the socket, or drops the peer check.
     #[test]
-    fn cmd_args_passes_socket_and_data_dir() {
+    fn cmd_args_passes_socket_data_dir_and_host_pid() {
         let base = std::env::temp_dir();
         let path = Endpoint::pick(&base).expect("pick should succeed");
         let data_dir = std::path::PathBuf::from("/some/app/data");
@@ -379,6 +385,8 @@ mod tests {
                 path.as_arg().to_owned(),
                 "--data-dir".to_string(),
                 data_dir.to_string_lossy().into_owned(),
+                "--host-pid".to_string(),
+                std::process::id().to_string(),
             ]
         );
     }

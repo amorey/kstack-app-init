@@ -36,6 +36,9 @@ func main() {
 
 	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
 	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
+	// Zero (the default) leaves the endpoint open to any process of this user,
+	// which is what a standalone dev run wants; the host always passes its own.
+	hostPID := flag.Int("host-pid", 0, "pid of the host process; the only process allowed to connect (0 allows any process of this user)")
 	// The host passes its app_local_data_dir(); required — app.New errors when empty.
 	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "app data dir for app.db and the per-cluster caches (defaults to KSTACK_DATA_DIR; required)")
 	flag.Parse()
@@ -45,12 +48,14 @@ func main() {
 		slog.Error("listen", "socket", *sockPath, "err", err)
 		os.Exit(1)
 	}
+	ln = ipc.Authenticated(ln, ipc.Policy{HostPID: *hostPID})
 	// Named pipes vanish with their listener; only the UDS file needs cleanup.
 	defer os.Remove(*sockPath)
 
 	slog.Info("sidecar starting",
 		"socket", *sockPath,
 		"pid", os.Getpid(),
+		"host_pid", *hostPID,
 		"data_dir", *dataDir,
 	)
 

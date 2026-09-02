@@ -143,15 +143,6 @@ The current picture — boundaries, and which protections a test actually pins �
 decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays distinguishable
 from an unnoticed one.
 
-- **Authenticate the socket's peer.** The listener serves whoever connects: any process running as
-  the user speaks GraphQL and gRPC, reads every mirrored object, and can call `StartLogin`/`Logout`
-  or a destructive mutation — without touching `~/.kube/config`. The file mode is the entire policy
-  today. **Fix:** on accept, assert the peer is the host process (or at minimum the same UID) —
-  `SO_PEERCRED` on Linux, `getpeereid` on macOS, `GetNamedPipeClientProcessId` on Windows — in
-  `sidecar/internal/ipc`, where the platform split already lives. **Weigh:** it does not stop a
-  determined same-UID attacker, who can read the socket path and the binary either way; what it
-  removes is the zero-privilege path, which is most of the practical exposure and about a day's work.
-
 - **Decide what the cluster cache is.** It holds full object bodies for every mirrored kind, and
   write-time redaction is deliberately not exhaustive (`kubestore/objects.go` says so) — ConfigMaps,
   inline container env values, and unlisted CRDs stay in the clear. So the file answers, offline and
