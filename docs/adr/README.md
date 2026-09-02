@@ -103,3 +103,12 @@ usually just documentation in the wrong place.
 | 2026-08-30 | [Redact credentials on the way into the cache, and never store a function of a secret](2026-08-30-secret-redaction-at-write-time.md) | sidecar | Accepted |
 | 2026-08-30 | [Resolve a connection retry when its own probe finishes](2026-08-30-retry-resolves-with-its-probe.md) | sidecar | Accepted |
 | 2026-08-30 | [Stamp every row with its write position, and log deletes](2026-08-30-write-positions-and-the-deletes-log.md) | sidecar | Accepted |
+| 2026-09-02 | [Kind records mirror the catalog on disk, and Paused is the user's field](2026-09-02-kind-records-mirror-the-catalog.md) | sidecar | Accepted |
+| 2026-09-02 | [The cache store prepares every statement once and binds collections as JSON](2026-09-02-kubestore-sql-discipline.md) | sidecar | Accepted |
+| 2026-09-02 | [One janitor per open cache file, gated on the freelist and trimming per kind](2026-09-02-kubestore-janitor.md) | sidecar | Accepted |
+| 2026-09-02 | [The Cluster pass folds its claim into two conditions and never writes timing](2026-09-02-cluster-conditions-two-subjects.md) | sidecar | Accepted |
+| 2026-09-02 | [Every non-watch request carries an idle-read bound](2026-09-02-idle-read-bound.md) | sidecar | Accepted |
+| 2026-09-02 | [The discovery sweep writes only on a changed fingerprint, drops a fixed list, and never prunes a partial answer](2026-09-02-discovery-sweep-rules.md) | sidecar | Accepted |
+| 2026-09-02 | [A kind sync proves itself by a frame, resumes off its cookie, and is judged at read time](2026-09-02-kind-sync-verdicts.md) | sidecar | Accepted |
+| 2026-09-02 | [Cache health is a read-side fold over the records, with paused kinds resolved first](2026-09-02-cache-health-fold.md) | sidecar | Accepted |
+| 2026-09-02 | [Three event timelines, written unconditionally and read by id alone](2026-09-02-event-timelines.md) | sidecar | Accepted |
