@@ -304,6 +304,9 @@ func TestTheConnectionSurfaceServesAnUnreachableCluster(t *testing.T) {
 func TestKubesyncStopsBetweenBeehiveAndTheStore(t *testing.T) {
 	svc, err := New(t.TempDir(), newTestKubeconfig(t), poke.New())
 	require.NoError(t, err)
+	// New opens the store even unstarted, and Windows will not unlink a file something
+	// still holds open.
+	t.Cleanup(func() { assert.NoError(t, svc.Close()) })
 
 	var names []string
 	for _, part := range svc.(*service).parts {

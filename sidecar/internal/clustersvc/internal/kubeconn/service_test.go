@@ -142,7 +142,7 @@ func (f *fakeKubeconfig) changed() { f.hub.Sender().Send(&api.Config{}) }
 // than hanging it until the suite's own deadline.
 func within(t *testing.T) context.Context {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), testutil.Timeout)
 	t.Cleanup(cancel)
 	return ctx
 }

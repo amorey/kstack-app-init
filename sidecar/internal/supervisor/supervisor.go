@@ -254,6 +254,11 @@ type Option func(*settings)
 // It panics below one, as every wiring bug here does. A supervisor with no slots admits nothing —
 // every subject queues and no run is ever dispatched — and it is silent about it, which is the one
 // failure a caller cannot debug from what the supervisor reports.
+// withNow substitutes the clock, for a test asserting that a stamp moved.
+func withNow(fn func() time.Time) Option {
+	return func(s *settings) { s.now = fn }
+}
+
 func WithStartConcurrency(n int) Option {
 	if n < 1 {
 		panic("supervisor: WithStartConcurrency needs at least one slot")
@@ -264,6 +269,10 @@ func WithStartConcurrency(n int) Option {
 // settings is what the options write.
 type settings struct {
 	startConcurrency int
+	// now reads the clock. A seam, because Windows stamps a coarse enough clock that two
+	// runs of a trivial job can land on the same instant, and "this run re-stamped it" is
+	// then indistinguishable from "nothing wrote it".
+	now func() time.Time
 }
 
 // Supervisor runs the registered jobs and workers over the tracked subjects. Build with New,
@@ -374,7 +383,7 @@ func (e *Supervisor) snapshotOf(sub *subject) Snapshot {
 // New returns a Supervisor with nothing registered and no subjects.
 func New(opts ...Option) *Supervisor {
 	e := &Supervisor{
-		settings: settings{startConcurrency: 8},
+		settings: settings{startConcurrency: 8, now: time.Now},
 		runQ:     workqueue.New[key](),
 		passQ:    workqueue.New[string](),
 		watchers: map[registrationID][]registrationID{},
@@ -872,7 +881,7 @@ func (e *Supervisor) pass(subjectName string) {
 		return
 	}
 
-	now := time.Now()
+	now := e.settings.now()
 	var soonest time.Time
 	for id := range e.specs {
 		a := &sub.obs[id].Attempts
@@ -1030,7 +1039,7 @@ func (e *Supervisor) runOne(ctx context.Context, k key, release func()) {
 
 	// Marked before the lock is dropped, so InFlight is true for as long as the run is out and
 	// a pass landing meanwhile leaves it alone.
-	startedAt := time.Now()
+	startedAt := e.settings.now()
 	a.begin(startedAt)
 	runCtx, cancel := context.WithCancel(ctx)
 	h := &runHandle{cancel: cancel, done: make(chan struct{})}
@@ -1148,7 +1157,7 @@ func (e *Supervisor) markReady(k key, held *subject, h *runHandle) {
 	// its cancelled context with a Skip would park for good.
 	fresh := e.subjects[k.subject] == held && a.run == h && h.readyAt.IsZero() && !h.timedOut
 	if fresh {
-		h.readyAt = time.Now()
+		h.readyAt = e.settings.now()
 		a.markReady(h.readyAt)
 	}
 	e.mu.Unlock()
@@ -1171,7 +1180,7 @@ func (e *Supervisor) commitLive(k key, held *subject, h *runHandle, v any) {
 		return
 	}
 	a := &held.obs[k.registration]
-	a.value, a.seen = v, time.Now()
+	a.value, a.seen = v, e.settings.now()
 	e.wakeWatchersLocked(k, held)
 	e.mu.Unlock()
 
@@ -1213,7 +1222,7 @@ func (e *Supervisor) commit(k key, held *subject, h *runHandle, sp spec, started
 
 	a := &held.obs[k.registration]
 	a.run = nil
-	now := time.Now()
+	now := e.settings.now()
 
 	// **A stop is not an attempt.** Restart, Remove and Close ask for the end, so it is not the
 	// body's own doing: the last record and the failure streak stand, and only the schedule

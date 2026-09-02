@@ -364,18 +364,18 @@ func TestManagerClearKindOnARetiredCacheIsAnError(t *testing.T) {
 // close — the store a fresh claim opened at the same id.
 func TestReleaseAfterAFailedClearLeavesAFreshClaimAlone(t *testing.T) {
 	dir := t.TempDir()
-	// The unlink also blocks the reopen: a store cannot be created in a directory
-	// nothing may write.
+	// The unlink also blocks the reopen: a store cannot be created where a directory
+	// already holds the name.
 	m := newManagerWithOptions(dir, withDeleteFiles(func(path string) error {
 		if err := deleteStoreFiles(path); err != nil {
 			return err
 		}
-		return os.Chmod(dir, 0o500)
+		// A directory where the fresh file must go. Chmodding the parent would say the
+		// same thing on Unix and nothing at all on Windows, where a mode is not a
+		// directory's write permission.
+		return os.Mkdir(path, 0o700)
 	}))
-	t.Cleanup(func() {
-		require.NoError(t, os.Chmod(dir, 0o700))
-		require.NoError(t, m.Close())
-	})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
 
 	ctx := context.Background()
 	first, err := m.OpenOrCreate(1)
@@ -386,7 +386,7 @@ func TestReleaseAfterAFailedClearLeavesAFreshClaimAlone(t *testing.T) {
 	require.Error(t, m.Clear(1), "the reopen must have failed for this test to mean anything")
 	assert.ErrorIs(t, first.SetCookie(ctx, "v1", "pods", "0"), ErrClosed, "a claim on the retired entry")
 
-	require.NoError(t, os.Chmod(dir, 0o700))
+	require.NoError(t, os.Remove(m.path(1)), "lift the block, so a fresh claim can open")
 	fresh, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
 	defer fresh.Release()
@@ -457,6 +457,25 @@ func TestManagerSubscribeTakesNoClaim(t *testing.T) {
 
 // cacheIsOpen asks whether anything holds cacheID's file open, which is what Subscribe's
 // ok reports. The receiver is closed straight away: this is a question, not a watch.
+// unstattableDir returns a manager directory the OS refuses to stat under, for a reason
+// that is not "missing". An embedded NUL fails in the syscall's own string conversion on
+// every platform; a path under a regular file would not, being ENOTDIR on Unix and
+// ERROR_PATH_NOT_FOUND — which reads as absent — on Windows.
+func unstattableDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "a\x00dir")
+}
+
+// closesAndFails is a close that reports err having closed the file anyway: Windows will
+// not unlink a file something still holds open, so a fake that only reports leaves
+// t.TempDir()'s own cleanup to fail.
+func closesAndFails(err error) func(*file) error {
+	return func(f *file) error {
+		_ = f.close()
+		return err
+	}
+}
+
 func cacheIsOpen(m *Manager, cacheID int64) bool {
 	sub, ok := m.Subscribe(cacheID)
 	if ok {
@@ -538,7 +557,7 @@ func TestStatsSurvivesTheFileClosingUnderIt(t *testing.T) {
 func TestClearRetiresTheEntryWhenTheFileWillNotClose(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("close failed")
-	m := newManagerWithOptions(t.TempDir(), withCloseFile(func(*file) error { return boom }))
+	m := newManagerWithOptions(t.TempDir(), withCloseFile(closesAndFails(boom)))
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
 	defer store.Release()
@@ -791,9 +810,7 @@ func TestOpenReportsAStatementItCannotPrepare(t *testing.T) {
 // A stat that fails for a reason other than absence is a fault, not an absent cache:
 // answering "no such cache" would have the caller create one where it cannot.
 func TestOpenExistingReportsAPathItCannotStat(t *testing.T) {
-	blocked := filepath.Join(t.TempDir(), "a-file")
-	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
-	m := NewManager(blocked, Retention{})
+	m := NewManager(unstattableDir(t), Retention{})
 
 	_, _, err := m.OpenExisting(1)
 
@@ -803,9 +820,7 @@ func TestOpenExistingReportsAPathItCannotStat(t *testing.T) {
 // Stats answers a missing cache as absent, but anything else is a measurement that
 // failed — and the gauge above it must say so rather than render a zero.
 func TestStatsReportsAPathItCannotStat(t *testing.T) {
-	blocked := filepath.Join(t.TempDir(), "a-file")
-	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
-	m := NewManager(blocked, Retention{})
+	m := NewManager(unstattableDir(t), Retention{})
 
 	_, err := m.Stats(context.Background(), 1)
 
@@ -839,7 +854,7 @@ func TestCountsFromDiskAnswersAVanishedFileAsEmpty(t *testing.T) {
 // the caller's next pass retries the unlink, and until it lands nothing may reopen.
 func TestRemoveReportsAFileThatWillNotClose(t *testing.T) {
 	boom := errors.New("close failed")
-	m := newManagerWithOptions(t.TempDir(), withCloseFile(func(*file) error { return boom }))
+	m := newManagerWithOptions(t.TempDir(), withCloseFile(closesAndFails(boom)))
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
 	defer store.Release()

@@ -195,6 +195,10 @@ func TestASweepSurvivesAVacuumItCannotRun(t *testing.T) {
 	readOnly, err := openReadOnly(filepath.Join(dir, "1.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, readOnly.Close()) })
+	// The handle being displaced is the only reference left to it, and Windows will not
+	// unlink a file something still holds open.
+	displaced := f.db
+	t.Cleanup(func() { require.NoError(t, displaced.Close()) })
 	f.db = readOnly
 
 	assert.NotPanics(t, func() { sweep(ctx, "1", f, Retention{StatusHistoryTTL: time.Hour}) })
