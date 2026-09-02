@@ -32,6 +32,9 @@ import (
 )
 
 func main() {
+	// Before anything can create a file.
+	setOwnerOnlyUmask()
+
 	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG_LEVEL"))))
 
 	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")

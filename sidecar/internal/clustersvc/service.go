@@ -400,8 +400,8 @@ const maxEventRuns = 20
 // New builds the cluster boundary rooted at dataDir (beehive.db, clusters/): it opens
 // the store, registers the controllers, and leaves everything stopped until Start.
 func New(dataDir string, kubeconfigSvc kubeconfigService, pokeSvc *poke.Service) (Service, error) {
-	// Self-sufficient rather than order-dependent: this is the first thing the
-	// composition root builds, so nothing else has made dataDir yet.
+	// A fallback for a standalone run: under the host, dataDir already exists (the
+	// host creates it 0700 before spawning us).
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}

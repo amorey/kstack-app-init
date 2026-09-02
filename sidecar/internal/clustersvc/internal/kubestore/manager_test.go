@@ -765,7 +765,7 @@ func TestOpenReportsAFileThatIsNotADatabase(t *testing.T) {
 
 	_, err := m.OpenOrCreate(1)
 
-	assert.ErrorContains(t, err, "auto_vacuum")
+	assert.ErrorContains(t, err, "not a database")
 }
 
 // The caches directory is created on demand, so a path that cannot become one is where

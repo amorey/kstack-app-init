@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,6 +49,21 @@ func OpenPool(path string, maxConns int) (*sql.DB, error) {
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	// sql.Open is lazy — the file does not exist until a connection runs. Ping first,
+	// then fix the mode: a file written by an older build kept the umask it was born with.
+	// The siblings are absent on a fresh open; SQLite creates them from the database's
+	// mode once that is fixed.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			db.Close()
+			return nil, err
+		}
+	}
 	return db, nil
 }
 

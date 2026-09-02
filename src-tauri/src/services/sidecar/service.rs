@@ -88,7 +88,7 @@ impl SidecarService {
                 )))
             })?
             .join(dir_name);
-        std::fs::create_dir_all(&data_dir).map_err(AppError::Io)?;
+        ensure_data_dir(&data_dir)?;
 
         let mut command = app
             .shell()
@@ -355,6 +355,28 @@ fn force_kill_by_pid(pid: u32) {
     }
 }
 
+/// Creates the sidecar's data directory owner-only, and tightens one an earlier build
+/// already created under the umask. On Windows the per-user `%LOCALAPPDATA%` ACL
+/// already restricts it, so the plain create is enough.
+fn ensure_data_dir(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(AppError::Io)?;
+        // A mode on DirBuilder applies only to directories it creates.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(AppError::Io)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(AppError::Io)?;
+    Ok(())
+}
+
 /// Adapts Tauri's `Channel<String>` to [`FrameSink`]. `send` errors only if
 /// the webview is gone; the frame is safely dropped.
 struct TauriChannelSink(Channel<String>);
@@ -389,5 +411,36 @@ mod tests {
                 std::process::id().to_string(),
             ]
         );
+    }
+
+    /// The data directory is the outer wall around the sidecar's caches, and the
+    /// only one Windows has. Unix only — Windows has no POSIX mode bits.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_data_dir_creates_and_tightens_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("kstack-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let fresh = base.join("fresh");
+        ensure_data_dir(&fresh).expect("create");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // Every install before this landed has a 0755 directory, and a mode on
+        // DirBuilder applies only to directories it creates.
+        let existing = base.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_data_dir(&existing).expect("tighten");
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
