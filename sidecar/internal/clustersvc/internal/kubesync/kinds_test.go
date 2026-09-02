@@ -15,6 +15,7 @@
 package kubesync
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -359,6 +360,13 @@ func TestAConnectionRetiredWhileAKindEstablishesIsReplacedRatherThanParked(t *te
 	stream := cluster.streamKind(podKind)
 	held := cluster.holdList(podKind)
 
+	// The replacement is its own api server, so the refusal below belongs to the connection
+	// that gets retired rather than to whichever run opens next.
+	replacement := newFakeCluster(t)
+	replacement.serveKind(podKind, true)
+	replacement.hasObjects(podKind, "10", object("v1", "Pod", "one", "1"))
+	replacementStream := replacement.streamKind(podKind)
+
 	// An hour, so nothing but a wake can explain a second start.
 	svc := newSyncingService(t, cluster, func(p *pacing) {
 		p.backoff = supervisor.Backoff{Base: time.Hour, Factor: 2, Cap: time.Hour}
@@ -370,11 +378,25 @@ func TestAConnectionRetiredWhileAKindEstablishesIsReplacedRatherThanParked(t *te
 	// that follows the list is what reads the refusal. The cancel is pending before the list is
 	// let go, and the whole cold list runs between the two.
 	stream.refuse(errors.New("the api server is busy"))
-	svc.connSvc.(*fakePool).lease("prod").connect(t, cluster, "uid-1")
+	svc.connSvc.(*fakePool).lease("prod").connect(t, replacement, "uid-1")
 	held.release()
 
 	cluster.listed.Await(t, "the held list to land")
-	cluster.listed.Await(t, "the kind to be started again over the replacement")
+	// The open, not a second list: whether the replacement's run cold lists or resumes turns on
+	// whether the retired run committed its list first, and either one is the restart.
+	replacementStream.opened.Await(t, "the kind to be started again over the replacement")
+}
+
+// The retirement is what ends the run, and the pool closes Done before the cancel it
+// triggers can be scheduled — so a run can read an error off the retired connection with
+// its own context still live. That error is not this kind's to report: reading it as one
+// puts a kind the pool just moved onto the ladder, where only a rung can free it.
+func TestARetiredConnectionEndsARunWhoseCancelHasNotLandedYet(t *testing.T) {
+	cluster := newFakeCluster(t)
+	conn := cluster.connection(t)
+	conn.Retire()
+
+	assert.True(t, ended(context.Background(), conn), "a retired connection ends the run reading over it")
 }
 
 func TestAKindWhoseAPIVersionIsUnparseableStillNamesItsCollection(t *testing.T) {

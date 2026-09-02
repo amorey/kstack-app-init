@@ -173,7 +173,7 @@ func (w kindSync) sync(ctx context.Context, sess *session, k kubestore.Kind, id 
 		if positionGone(err) {
 			sess.markRelist(id)
 		}
-		if ctx.Err() != nil {
+		if ended(ctx, conn) {
 			return w.stopped(pass, conn)
 		}
 		return supervisor.Fail(ReasonSyncFailed, err)
@@ -190,7 +190,7 @@ func (w kindSync) sync(ctx context.Context, sess *session, k kubestore.Kind, id 
 		sess.markRelist(id)
 	}
 	switch {
-	case ctx.Err() != nil:
+	case ended(ctx, conn):
 		return w.stopped(pass, conn)
 	case err == nil && syncer.proved:
 		// The apiserver ended the watch on its own timeout: a rotation, not a failure. The
@@ -225,6 +225,17 @@ func (w kindSync) stopped(pass *supervisor.WorkerPass[Reason], conn *kubeconn.Co
 		w.s.kindSupervisor.Wake(pass.Subject(), nameKindSync)
 	}
 	return supervisor.Skip()
+}
+
+// ended reports a run that something outside this kind ended: the session went, the supervisor
+// stopped it, or the pool retired the connection under it.
+//
+// The retirement is checked directly rather than through the context, because Retire closes
+// Done synchronously while the cancel it triggers waits on a goroutine. A run can therefore read
+// an error off a connection nothing will answer with ctx.Err() still nil, and reporting that as
+// the kind's own failure would put it on the ladder.
+func ended(ctx context.Context, conn *kubeconn.Connection) bool {
+	return ctx.Err() != nil || retired(conn)
 }
 
 // retired reports whether the pool took the connection this run was reading over.
