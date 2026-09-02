@@ -45,6 +45,7 @@ nothing stops the next change undoing it. **Not built** links the work.
 | `managedFields` and the last-applied annotation stripped before storage | `kubestore/objects.go` | **Enforced** — `TestProjectStripsServerNoise` |
 | Loopback callback checks `state` before consuming a code or an error | `sidecar/internal/auth/login.go` | **Enforced** — `TestLoopbackRejectsInvalidCallbackWithoutConsuming` |
 | A webview's subscriptions are torn down by the host on reload and close | `src-tauri/src/lib.rs` | **Enforced** — `cancel_webview_drops_only_that_webviews_subscriptions` |
+| Sidecar-reported log fields ride under `sidecar.fields`, never as host fields | `src-tauri/src/services/sidecar/logs.rs` | **Enforced** — `forwarded_fields_are_namespaced` |
 | `tauri.conf.json` declares no windows; chrome decisions stay in `build_window` | `src-tauri/src/window_manager.rs` | **Enforced** — unit test in `window_manager.rs` |
 | Data directories created 0700; `host.json` and the sync files written 0600 | `src-tauri/src/services/sidecar/service.rs`, `atomicjson`, `clustersvc/service.go`, `sqlitemigrate`, `appdb`, `kubestore/manager.go` | **Enforced** on Unix — `ensure_data_dir_creates_and_tightens_to_0700`, `TestSaveIsOwnerOnly`, `TestOpenPoolFilesAreOwnerOnly`, `TestCacheFileIsOwnerOnly`, `TestSetOwnerOnlyUmask`; on Windows the inherited profile ACL, [by decision](adr/2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) |
 | Go, Rust and npm dependency trees scanned for advisories on every pull request | `.github/workflows/ci.yml` | **Enforced** — the `Go · Audit`, `Rust · Audit` and `TypeScript · Audit` jobs |
@@ -58,7 +59,6 @@ nothing stops the next change undoing it. **Not built** links the work.
 | Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [spec 12](specs/12-decide-what-the-cache-is.md) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
 | Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
-| Sidecar-reported log fields cannot shadow a host field | `src-tauri/src/services/sidecar/logs.rs` | **Not built** — [spec 4](specs/4-namespace-sidecar-log-fields.md) |
 | No authority granted ahead of a consumer (`opener:default`, `chatStream`) | — | **Not built** — [spec 5](specs/5-drop-ungranted-authority.md) |
 | An unverified cluster connection is visible in the UI | — | **Not built** — [spec 6](specs/6-surface-unverified-tls.md) |
 | Cloud and OAuth endpoints come from the host's arguments, not from inherited environment | — | **Not built** — [spec 7](specs/7-endpoints-as-arguments.md) |

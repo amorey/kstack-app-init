@@ -13,8 +13,12 @@
 // limitations under the License.
 
 //! Re-emits sidecar stdout/stderr as host `tracing` events. slog JSON lines
-//! are classified by their own `level` (extra fields ride along); non-JSON
-//! lines (Go panics) forward verbatim at the pipe's fallback level.
+//! are classified by their own `level`; non-JSON lines (Go panics) forward
+//! verbatim at the pipe's fallback level.
+//!
+//! The sidecar's own fields never become top-level host fields: cluster-
+//! controlled text reaches them, so they arrive as one JSON value under
+//! `sidecar.fields`, where a reader can tell whose they are.
 
 use serde::Deserialize;
 
@@ -86,12 +90,14 @@ pub(super) fn forward_sidecar_line(raw: &[u8], fallback: Severity) {
     };
 
     // `tracing` needs the level fixed at compile time, so dispatch per arm.
+    // The dotted field name is quoted: it is not a Rust identifier, and the
+    // macro cannot parse it as one.
     macro_rules! emit {
         ($level:ident) => {
             if extra.is_empty() {
                 tracing::$level!(target: "sidecar", "{}", msg);
             } else {
-                tracing::$level!(target: "sidecar", fields = %extra, "{}", msg);
+                tracing::$level!(target: "sidecar", { "sidecar.fields" = %extra }, "{}", msg);
             }
         };
     }
@@ -205,5 +211,42 @@ mod tests {
         let (severity, msg, _) = classify_str(raw, Severity::Warn);
         assert_eq!(severity, Severity::Warn);
         assert_eq!(msg, raw);
+    }
+
+    /// The sidecar's fields must arrive under a namespaced key: a reader has
+    /// to be able to tell cluster-controlled text from a host-recorded field.
+    #[test]
+    fn forwarded_fields_are_namespaced() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            forward_sidecar_line(STARTUP_LINE.as_bytes(), Severity::Warn);
+        });
+
+        let out = String::from_utf8(capture.0.lock().unwrap().clone()).expect("utf-8 output");
+        assert!(
+            out.contains("sidecar.fields="),
+            "fields should be namespaced, got: {out}"
+        );
+        assert!(
+            !out.contains(" fields="),
+            "no bare `fields` key may appear, got: {out}"
+        );
     }
 }
