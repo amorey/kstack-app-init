@@ -2,12 +2,18 @@
 # so it doesn't belong in package.json scripts; this Makefile is the
 # place where Go, Rust, and JS commands meet.
 
-.PHONY: sidecar proto proto-go proto-rust test test-go test-rust test-js lint lint-go lint-rust lint-js vet vet-go vet-rust clean
+.PHONY: sidecar sidecar-dev proto proto-go proto-rust test test-go test-rust test-js lint lint-go lint-rust lint-js vet vet-go vet-rust clean
 
 # Build the Go sidecar into src-tauri/binaries/ with the Tauri-required
 # `<name>-<rust-host-triple>` filename. Tauri's externalBin picks it up.
 sidecar:
 	bash scripts/build-sidecar.sh
+
+# The dev build, and the only one that lets KSTACK_CLOUD_API_URL and friends
+# redirect the sidecar. `tauri dev` calls this; every release path calls
+# `sidecar` and so builds untagged.
+sidecar-dev:
+	KSTACK_SIDECAR_TAGS=debug bash scripts/build-sidecar.sh
 
 # Regenerate the gRPC bindings from the shared repo-root proto/ for both
 # languages. proto/ is the single source of truth (host <-> sidecar wire

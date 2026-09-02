@@ -144,7 +144,6 @@ The current picture â€” boundaries, and which protections a test actually pins â
 **Each item has a spec.** They live in [`docs/specs/`](specs/), numbered in build order, and are not
 repeated here:
 
-7. [Endpoints come from arguments, not environment](specs/7-endpoints-as-arguments.md)
 8. [Updates say what they actually are](specs/8-updates-say-what-they-are.md)
 9. [Cached events age out](specs/9-bound-the-events-table.md)
 10. [A kubeconfig exec plugin waits for approval](specs/10-approve-exec-credential-plugins.md)

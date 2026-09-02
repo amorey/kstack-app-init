@@ -69,7 +69,7 @@ type App struct {
 // cloud subsystems into the GraphQL and gRPC servers that share one h2c socket.
 func New(cfg Config) (*App, error) {
 	if cfg.DataDir == "" {
-		return nil, fmt.Errorf("data dir is required (--data-dir / KSTACK_DATA_DIR)")
+		return nil, fmt.Errorf("data dir is required (--data-dir)")
 	}
 
 	// Shared cross-subsystem poke bus (wall-clock gap detector + host pokes via

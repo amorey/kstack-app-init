@@ -16,7 +16,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,44 +36,30 @@ func main() {
 
 	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG_LEVEL"))))
 
-	sockPath := flag.String("socket", ipc.DefaultSocketPath(), "path to the IPC endpoint (Unix domain socket on Unix, named pipe on Windows) to listen on")
-	kubeconfigPath := flag.String("kubeconfig", "", "explicit kubeconfig path; empty uses the clientcmd default-loading rules ($KUBECONFIG / ~/.kube/config)")
-	// Zero (the default) leaves the endpoint open to any process of this user,
-	// which is what a standalone dev run wants; the host always passes its own.
-	hostPID := flag.Int("host-pid", 0, "pid of the host process; the only process allowed to connect (0 allows any process of this user)")
-	// The host passes its app_local_data_dir(); required — app.New errors when empty.
-	dataDir := flag.String("data-dir", envOr("KSTACK_DATA_DIR", ""), "app data dir for app.db and the per-cluster caches (defaults to KSTACK_DATA_DIR; required)")
-	flag.Parse()
-
-	ln, err := ipc.Listen(*sockPath)
+	cfg, err := configFromArgs(os.Args[1:])
 	if err != nil {
-		slog.Error("listen", "socket", *sockPath, "err", err)
+		os.Exit(2)
+	}
+
+	ln, err := ipc.Listen(cfg.Socket)
+	if err != nil {
+		slog.Error("listen", "socket", cfg.Socket, "err", err)
 		os.Exit(1)
 	}
-	ln = ipc.Authenticated(ln, ipc.Policy{HostPID: *hostPID})
+	ln = ipc.Authenticated(ln, ipc.Policy{HostPID: cfg.HostPID})
 	// Named pipes vanish with their listener; only the UDS file needs cleanup.
-	defer os.Remove(*sockPath)
+	defer os.Remove(cfg.Socket)
 
 	slog.Info("sidecar starting",
-		"socket", *sockPath,
+		"socket", cfg.Socket,
 		"pid", os.Getpid(),
-		"host_pid", *hostPID,
-		"data_dir", *dataDir,
+		"host_pid", cfg.HostPID,
+		"data_dir", cfg.App.DataDir,
+		"cloud_url", cfg.App.CloudURL,
+		"oauth_issuer", cfg.App.OAuthIssuerURL,
 	)
 
-	// Cloud/OAuth defaults are the kstack production endpoints (env-overridable).
-	// The OAuth client is public (PKCE/loopback, no secret), so baking the
-	// defaults into the binary leaks nothing.
-	application, err := app.New(app.Config{
-		KubeconfigPath: *kubeconfigPath,
-		DataDir:        *dataDir,
-		CloudURL:       envOr("KSTACK_CLOUD_API_URL", "https://api.kstack.sh"),
-		OAuthIssuerURL: envOr("KSTACK_OAUTH_ISSUER", "https://oauth.kstack.sh"),
-		OAuthClientID:  envOr("KSTACK_OAUTH_CLIENT_ID", "kstack-desktop"),
-		// Empty ⇒ the "Kstack" default; the host sets a dev-specific name so
-		// dev and release runs don't share one keychain entry.
-		KeychainService: os.Getenv("KSTACK_KEYCHAIN_SERVICE"),
-	})
+	application, err := app.New(cfg.App)
 	if err != nil {
 		slog.Error("app init", "err", err)
 		os.Exit(1)
@@ -93,7 +78,7 @@ func main() {
 
 	// The host matches the `READY ` prefix; scheme+path are informational (the
 	// host picked the path and passed it via --socket).
-	fmt.Printf("READY %s:%s\n", ipc.Scheme, *sockPath)
+	fmt.Printf("READY %s:%s\n", ipc.Scheme, cfg.Socket)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -141,12 +126,4 @@ func main() {
 		slog.Warn("stop did not complete cleanly", "err", err)
 	}
 	_ = application.Close()
-}
-
-// envOr returns env var `key`, or `fallback` if unset/empty.
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

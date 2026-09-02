@@ -46,7 +46,6 @@ spec's header says otherwise. They come from
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [7 · Endpoints come from arguments, not environment](7-endpoints-as-arguments.md) | host · sidecar · build · ci | Planned |
 | [8 · Updates say what they actually are](8-updates-say-what-they-are.md) | host · docs · ci | Planned |
 | [9 · Cached events age out](9-bound-the-events-table.md) | sidecar | Planned |
 | [10 · A kubeconfig exec plugin waits for approval](10-approve-exec-credential-plugins.md) | sidecar · frontend | Planned |

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "sh.kstack.app",
   "build": {
-    "beforeDevCommand": "make sidecar && pnpm dev",
+    "beforeDevCommand": "make sidecar-dev && pnpm dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "make sidecar && pnpm build",
     "frontendDist": "../dist"

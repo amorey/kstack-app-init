@@ -71,14 +71,7 @@ impl SidecarService {
         // Per-machine app data dir for the sidecar's SQLite cache and cloud
         // settings/queue. Human-readable leaf on `local_data_dir`, not Tauri's
         // bundle-id `app_local_data_dir` (Application Support convention is a
-        // display name). Debug builds use a "Kstack-dev" sibling so dev can't
-        // collide with an installed release. Created up front so the sidecar
-        // can mkdir subdirs.
-        let dir_name = if cfg!(debug_assertions) {
-            "Kstack-dev"
-        } else {
-            "Kstack"
-        };
+        // display name). Created up front so the sidecar can mkdir subdirs.
         let data_dir = app
             .path()
             .local_data_dir()
@@ -87,19 +80,14 @@ impl SidecarService {
                     "resolve local_data_dir: {e}"
                 )))
             })?
-            .join(dir_name);
+            .join(APP_DIR_NAME);
         ensure_data_dir(&data_dir)?;
 
-        let mut command = app
+        let (mut rx, child) = app
             .shell()
             .sidecar("kstack-sidecar")?
-            .args(cmd_args(&endpoint, &data_dir));
-        // Dev-specific keychain service name so a dev run's stored sign-in
-        // doesn't clobber the installed release's entry.
-        if cfg!(debug_assertions) {
-            command = command.env("KSTACK_KEYCHAIN_SERVICE", dir_name);
-        }
-        let (mut rx, child) = command.spawn()?;
+            .args(cmd_args(&endpoint, &data_dir))
+            .spawn()?;
         let pid = child.pid();
 
         let state = Arc::new(Mutex::new(State {
@@ -311,6 +299,32 @@ impl SidecarService {
     }
 }
 
+/// The endpoints the app signs in against. Constants, never read from this
+/// process's environment: the sidecar inherits that environment, so reading
+/// them here would move the redirection risk rather than close it. A dev run
+/// overrides them inside the sidecar's own debug build.
+const CLOUD_URL: &str = "https://api.kstack.sh";
+const OAUTH_ISSUER: &str = "https://oauth.kstack.sh";
+const OAUTH_CLIENT_ID: &str = "kstack-desktop";
+
+/// The data-dir leaf under `local_data_dir`. Debug builds use a `-dev` sibling
+/// so a dev run never collides with an installed release.
+const APP_DIR_NAME: &str = if cfg!(debug_assertions) {
+    "Kstack-dev"
+} else {
+    "Kstack"
+};
+
+/// The OS-keychain service the sidecar stores sign-in under: the product name,
+/// as the entry is user-visible in Keychain Access and Credential Manager.
+/// Renaming it orphans every stored sign-in, so it is its own constant even
+/// though it matches the data-dir leaf today.
+const KEYCHAIN_SERVICE: &str = if cfg!(debug_assertions) {
+    "Kstack-dev"
+} else {
+    "Kstack"
+};
+
 /// CLI flags for the sidecar; a free function so the contract is unit-testable
 /// without the Tauri runtime.
 ///
@@ -318,14 +332,18 @@ impl SidecarService {
 /// its sole client — the webview reaches it through us — so this closes the
 /// endpoint to every other process running as the user.
 fn cmd_args(socket: &Endpoint, data_dir: &std::path::Path) -> Vec<String> {
-    vec![
-        "--socket".to_string(),
-        socket.as_arg().to_owned(),
-        "--data-dir".to_string(),
-        data_dir.to_string_lossy().into_owned(),
-        "--host-pid".to_string(),
-        std::process::id().to_string(),
+    [
+        ("--socket", socket.as_arg().to_owned()),
+        ("--data-dir", data_dir.to_string_lossy().into_owned()),
+        ("--host-pid", std::process::id().to_string()),
+        ("--cloud-url", CLOUD_URL.to_owned()),
+        ("--oauth-issuer", OAUTH_ISSUER.to_owned()),
+        ("--oauth-client-id", OAUTH_CLIENT_ID.to_owned()),
+        ("--keychain-service", KEYCHAIN_SERVICE.to_owned()),
     ]
+    .into_iter()
+    .flat_map(|(flag, value)| [flag.to_owned(), value])
+    .collect()
 }
 
 /// Best-effort kill by pid — the fallback once [`SidecarService::graceful_shutdown`]
@@ -392,23 +410,31 @@ mod tests {
     use super::*;
 
     /// Pins the host↔sidecar CLI contract (`--socket`, `--data-dir`,
-    /// `--host-pid`); changing it without updating the sidecar silently
-    /// misroutes the cache or the socket, or drops the peer check.
+    /// `--host-pid`, and the endpoints); changing it without updating the
+    /// sidecar silently misroutes the cache or the socket, drops the peer
+    /// check, or leaves sign-in on an inherited environment variable.
     #[test]
-    fn cmd_args_passes_socket_data_dir_and_host_pid() {
+    fn cmd_args_passes_socket_data_dir_host_pid_and_endpoints() {
         let base = std::env::temp_dir();
         let path = Endpoint::pick(&base).expect("pick should succeed");
         let data_dir = std::path::PathBuf::from("/some/app/data");
-        let args = cmd_args(&path, &data_dir);
         assert_eq!(
-            args,
-            vec![
-                "--socket".to_string(),
-                path.as_arg().to_owned(),
-                "--data-dir".to_string(),
-                data_dir.to_string_lossy().into_owned(),
-                "--host-pid".to_string(),
-                std::process::id().to_string(),
+            cmd_args(&path, &data_dir),
+            [
+                "--socket",
+                path.as_arg(),
+                "--data-dir",
+                &data_dir.to_string_lossy(),
+                "--host-pid",
+                &std::process::id().to_string(),
+                "--cloud-url",
+                CLOUD_URL,
+                "--oauth-issuer",
+                OAUTH_ISSUER,
+                "--oauth-client-id",
+                OAUTH_CLIENT_ID,
+                "--keychain-service",
+                KEYCHAIN_SERVICE,
             ]
         );
     }

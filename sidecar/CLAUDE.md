@@ -2,7 +2,7 @@
 
 A standalone Go binary started by the Tauri host. It serves the app's GraphQL API and a gRPC control channel and owns all Kubernetes logic. **No TCP**: it listens on a Unix socket (named pipe on Windows), prints `READY unix:<path>` to stdout, and shuts down on `SIGINT`/`SIGTERM` or **stdin EOF**.
 
-`--data-dir` / `KSTACK_DATA_DIR` is **required**; `app.New` errors when empty and tests pass `t.TempDir()`. `<data-dir>/app.db` is `internal/appdb`'s: one migration sequence, numbered files in `appdb/migrations/`, never a second embed against the same file.
+`--data-dir` is **required**; `app.New` errors when empty and tests pass `t.TempDir()`. `<data-dir>/app.db` is `internal/appdb`'s: one migration sequence, numbered files in `appdb/migrations/`, never a second embed against the same file.
 
 This file states what is true now. Why it is that way lives in `docs/adr/`; every section links its ADRs. Rationale goes there, not here.
 
@@ -23,7 +23,9 @@ Shutdown order from `main.go`: `app.NotifyShutdown()` → `srv.Shutdown` → `ap
 
 ## Security invariants
 
-Full picture: [`docs/security-model.md`](../docs/security-model.md). The sidecar holds every credential in the system, so these four are load-bearing:
+Full picture: [`docs/security-model.md`](../docs/security-model.md). The sidecar holds every credential in the system, so these are load-bearing:
+
+- **Every endpoint is an argument.** `configFromArgs` (`config.go`) parses the whole command line, including `--cloud-url`, `--oauth-issuer`, `--oauth-client-id` and `--keychain-service`; the host passes them. The environment reaches the config only through `applyEnvOverrides` (`config.go`), a no-op unless the binary is built with `-tags debug` (`make sidecar-dev`, for a standalone dev run with no host). `KSTACK_LOG_LEVEL` is the one variable a release build still reads — a log level redirects nothing. `config_test.go` pins the boundary; `go test` builds untagged.
 
 - **Only the host process may connect.** `ipc.Authenticated` checks each accepted connection's peer pid against `--host-pid` (the kernel stamps it, so a client cannot claim another's) and closes anything else without ending the accept loop; zero, the standalone-run default, falls back to the uid alone. The file mode carries the rest: `ipc.Listen` tightens the umask *before* `net.Listen` so the socket is never briefly world-accessible, then chmods 0600; Windows binds the pipe owner-only (`D:P(A;;GA;;;OW)`). Both are pinned by tests. Never widen either, never move the endpoint out of a 0700 directory, and never add a TCP listener — the GET transport is registered alongside POST and SSE and is only harmless because the transport is local.
 - **Redaction happens at write time, keyed off the body's own group and kind,** so it cannot be bypassed by how an object was addressed (`kubestore/objects.go`). A new read path serves the stored body; it does not get to re-derive what to hide. The table is deliberately incomplete, so treat a cache file as holding cluster data in the clear — that is what makes its file mode and its lifetime security properties. → [ADR: secret redaction](../docs/adr/2026-08-30-secret-redaction-at-write-time.md).

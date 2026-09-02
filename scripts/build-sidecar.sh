@@ -23,5 +23,8 @@ mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/$BASENAME-$TRIPLE$EXT"
 
 echo "→ building $OUT"
-(cd "$SIDECAR_DIR" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$OUT" .)
+# Empty by default, so the release path builds untagged and its endpoints can
+# only come from the host's arguments. `make sidecar-dev` sets `debug`.
+TAGS="${KSTACK_SIDECAR_TAGS:-}"
+(cd "$SIDECAR_DIR" && CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags='-s -w' -o "$OUT" .)
 echo "✓ $OUT"

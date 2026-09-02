@@ -106,6 +106,16 @@ jobs:
           KSTACK_HOST_TRIPLE: ${{ matrix.triple }}
         run: ./scripts/build-sidecar.sh
 
+      # A `debug`-tagged sidecar lets the environment redirect sign-in, and the
+      # failure would be silent. Go records the build tags in the binary.
+      - name: Assert the shipped sidecar is untagged
+        shell: bash
+        run: |
+          if go version -m src-tauri/binaries/kstack-sidecar-* | grep -q -- '-tags='; then
+            echo "sidecar built with tags"
+            exit 1
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
