@@ -47,6 +47,7 @@ nothing stops the next change undoing it. **Not built** links the work.
 | A webview's subscriptions are torn down by the host on reload and close | `src-tauri/src/lib.rs` | **Enforced** — `cancel_webview_drops_only_that_webviews_subscriptions` |
 | `tauri.conf.json` declares no windows; chrome decisions stay in `build_window` | `src-tauri/src/window_manager.rs` | **Enforced** — unit test in `window_manager.rs` |
 | Data directories created 0700; `host.json` and the sync files written 0600 | `src-tauri/src/services/sidecar/service.rs`, `atomicjson`, `clustersvc/service.go`, `sqlitemigrate`, `appdb`, `kubestore/manager.go` | **Enforced** on Unix — `ensure_data_dir_creates_and_tightens_to_0700`, `TestSaveIsOwnerOnly`, `TestOpenPoolFilesAreOwnerOnly`, `TestCacheFileIsOwnerOnly`, `TestSetOwnerOnlyUmask`; on Windows the inherited profile ACL, [by decision](adr/2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) |
+| Go, Rust and npm dependency trees scanned for advisories on every pull request | `.github/workflows/ci.yml` | **Enforced** — the `Go · Audit`, `Rust · Audit` and `TypeScript · Audit` jobs |
 | Production CSP admits no remote script, no `eval`, no frames, no form posts | `src-tauri/tauri.conf.json` | **Held by review** |
 | The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Held by review** — [spec 3](specs/3-ban-html-sinks-in-the-webview.md) makes it a lint rule |
 | Printer columns evaluated by a restricted reader, not a template engine | `src/lib/jsonpath.ts` | **Held by review** |
@@ -57,7 +58,6 @@ nothing stops the next change undoing it. **Not built** links the work.
 | Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [spec 12](specs/12-decide-what-the-cache-is.md) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
 | Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
-| Dependency advisory scanning in CI | — | **Not built** — [spec 2](specs/2-dependency-scanning-in-ci.md) |
 | Sidecar-reported log fields cannot shadow a host field | `src-tauri/src/services/sidecar/logs.rs` | **Not built** — [spec 4](specs/4-namespace-sidecar-log-fields.md) |
 | No authority granted ahead of a consumer (`opener:default`, `chatStream`) | — | **Not built** — [spec 5](specs/5-drop-ungranted-authority.md) |
 | An unverified cluster connection is visible in the UI | — | **Not built** — [spec 6](specs/6-surface-unverified-tls.md) |

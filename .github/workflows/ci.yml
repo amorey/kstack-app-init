@@ -136,6 +136,47 @@ jobs:
         run: pnpm lint
 
   ###########################
+  # Audit jobs
+  ###########################
+
+  go-audit:
+    name: Go · Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Run govulncheck
+        working-directory: ./sidecar
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  rust-audit:
+    name: Rust · Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.2
+      - name: Run cargo audit
+        working-directory: ./src-tauri
+        run: cargo audit
+
+  typescript-audit:
+    name: TypeScript · Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Run pnpm audit
+        run: pnpm audit --audit-level high
+
+  ###########################
   # Test jobs
   ###########################
 

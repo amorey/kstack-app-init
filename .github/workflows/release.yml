@@ -346,12 +346,25 @@ jobs:
     environment: production
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/desktop/v${{ needs.config.outputs.version }}
+
       - name: Download bundles
         uses: actions/download-artifact@v6
         with:
           pattern: assets-bundle-*
           path: assets
           merge-multiple: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: assets/kstack-${{ needs.config.outputs.version }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Generate SHA-256 checksums
         working-directory: ./assets
