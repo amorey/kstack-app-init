@@ -36,7 +36,6 @@ type Documents = {
     "\n  subscription ClustersWatch {\n    clustersWatch {\n      type\n      cluster {\n        id\n        deletionRequestedAt\n        spec {\n          name\n          syncEnabled\n          enabled\n          source {\n            kubeconfig {\n              context\n            }\n          }\n        }\n        status {\n          source {\n            kubeconfig {\n              cluster\n              user\n              isPresent\n              isDefault\n            }\n          }\n          server {\n            uid\n          }\n        }\n        conditions {\n          type\n          status\n          reason\n          message\n          liveness\n          unconfirmed\n          transitionedAt\n        }\n      }\n    }\n  }\n": typeof types.ClustersWatchDocument,
     "\n  subscription ClusterCachesWatch {\n    clusterCachesWatch {\n      type\n      cache {\n        id\n        owner {\n          id\n        }\n        spec {\n          serverUid\n        }\n        # On-disk stats ride clusterCacheStatsWatch, subscribed per expanded row.\n      }\n    }\n  }\n": typeof types.ClusterCachesWatchDocument,
     "\n  subscription ClusterCacheHealthWatch {\n    clusterCacheHealthWatch {\n      cacheID\n      status\n      reason\n      unhealthyKindRefs {\n        apiVersion\n        resource\n      }\n      totalKinds\n      unhealthyKinds\n      pausedKinds\n      lastUpdateAt\n      lastLiveAt\n    }\n  }\n": typeof types.ClusterCacheHealthWatchDocument,
-    "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n": typeof types.ChatStreamDocument,
 };
 const documents: Documents = {
     "\n  mutation ClusterEnabledSet($id: ObjectID!, $enabled: Boolean!) {\n    clusterEnabledSet(id: $id, enabled: $enabled) {\n      id\n      spec {\n        enabled\n      }\n    }\n  }\n": types.ClusterEnabledSetDocument,
@@ -61,7 +60,6 @@ const documents: Documents = {
     "\n  subscription ClustersWatch {\n    clustersWatch {\n      type\n      cluster {\n        id\n        deletionRequestedAt\n        spec {\n          name\n          syncEnabled\n          enabled\n          source {\n            kubeconfig {\n              context\n            }\n          }\n        }\n        status {\n          source {\n            kubeconfig {\n              cluster\n              user\n              isPresent\n              isDefault\n            }\n          }\n          server {\n            uid\n          }\n        }\n        conditions {\n          type\n          status\n          reason\n          message\n          liveness\n          unconfirmed\n          transitionedAt\n        }\n      }\n    }\n  }\n": types.ClustersWatchDocument,
     "\n  subscription ClusterCachesWatch {\n    clusterCachesWatch {\n      type\n      cache {\n        id\n        owner {\n          id\n        }\n        spec {\n          serverUid\n        }\n        # On-disk stats ride clusterCacheStatsWatch, subscribed per expanded row.\n      }\n    }\n  }\n": types.ClusterCachesWatchDocument,
     "\n  subscription ClusterCacheHealthWatch {\n    clusterCacheHealthWatch {\n      cacheID\n      status\n      reason\n      unhealthyKindRefs {\n        apiVersion\n        resource\n      }\n      totalKinds\n      unhealthyKinds\n      pausedKinds\n      lastUpdateAt\n      lastLiveAt\n    }\n  }\n": types.ClusterCacheHealthWatchDocument,
-    "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n": types.ChatStreamDocument,
 };
 
 /**
@@ -166,10 +164,6 @@ export function graphql(source: "\n  subscription ClusterCachesWatch {\n    clus
  * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
  */
 export function graphql(source: "\n  subscription ClusterCacheHealthWatch {\n    clusterCacheHealthWatch {\n      cacheID\n      status\n      reason\n      unhealthyKindRefs {\n        apiVersion\n        resource\n      }\n      totalKinds\n      unhealthyKinds\n      pausedKinds\n      lastUpdateAt\n      lastLiveAt\n    }\n  }\n"): (typeof documents)["\n  subscription ClusterCacheHealthWatch {\n    clusterCacheHealthWatch {\n      cacheID\n      status\n      reason\n      unhealthyKindRefs {\n        apiVersion\n        resource\n      }\n      totalKinds\n      unhealthyKinds\n      pausedKinds\n      lastUpdateAt\n      lastLiveAt\n    }\n  }\n"];
-/**
- * The graphql function is used to parse GraphQL queries into a document that can be used by GraphQL clients.
- */
-export function graphql(source: "\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n"): (typeof documents)["\n  subscription ChatStream($input: ChatInput!) {\n    chatStream(input: $input) {\n      delta\n      done\n    }\n  }\n"];
 
 export function graphql(source: string) {
   return (documents as any)[source] ?? {};

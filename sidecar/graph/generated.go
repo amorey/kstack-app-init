@@ -53,11 +53,6 @@ type ComplexityRoot struct {
 		Identity      func(childComplexity int) int
 	}
 
-	ChatChunk struct {
-		Delta func(childComplexity int) int
-		Done  func(childComplexity int) int
-	}
-
 	Cluster struct {
 		Caches              func(childComplexity int) int
 		Conditions          func(childComplexity int) int
@@ -357,7 +352,6 @@ type ComplexityRoot struct {
 
 	Subscription struct {
 		AuthStateWatch                func(childComplexity int) int
-		ChatStream                    func(childComplexity int, input model.ChatInput) int
 		ClusterCacheHealthWatch       func(childComplexity int) int
 		ClusterCacheStatsWatch        func(childComplexity int, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) int
 		ClusterCacheSyncStatusWatch   func(childComplexity int, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) int
@@ -426,7 +420,6 @@ type SubscriptionResolver interface {
 	ClusterCachedDataKindsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataKindWatchFrame, error)
 	ClusterCachedDataEventsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID) (<-chan *clustersvc.ClusterCachedDataEventWatchFrame, error)
 	ClusterCachedDataObjectsWatch(ctx context.Context, id clustersvc.ObjectID, cacheID clustersvc.ObjectID, apiVersion string, resource string) (<-chan *clustersvc.ClusterCachedDataObjectWatchFrame, error)
-	ChatStream(ctx context.Context, input model.ChatInput) (<-chan *model.ChatChunk, error)
 	AuthStateWatch(ctx context.Context) (<-chan *auth.State, error)
 }
 
@@ -456,19 +449,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.AuthState.Identity(childComplexity), true
-
-	case "ChatChunk.delta":
-		if e.ComplexityRoot.ChatChunk.Delta == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ChatChunk.Delta(childComplexity), true
-	case "ChatChunk.done":
-		if e.ComplexityRoot.ChatChunk.Done == nil {
-			break
-		}
-
-		return e.ComplexityRoot.ChatChunk.Done(childComplexity), true
 
 	case "Cluster.caches":
 		if e.ComplexityRoot.Cluster.Caches == nil {
@@ -1670,17 +1650,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Subscription.AuthStateWatch(childComplexity), true
-	case "Subscription.chatStream":
-		if e.ComplexityRoot.Subscription.ChatStream == nil {
-			break
-		}
-
-		args, err := ec.field_Subscription_chatStream_args(ctx, rawArgs)
-		if err != nil {
-			return 0, false
-		}
-
-		return e.ComplexityRoot.Subscription.ChatStream(childComplexity, args["input"].(model.ChatInput)), true
 	case "Subscription.clusterCacheHealthWatch":
 		if e.ComplexityRoot.Subscription.ClusterCacheHealthWatch == nil {
 			break
@@ -1808,10 +1777,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 func (e *executableSchema) Exec(ctx context.Context) graphql.ResponseHandler {
 	opCtx := graphql.GetOperationContext(ctx)
 	ec := newExecutionContext(opCtx, e, make(chan graphql.DeferredResult))
-	inputUnmarshalMap := graphql.BuildUnmarshalerMap(
-		ec.unmarshalInputChatInput,
-		ec.unmarshalInputChatMessageInput,
-	)
+	inputUnmarshalMap := graphql.BuildUnmarshalerMap()
 	first := true
 
 	switch opCtx.Operation.Operation {
@@ -1930,16 +1896,6 @@ func (ec *executionContext) childFields_AuthState(ctx context.Context, field gra
 		return ec.fieldContext_AuthState_identity(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type AuthState", field.Name)
-}
-
-func (ec *executionContext) childFields_ChatChunk(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-	switch field.Name {
-	case "delta":
-		return ec.fieldContext_ChatChunk_delta(ctx, field)
-	case "done":
-		return ec.fieldContext_ChatChunk_done(ctx, field)
-	}
-	return nil, fmt.Errorf("no field named %q was found under type ChatChunk", field.Name)
 }
 
 func (ec *executionContext) childFields_Cluster(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -2892,20 +2848,6 @@ func (ec *executionContext) field_Query_cluster_args(ctx context.Context, rawArg
 	return args, nil
 }
 
-func (ec *executionContext) field_Subscription_chatStream_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
-	var err error
-	args := map[string]any{}
-	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "input",
-		func(ctx context.Context, v any) (model.ChatInput, error) {
-			return ec.unmarshalNChatInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatInput(ctx, v)
-		})
-	if err != nil {
-		return nil, err
-	}
-	args["input"] = arg0
-	return args, nil
-}
-
 func (ec *executionContext) field_Subscription_clusterCacheStatsWatch_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
@@ -3199,52 +3141,6 @@ func (ec *executionContext) fieldContext_AuthState_identity(_ context.Context, f
 		},
 	}
 	return fc, nil
-}
-
-func (ec *executionContext) _ChatChunk_delta(ctx context.Context, field graphql.CollectedField, obj *model.ChatChunk) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ChatChunk_delta(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Delta, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
-			return ec.marshalNString2string(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ChatChunk_delta(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ChatChunk", field, false, false, errors.New("field of type String does not have child fields"))
-}
-
-func (ec *executionContext) _ChatChunk_done(ctx context.Context, field graphql.CollectedField, obj *model.ChatChunk) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_ChatChunk_done(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.Done, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
-			return ec.marshalNBoolean2bool(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_ChatChunk_done(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ChatChunk", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
 func (ec *executionContext) _Cluster_id(ctx context.Context, field graphql.CollectedField, obj *clustersvc.Cluster) (ret graphql.Marshaler) {
@@ -8523,50 +8419,6 @@ func (ec *executionContext) fieldContext_Subscription_clusterCachedDataObjectsWa
 	return fc, nil
 }
 
-func (ec *executionContext) _Subscription_chatStream(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
-	return graphql.ResolveFieldStream(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_Subscription_chatStream(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Subscription().ChatStream(ctx, fc.Args["input"].(model.ChatInput))
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v *model.ChatChunk) graphql.Marshaler {
-			return ec.marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_Subscription_chatStream(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	fc = &graphql.FieldContext{
-		Object:     "Subscription",
-		Field:      field,
-		IsMethod:   true,
-		IsResolver: true,
-		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.childFields_ChatChunk(ctx, field)
-		},
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			err = ec.Recover(ctx, r)
-			ec.Error(ctx, err)
-		}
-	}()
-	ctx = graphql.WithFieldContext(ctx, fc)
-	if fc.Args, err = ec.field_Subscription_chatStream_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
-		ec.Error(ctx, err)
-		return fc, err
-	}
-	return fc, nil
-}
-
 func (ec *executionContext) _Subscription_authStateWatch(ctx context.Context, field graphql.CollectedField) (ret func(ctx context.Context) graphql.Marshaler) {
 	return graphql.ResolveFieldStream(
 		ctx,
@@ -9704,73 +9556,6 @@ func (ec *executionContext) fieldContext___Type_isOneOf(_ context.Context, field
 
 // region    **************************** input.gotpl *****************************
 
-func (ec *executionContext) unmarshalInputChatInput(ctx context.Context, obj any) (model.ChatInput, error) {
-	var it model.ChatInput
-	if obj == nil {
-		return it, nil
-	}
-
-	asMap := map[string]any{}
-	for k, v := range obj.(map[string]any) {
-		asMap[k] = v
-	}
-
-	fieldsInOrder := [...]string{"messages"}
-	for _, k := range fieldsInOrder {
-		v, ok := asMap[k]
-		if !ok {
-			continue
-		}
-		switch k {
-		case "messages":
-			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("messages"))
-			data, err := ec.unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInputᚄ(ctx, v)
-			if err != nil {
-				return it, err
-			}
-			it.Messages = data
-		}
-	}
-	return it, nil
-}
-
-func (ec *executionContext) unmarshalInputChatMessageInput(ctx context.Context, obj any) (model.ChatMessageInput, error) {
-	var it model.ChatMessageInput
-	if obj == nil {
-		return it, nil
-	}
-
-	asMap := map[string]any{}
-	for k, v := range obj.(map[string]any) {
-		asMap[k] = v
-	}
-
-	fieldsInOrder := [...]string{"role", "content"}
-	for _, k := range fieldsInOrder {
-		v, ok := asMap[k]
-		if !ok {
-			continue
-		}
-		switch k {
-		case "role":
-			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("role"))
-			data, err := ec.unmarshalNString2string(ctx, v)
-			if err != nil {
-				return it, err
-			}
-			it.Role = data
-		case "content":
-			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("content"))
-			data, err := ec.unmarshalNString2string(ctx, v)
-			if err != nil {
-				return it, err
-			}
-			it.Content = data
-		}
-	}
-	return it, nil
-}
-
 // endregion **************************** input.gotpl *****************************
 
 // region    ************************** interface.gotpl ***************************
@@ -9797,50 +9582,6 @@ func (ec *executionContext) _AuthState(ctx context.Context, sel ast.SelectionSet
 			}
 		case "identity":
 			out.Values[i] = ec._AuthState_identity(ctx, field, obj)
-		default:
-			panic("unknown field " + strconv.Quote(field.Name))
-		}
-	}
-	out.Dispatch(ctx)
-	if out.Invalids > 0 {
-		return graphql.Null
-	}
-
-	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
-
-	for label, dfs := range deferred {
-		ec.ProcessDeferredGroup(graphql.DeferredGroup{
-			Label:    label,
-			Path:     graphql.GetPath(ctx),
-			FieldSet: dfs,
-			Context:  ctx,
-		})
-	}
-
-	return out
-}
-
-var chatChunkImplementors = []string{"ChatChunk"}
-
-func (ec *executionContext) _ChatChunk(ctx context.Context, sel ast.SelectionSet, obj *model.ChatChunk) graphql.Marshaler {
-	fields := graphql.CollectFields(ec.OperationContext, sel, chatChunkImplementors)
-
-	out := graphql.NewFieldSet(fields)
-	deferred := make(map[string]*graphql.FieldSet)
-	for i, field := range fields {
-		switch field.Name {
-		case "__typename":
-			out.Values[i] = graphql.MarshalString("ChatChunk")
-		case "delta":
-			out.Values[i] = ec._ChatChunk_delta(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
-		case "done":
-			out.Values[i] = ec._ChatChunk_done(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -12439,8 +12180,6 @@ func (ec *executionContext) _Subscription(ctx context.Context, sel ast.Selection
 		return ec._Subscription_clusterCachedDataEventsWatch(ctx, fields[0])
 	case "clusterCachedDataObjectsWatch":
 		return ec._Subscription_clusterCachedDataObjectsWatch(ctx, fields[0])
-	case "chatStream":
-		return ec._Subscription_chatStream(ctx, fields[0])
 	case "authStateWatch":
 		return ec._Subscription_authStateWatch(ctx, fields[0])
 	default:
@@ -12855,45 +12594,6 @@ func (ec *executionContext) marshalNBoolean2bool(ctx context.Context, sel ast.Se
 		}
 	}
 	return res
-}
-
-func (ec *executionContext) marshalNChatChunk2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v model.ChatChunk) graphql.Marshaler {
-	return ec._ChatChunk(ctx, sel, &v)
-}
-
-func (ec *executionContext) marshalNChatChunk2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatChunk(ctx context.Context, sel ast.SelectionSet, v *model.ChatChunk) graphql.Marshaler {
-	if v == nil {
-		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
-			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
-		}
-		return graphql.Null
-	}
-	return ec._ChatChunk(ctx, sel, v)
-}
-
-func (ec *executionContext) unmarshalNChatInput2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatInput(ctx context.Context, v any) (model.ChatInput, error) {
-	res, err := ec.unmarshalInputChatInput(ctx, v)
-	return res, graphql.ErrorOnPath(ctx, err)
-}
-
-func (ec *executionContext) unmarshalNChatMessageInput2ᚕᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInputᚄ(ctx context.Context, v any) ([]*model.ChatMessageInput, error) {
-	var vSlice []any
-	vSlice = graphql.CoerceList(v)
-	var err error
-	res := make([]*model.ChatMessageInput, len(vSlice))
-	for i := range vSlice {
-		ctx := graphql.WithPathContext(ctx, graphql.NewPathWithIndex(i))
-		res[i], err = ec.unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInput(ctx, vSlice[i])
-		if err != nil {
-			return nil, err
-		}
-	}
-	return res, nil
-}
-
-func (ec *executionContext) unmarshalNChatMessageInput2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋgraphᚋmodelᚐChatMessageInput(ctx context.Context, v any) (*model.ChatMessageInput, error) {
-	res, err := ec.unmarshalInputChatMessageInput(ctx, v)
-	return &res, graphql.ErrorOnPath(ctx, err)
 }
 
 func (ec *executionContext) marshalNCluster2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐCluster(ctx context.Context, sel ast.SelectionSet, v clustersvc.Cluster) graphql.Marshaler {

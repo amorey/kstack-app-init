@@ -2,21 +2,6 @@
 
 package model
 
-// Streaming chat chunk. `delta` is the next piece of assistant text; `done` is true on the final frame (delta may be empty).
-type ChatChunk struct {
-	Delta string `json:"delta"`
-	Done  bool   `json:"done"`
-}
-
-type ChatInput struct {
-	Messages []*ChatMessageInput `json:"messages"`
-}
-
-type ChatMessageInput struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
 // The connecting principal's effective RBAC in one namespace (live
 // SelfSubjectRulesReview). Namespace-scoped (the API has no all-namespaces form)
 // and point-in-time — for UI/debugging, not authoritative for access decisions.

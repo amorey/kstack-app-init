@@ -144,7 +144,6 @@ The current picture â€” boundaries, and which protections a test actually pins â
 **Each item has a spec.** They live in [`docs/specs/`](specs/), numbered in build order, and are not
 repeated here:
 
-5. [Drop the two grants with no consumer](specs/5-drop-ungranted-authority.md)
 6. [An unverified cluster connection says so](specs/6-surface-unverified-tls.md)
 7. [Endpoints come from arguments, not environment](specs/7-endpoints-as-arguments.md)
 8. [Updates say what they actually are](specs/8-updates-say-what-they-are.md)

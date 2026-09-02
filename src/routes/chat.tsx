@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { useRef, useState } from 'react';
 import { createRoute } from '@tanstack/react-router';
 
 import { Button } from '@kubetail/ui/elements/button';
 import { Input } from '@kubetail/ui/elements/input';
 
-import { graphql } from '@/gql';
 import { CenteredColumn } from '@/components/widgets/centered-column';
-import { useWatchSubscription } from '@/lib/graphql/use-watch-subscription';
 import { Route as appRoute } from '@/routes/_app';
 
 export const Route = createRoute({
@@ -29,108 +26,21 @@ export const Route = createRoute({
   component: Chat,
 });
 
-const ChatStreamSubscription = graphql(`
-  subscription ChatStream($input: ChatInput!) {
-    chatStream(input: $input) {
-      delta
-      done
-    }
-  }
-`);
-
-type Msg = { id: string; from: 'user' | 'assistant'; content: string };
-
+// A placeholder until the assistant is built. The route stays mounted so it remains
+// deep-linkable and the sidebar's mode switch keeps working; the composer is inert
+// because there is nothing behind it.
 function Chat() {
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [draft, setDraft] = useState('');
-  // `pending` set = subscription active, `streamed` = in-flight assistant text. On
-  // `done`, finalize + clear in one handler call — React batches the setStates, so
-  // the streaming and finalized bubbles never co-exist for a frame.
-  const [pending, setPending] = useState<Msg[] | null>(null);
-  const [streamed, setStreamed] = useState('');
-  // Guards duplicate `done` deliveries (StrictMode double-mount, late frames).
-  const finishedRef = useRef(true);
-
-  useWatchSubscription(
-    {
-      query: ChatStreamSubscription,
-      variables: {
-        input: { messages: (pending ?? []).map((m) => ({ role: m.from, content: m.content })) },
-      },
-      pause: pending === null,
-    },
-    // On transport reconnect the accumulator resets and the stream restarts from the top.
-    (prev: string | undefined, frames) => {
-      let next = prev ?? '';
-      frames.forEach(({ chatStream: chunk }) => {
-        next += chunk.delta;
-        if (!chunk.done) return;
-        if (finishedRef.current) return;
-        finishedRef.current = true;
-        setMessages((m) => [...m, { id: crypto.randomUUID(), from: 'assistant', content: next }]);
-        setStreamed('');
-        setPending(null);
-      });
-      // Once for the batch, after the fold — every earlier value is a frame nobody paints.
-      if (!finishedRef.current) setStreamed(next);
-      return next;
-    },
-  );
-
-  const send = () => {
-    const text = draft.trim();
-    if (!text || pending) return;
-    const next: Msg[] = [...messages, { id: crypto.randomUUID(), from: 'user', content: text }];
-    finishedRef.current = false;
-    setMessages(next);
-    setDraft('');
-    setStreamed('');
-    setPending(next);
-  };
-
   return (
     <CenteredColumn>
-      <div className="flex-1 space-y-3 overflow-y-auto">
-        {messages.length === 0 && !pending && <p className="text-sm text-muted-foreground">Say hi to start a chat.</p>}
-        {messages.map((m) => (
-          <Bubble key={m.id} from={m.from}>
-            {m.content}
-          </Bubble>
-        ))}
-        {pending && <Bubble from="assistant">{streamed || '…'}</Bubble>}
+      <div className="flex-1 overflow-y-auto">
+        <p className="text-sm text-muted-foreground">Chat isn&apos;t available yet.</p>
       </div>
-      <form
-        className="flex gap-2"
-        onSubmit={(e) => {
-          e.preventDefault();
-          send();
-        }}
-      >
-        <Input
-          value={draft}
-          onChange={(e) => setDraft(e.currentTarget.value)}
-          placeholder="Message…"
-          disabled={!!pending}
-          className="bg-sidebar"
-        />
-        <Button type="submit" disabled={!!pending || !draft.trim()}>
+      <form className="flex gap-2" onSubmit={(e) => e.preventDefault()}>
+        <Input value="" readOnly placeholder="Message…" disabled className="bg-sidebar" />
+        <Button type="submit" disabled>
           Send
         </Button>
       </form>
     </CenteredColumn>
-  );
-}
-
-function Bubble({ from, children }: { from: 'user' | 'assistant'; children: React.ReactNode }) {
-  return (
-    <div
-      className={
-        from === 'user'
-          ? 'ml-auto max-w-[80%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground whitespace-pre-wrap'
-          : 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2 text-sm whitespace-pre-wrap'
-      }
-    >
-      {children}
-    </div>
   );
 }

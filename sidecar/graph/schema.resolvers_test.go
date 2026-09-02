@@ -1309,3 +1309,16 @@ func TestAnAbsentTimestampSerializesAsNull(t *testing.T) {
 	assert.Contains(t, frame.data, `"firstSeen":null`)
 	assert.Contains(t, frame.data, `"lastSeen":"2026-08-30T12:00:00Z"`)
 }
+
+// --- Chat ---
+
+// No assistant surface is served. The schema is the grant: an entry point that
+// exists is one an operation can reach, whatever the resolver behind it does.
+func TestChatStreamIsNotOnTheSchema(t *testing.T) {
+	srv := httptest.NewServer(graph.NewServer(&graph.Resolver{Auth: newFakeAuth(auth.Identity{})}))
+	t.Cleanup(srv.Close)
+
+	raw := string(postGQL(t, srv.URL, `{"query":"subscription { chatStream(input: {messages: []}) { delta } }"}`))
+
+	assert.Contains(t, raw, "Cannot query field \\\"chatStream\\\"")
+}

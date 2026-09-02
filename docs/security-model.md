@@ -56,10 +56,10 @@ nothing stops the next change undoing it. **Not built** links the work.
 | ID tokens verified against the JWKS; the unverified decode is display-only | `sidecar/internal/auth/oauth/oauth.go` | **Held by review** — a comment is the only fence |
 | Tokens never appear on the GraphQL surface | `sidecar/graph/schema.graphqls` | **Held by review** |
 | Every non-watch Kubernetes request carries an idle-read bound | `kubeconn/idletimeout.go` | **Held by review** |
+| No authority granted ahead of a consumer | `src-tauri/capabilities/default.json`, `sidecar/graph/schema.graphqls` | **Held by review** — a capability file and a schema are reviewed, not tested |
 | Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [spec 12](specs/12-decide-what-the-cache-is.md) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
 | Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
-| No authority granted ahead of a consumer (`opener:default`, `chatStream`) | — | **Not built** — [spec 5](specs/5-drop-ungranted-authority.md) |
 | An unverified cluster connection is visible in the UI | — | **Not built** — [spec 6](specs/6-surface-unverified-tls.md) |
 | Cloud and OAuth endpoints come from the host's arguments, not from inherited environment | — | **Not built** — [spec 7](specs/7-endpoints-as-arguments.md) |
 | The host forwards only operations the app ships | — | **Not built** — [spec 11](specs/11-allowlist-graphql-operations.md) |

@@ -46,7 +46,6 @@ spec's header says otherwise. They come from
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [5 · Drop the two grants with no consumer](5-drop-ungranted-authority.md) | host · sidecar · frontend | Planned |
 | [6 · An unverified cluster connection says so](6-surface-unverified-tls.md) | sidecar · frontend | Planned |
 | [7 · Endpoints come from arguments, not environment](7-endpoints-as-arguments.md) | host · sidecar · build · ci | Planned |
 | [8 · Updates say what they actually are](8-updates-say-what-they-are.md) | host · docs · ci | Planned |

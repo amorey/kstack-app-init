@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # The app's whole GraphQL surface, grouped by noun: shared vocabulary first, then
-# Cluster, ClusterCache, cluster data, chat, and the cloud account, with the root
+# Cluster, ClusterCache, cluster data, and the cloud account, with the root
 # operation types collected at the end.
 #
 # --- Shared vocabulary ---
@@ -838,24 +838,6 @@ type ClusterCachedDataObjectWatchFrame {
   resource: String!
 }
 
-# --- Chat ---
-# The assistant surface.
-
-input ChatMessageInput {
-  role: String!
-  content: String!
-}
-
-input ChatInput {
-  messages: [ChatMessageInput!]!
-}
-
-"Streaming chat chunk. `delta` is the next piece of assistant text; `done` is true on the final frame (delta may be empty)."
-type ChatChunk {
-  delta: String!
-  done: Boolean!
-}
-
 # --- Cloud account ---
 # The sidecar-owned sign-in and the state it publishes. Tokens never appear here: the projection carries only the sign-in bit and the verified
 # claims.
@@ -937,7 +919,7 @@ type Subscription {
   # set, closes that snapshot with one Bookmark, then streams changes (DeltaFrameType) —
   # so a consumer renders an empty state only after the Bookmark. A GAUGE is
   # current-on-subscribe: its first value IS the snapshot, and no Bookmark rides it.
-  # Every subscription here is endless; chatStream alone completes.
+  # Every subscription here is endless.
 
   # --- Any object ---
   "Any record's event timeline — `Cluster`, `ClusterCache`, `ClusterCachedKind` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field."
@@ -986,10 +968,6 @@ type Subscription {
     apiVersion: String!
     resource: String!
   ): ClusterCachedDataObjectWatchFrame!
-
-  # --- Chat ---
-  "Streams the assistant's reply token-by-token. Completes after a frame with `done: true`."
-  chatStream(input: ChatInput!): ChatChunk!
 
   # --- Cloud account ---
   "Authentication state as a gauge: a fresh snapshot on every sign-in, sign-out, and refresh failure."

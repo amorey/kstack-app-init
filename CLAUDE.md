@@ -81,7 +81,7 @@ React 19 + TanStack Router + [urql] (GraphQL) + Vite + Tailwind v4. UI primitive
 
 ### Routing & layout
 
-- Entry: `src/main.tsx` → `RouterProvider`. Routes in `src/routes/` (code-based, wired in `src/routeTree.ts`): `__root.tsx` mounts the provider stack; `_app.tsx` is a pathless layout route rendering `AppLayout` (the sidebar shell); `chat.tsx` and `dashboard.tsx` nest under it as peer routes. `index.tsx` (`/`) just redirects to `DEFAULT_ROUTE`. The Chat/Dashboard switch is the sidebar's `ModeNav` (router `Link`s), so each mode is a real, deep-linkable route.
+- Entry: `src/main.tsx` → `RouterProvider`. Routes in `src/routes/` (code-based, wired in `src/routeTree.ts`): `__root.tsx` mounts the provider stack; `_app.tsx` is a pathless layout route rendering `AppLayout` (the sidebar shell); `chat.tsx` and `dashboard.tsx` nest under it as peer routes. `index.tsx` (`/`) just redirects to `DEFAULT_ROUTE`. `chat.tsx` is a placeholder — there is no assistant, and no GraphQL surface behind one. The Chat/Dashboard switch is the sidebar's `ModeNav` (router `Link`s), so each mode is a real, deep-linkable route.
 - **Layouts** live in `src/layouts/` — presentational shells rendering an `Outlet`. Secondary windows (log tail, exec) will get their own sidebar-less layout under a separate pathless route; a Tauri window opens at that route's path.
 - App-wide concerns live in `src/lib/` (auth, error bus, sync-status, kube-config, ready-gate, `platform.ts`, `host-file.ts`, `theme.tsx`); reusable UI in `src/components/widgets/`.
 

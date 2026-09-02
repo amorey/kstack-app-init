@@ -69,7 +69,7 @@ func (r *clusterCachedKindResolver) Events(ctx context.Context, obj *clustersvc.
 // SyncEnabled is the resolver for the syncEnabled field: the wire's positive form over the
 // stored Paused. The storage field is inverted so a record written before it decodes as
 // syncing rather than stopping the fleet on the upgrade; this is the one negation.
-func (r *clusterCachedKindSpecResolver) SyncEnabled(_ context.Context, obj *clustersvc.ClusterCachedKindSpec) (bool, error) {
+func (r *clusterCachedKindSpecResolver) SyncEnabled(ctx context.Context, obj *clustersvc.ClusterCachedKindSpec) (bool, error) {
 	return !obj.Paused, nil
 }
 
@@ -312,11 +312,6 @@ func (r *subscriptionResolver) ClusterCachedDataObjectsWatch(ctx context.Context
 		return nil, err
 	}
 	return watchStream(ctx, stream), nil
-}
-
-// ChatStream is the resolver for the chatStream field.
-func (r *subscriptionResolver) ChatStream(ctx context.Context, input model.ChatInput) (<-chan *model.ChatChunk, error) {
-	panic(fmt.Errorf("not implemented: ChatStream - chatStream"))
 }
 
 // AuthStateWatch is the resolver for the authStateWatch field; the stream is
