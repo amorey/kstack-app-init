@@ -599,6 +599,23 @@ func TestTickNeverRepeatsAnInstant(t *testing.T) {
 	assert.True(t, e.tick().After(first), "a repeated reading cannot say a second run happened")
 }
 
+// Now shares the clock the stamps come from, so a baseline read off it orders exactly against
+// them — which is what a caller waiting for the run it asked for compares. The wall clock cannot
+// answer that: tick's nudge can put a stamp ahead of a later wall reading.
+func TestNowOrdersAgainstTheStampsItShares(t *testing.T) {
+	e, p, id := single(t, Succeeded())
+	e.Add(subj)
+	e.settle()
+	runNext(t, e)
+	assert.True(t, e.Now().After(att(t, e, id).LastRunAt), "a run that finished before the ask is behind it")
+
+	askedAt := e.Now()
+	p.set(Succeeded())
+	e.Wake(subj, "conn")
+	runNext(t, e)
+	assert.False(t, att(t, e, id).LastRunAt.Before(askedAt), "and the run after the ask answers it")
+}
+
 // A Skip leaves no record, so LastAttempt cannot say a run happened at all. LastRunAt is what
 // does — the level a caller waiting on a run of its own reads, whatever that run concluded.
 func TestASkipStampsTheRunItLeftNoRecordOf(t *testing.T) {

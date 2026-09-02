@@ -418,6 +418,14 @@ func (e *Supervisor) tick() time.Time {
 	return now
 }
 
+// Now reads the clock the supervisor stamps its runs with — for a caller taking a baseline to
+// compare against those stamps, which must not be the wall clock: tick nudges a repeated instant
+// forward, so the two can disagree.
+//
+// Reading it advances the clock, which is what makes the comparison exact: every stamp issued
+// before this reading is behind it, and every one after is ahead.
+func (e *Supervisor) Now() time.Time { return e.tick() }
+
 // OnPass sets the callback the supervisor fires after every pass, with the Snapshot that pass
 // produced. Called outside the supervisor's lock but serialized per subject; it must not block.
 // Wiring, not state — set it before Start, like a registration.

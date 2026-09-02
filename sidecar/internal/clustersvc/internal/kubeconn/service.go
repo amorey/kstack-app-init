@@ -232,7 +232,10 @@ func (s *Service) retryAndWait(ctx context.Context, contextName string, ceiling 
 	sub := lease.WatchState()
 	defer sub.Close()
 
-	askedAt := time.Now()
+	// The supervisor's clock, because LastRunAt is stamped from it and it is not the wall
+	// clock: a baseline read off the wall could sit behind a stamp already issued, and a run
+	// that finished before the ask would answer it.
+	askedAt := s.supervisor.Now()
 	s.supervisor.Wake(contextName, probeNames[:]...)
 
 	// The caller's context is the only bound until the run begins.
