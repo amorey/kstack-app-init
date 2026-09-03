@@ -72,7 +72,7 @@ Two shapes are *not* magic sleeps, and both must say so in a comment:
 The whole picture is [`docs/security-model.md`](docs/security-model.md). What an ordinary frontend change can break:
 
 - **Anything running in the webview holds the full cluster surface.** `graphql_query` forwards the operation string unexamined, so a dependency that executes is a dependency that can read every mirrored object and call every mutation. The CSP in `src-tauri/tauri.conf.json` is the containment — never widen `script-src`/`connect-src` to a remote origin, and never load a script the bundle doesn't ship.
-- **Cluster data is attacker-controlled text.** Names, labels, annotations and event messages come from whoever controls the cluster. `src/` has no HTML sink — no `innerHTML`, no `dangerouslySetInnerHTML`, no `eval` — and the `custom/no-html-sinks` config object in `eslint.config.ts` fails the lint on one. Printer columns go through the restricted reader in `src/lib/jsonpath.ts`, never a template engine.
+- **Cluster data is attacker-controlled text.** Names, labels, annotations and event messages come from whoever controls the cluster. `src/` has no HTML sink — no `innerHTML`, no `dangerouslySetInnerHTML`, no `eval` — and the `custom/cluster-data-is-text` config object in `eslint.config.ts` fails the lint on one. Printer columns go through the restricted reader in `src/lib/jsonpath.ts`; the same config object refuses a template engine, by import and by call.
 - **The log-tail and exec windows inherit this.** When they land, treat their output as untrusted bytes: no HTML interpretation, and strip terminal control sequences.
 
 ## Frontend (`src/`)

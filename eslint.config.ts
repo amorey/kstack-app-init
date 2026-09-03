@@ -94,12 +94,18 @@ const customRulesConfig = [
   },
 ];
 
-// Everything the webview displays is text chosen by whoever controls the cluster, so an HTML sink
-// in `src/` hands a hostile cluster script execution in a page that holds the whole cluster
-// surface. Scoped rather than folded into `custom/rules`, which has no `files`.
-const htmlSinksConfig = [
+const TEMPLATE_ENGINE_MESSAGE =
+  'Cluster data is attacker-controlled text; read it with `src/lib/jsonpath.ts`, never a template engine.';
+
+// Everything the webview displays is text chosen by whoever controls the cluster, so anything in
+// `src/` that turns that text into markup hands a hostile cluster script execution in a page that
+// holds the whole cluster surface. Two shapes are banned: the DOM's HTML sinks, and a template
+// engine — printer columns are read by `src/lib/jsonpath.ts`, and an engine is how a jsonPath
+// starts being interpolated instead. Scoped rather than folded into `custom/rules`, which has no
+// `files`.
+const clusterDataIsTextConfig = [
   {
-    name: 'custom/no-html-sinks',
+    name: 'custom/cluster-data-is-text',
     files: ['src/**/*.{ts,tsx}'],
     rules: {
       // airbnb ships this as a warning, and a warning does not fail `pnpm lint`.
@@ -128,6 +134,37 @@ const htmlSinksConfig = [
         // Belt and braces: the CSP already refuses these at runtime.
         { selector: "CallExpression[callee.name='eval']", message: 'No eval in the webview.' },
         { selector: "NewExpression[callee.name='Function']", message: 'No eval in the webview.' },
+        // A template engine by hand: `template(src)(data)`, whatever it was imported as.
+        {
+          selector: "CallExpression[callee.name='template'], CallExpression[callee.property.name='template']",
+          message: TEMPLATE_ENGINE_MESSAGE,
+        },
+      ],
+      // airbnb turns both this and its typescript-eslint twin off, so there are no options to
+      // restate here.
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: [
+                'handlebars',
+                'handlebars/*',
+                'mustache',
+                'ejs',
+                'nunjucks',
+                'pug',
+                'eta',
+                'liquidjs',
+                'dot',
+                'dot/*',
+                'lodash/template',
+                'lodash.template',
+              ],
+              message: TEMPLATE_ENGINE_MESSAGE,
+            },
+          ],
+        },
       ],
     },
   },
@@ -142,5 +179,5 @@ export default [
   ...prettierConfig,
   ...reactRefreshConfig,
   ...customRulesConfig,
-  ...htmlSinksConfig,
+  ...clusterDataIsTextConfig,
 ];

@@ -159,11 +159,11 @@ distinguishable from an unnoticed one. **Decided against:**
 
 **Without a spec yet:**
 
-- **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Four rows
+- **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Three rows
   in [`security-model.md`](security-model.md) are true today with nothing holding them. None wants a
-  design; each wants one rule, a type, or a decision — which is why this is one item rather than
-  four. Two of them end this pass still held by review, and the point of doing it is that they stop
-  reading like the two that can be fenced.
+  design; each wants a type or a decision — which is why this is one item rather than three. One of
+  them ends this pass still held by review, and the point of doing it is that it stops reading like
+  the two that can be fenced.
 
   **The rule the first pass set, and the only part worth insisting on: prove every fence by breaking
   the thing it guards.** A green test proves less than a red one — the CSP test was checked against a
@@ -171,14 +171,6 @@ distinguishable from an unnoticed one. **Decided against:**
   and the log test by adding `"variables", oc.Variables` to the presenter and watching the sentinel
   appear. Move each row to **Enforced** naming its test in the same change, and shorten this item to
   the rows still standing.
-
-  - **Printer columns go through the restricted reader** — lint, not a test.
-    `src/lib/jsonpath.test.ts` already pins the reader's behaviour, so what is unfenced is a *future
-    template engine*, not the current code. Extend the `custom/no-html-sinks` config object in
-    `eslint.config.ts`; decide first whether the rule bans the import (a dependency arriving) or the
-    call (a helper someone writes by hand) — the honest answer is probably both, and the rule's name
-    should then say what it protects rather than how. Break it with a scratch file that interpolates
-    into a template and confirm `pnpm lint` fails.
 
   - **The unverified ID-token decode is display-only** — types, not a test, and **read before
     writing**: `oauth.ParseIdentityUnverified` has exactly one production caller
