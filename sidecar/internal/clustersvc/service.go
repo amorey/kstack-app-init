@@ -523,6 +523,9 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 	// one feed carrying both would wake a cache for each of its hundreds of kinds.
 	syncCacheTrigger := newKubesyncDiscoveryTrigger(d.kubesyncSvc)
 	syncKindTrigger := newKubesyncKindTrigger(d.kubesyncSvc)
+	// A second feed onto the cache kind: the store speaks of files and the sync of
+	// discovery, and one channel carrying both would be a translation neither owns.
+	sizeLimitTrigger := newKubestoreSizeLimitTrigger(d.kubestoreMgr)
 
 	source := &clusterSourceController{deps: d}
 	cluster := &clusterController{deps: d}
@@ -531,7 +534,8 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 
 	errSource := beehive.Register(bh, ClusterSourceGroupKind, source, startupPass, sourceResync, beehive.WithTriggerByName(kubeconfigTrigger.Wakes()))
 	errCluster := beehive.Register(bh, ClusterGroupKind, cluster, startupPass, clusterResync, beehive.WithTriggerByName(kubeconnTrigger.Wakes()))
-	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass, beehive.WithTriggerByID(syncCacheTrigger.Wakes()))
+	errCache := beehive.Register(bh, ClusterCacheGroupKind, cache, startupPass,
+		beehive.WithTriggerByID(syncCacheTrigger.Wakes()), beehive.WithTriggerByID(sizeLimitTrigger.Wakes()))
 	errResource := beehive.Register(bh, ClusterCachedKindGroupKind, resource, startupPass, beehive.WithTriggerByName(syncKindTrigger.Wakes()))
 	if err := errors.Join(errSource, errCluster, errCache, errResource); err != nil {
 		return nil, err
@@ -541,6 +545,7 @@ func registerControllers(bh *beehive.Beehive, d deps) ([]lifecycle.Part, error) 
 		{Name: "cluster controller", StartCloser: cluster},
 		{Name: "cache controller", StartCloser: cache},
 		{Name: "cached-resource controller", StartCloser: resource},
+		{Name: "kubestore size-limit trigger", StartCloser: lifecycle.StartFunc(sizeLimitTrigger.Start)},
 		{Name: "kubeconfig trigger", StartCloser: lifecycle.StartFunc(kubeconfigTrigger.Start)},
 		{Name: "kubeconn trigger", StartCloser: lifecycle.StartFunc(kubeconnTrigger.Start)},
 		{Name: "kubesync cache trigger", StartCloser: lifecycle.StartFunc(syncCacheTrigger.Start)},

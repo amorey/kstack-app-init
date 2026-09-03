@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"time"
@@ -432,9 +433,13 @@ func (a cachesAPI) measureCache(ctx context.Context, cacheID ClusterCacheID) (Cl
 	}, nil
 }
 
-// WatchHealth reports each live cache's verdict. A read-side projection, never a stored
-// condition: nothing in the object graph reacts to it, and storing it would wake the
-// cache and every watcher each time its verdict moved.
+// WatchHealth reports each live cache's verdict. A read-side projection of the per-kind
+// states, which are the workers' own and change constantly: storing those would wake the
+// cache and every watcher each time one moved.
+//
+// The one condition it reads back is the size ceiling's, because that verdict is a decision
+// the cache's pass made and wrote down — and the pause it records outlives the file it was
+// made on, which no live read could answer for.
 //
 // It re-emits on a cadence, which is what carries the stamps a filled cache reports: those
 // move in healthy steady state precisely when a change signal would be silent.
@@ -474,8 +479,12 @@ func (a cachesAPI) WatchHealth(ctx context.Context) (*Stream[ClusterCacheHealth]
 // **No answer is not an empty answer.** A kind whose worker has committed nothing is not one
 // that stopped syncing — a cache still starting, a clear in progress — so it is neither an
 // offender nor proof of health: the cache reads as connecting until every kind has spoken.
-func (a cachesAPI) readCacheHealth(ctx context.Context, cacheID ClusterCacheID) (ClusterCacheHealth, error) {
-	kindObjs, err := a.s.kindClient.ListOwnedObjects(ctx, beehive.ObjectID(cacheID))
+func (a cachesAPI) readCacheHealth(
+	ctx context.Context,
+	cacheObj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
+) (ClusterCacheHealth, error) {
+	cacheID := ClusterCacheID(cacheObj.ID)
+	kindObjs, err := a.s.kindClient.ListOwnedObjects(ctx, cacheObj.ID)
 	if err != nil {
 		return ClusterCacheHealth{}, fmt.Errorf("list cluster cache %d cached kinds: %w", cacheID, err)
 	}
@@ -537,6 +546,12 @@ func (a cachesAPI) readCacheHealth(ctx context.Context, cacheID ClusterCacheID) 
 	}
 
 	switch {
+	case FindCondition(cacheObj.Conditions, ConditionSynced) != nil:
+		// The cache's own decision, above every arm below: a cache stopped at its size
+		// ceiling has armed nothing, and a cache that is also paused kind by kind would
+		// otherwise read as merely paused — which is the one thing the two reasons are
+		// kept apart to prevent.
+		health.Reason = ReasonSizeLimit
 	case health.PausedKinds == health.TotalKinds && health.TotalKinds > 0:
 		// Ahead of every arm below: paused kinds are skipped, so a fully paused cache has
 		// no offenders and nothing unanswered — and the Watching arm would call it healthy.
@@ -722,6 +737,15 @@ func (a cachesAPI) Clear(ctx context.Context, id ClusterCacheID) (*ClusterCache,
 	}); err != nil {
 		return nil, fmt.Errorf("clear cluster cache %d: %w", id, err)
 	}
+
+	// The pass has to be told: an empty file wakes nothing on its own, and a cache stopped
+	// at its ceiling holds no claim — so nothing reopens it, no janitor sweeps it, and no
+	// verdict follows. The backoff goes with the requeue, since a clear is precisely what
+	// proves an earlier pass's verdict stale. Logged rather than returned: the clear landed,
+	// and a failure here is a record already gone or a process already stopping.
+	if err := a.s.cacheClient.Requeue(ctx, beehive.ObjectID(id), beehive.WithResetBackoff()); err != nil {
+		slog.Warn("cluster cache: requeue after clear failed", "cacheID", id, "err", err)
+	}
 	return toClusterCache(obj)
 }
 
@@ -759,7 +783,7 @@ func (a cachesAPI) readAllCacheHealth(ctx context.Context) ([]ClusterCacheHealth
 			healths = append(healths, ClusterCacheHealth{CacheID: cacheID, Status: ConditionFalse, Reason: ReasonPaused})
 			continue
 		}
-		health, err := a.readCacheHealth(ctx, cacheID)
+		health, err := a.readCacheHealth(ctx, cacheObj)
 		if err != nil {
 			return nil, err
 		}
@@ -871,7 +895,11 @@ func (c *clusterCacheController) Reconcile(
 		return beehive.Settled()
 	}
 
-	if err := c.armSync(ctx, client, obj); err != nil {
+	limited, measured := c.checkSizeLimit(ctx, obj)
+	if err := c.reportSizeLimit(ctx, client, obj, limited, measured); err != nil {
+		return beehive.Fail(err)
+	}
+	if err := c.armSync(ctx, client, obj, limited); err != nil {
 		return beehive.Fail(err)
 	}
 	if err := c.mirrorKinds(ctx, obj); err != nil {
@@ -885,6 +913,69 @@ func (c *clusterCacheController) Reconcile(
 	return beehive.Settled()
 }
 
+// checkSizeLimit answers whether this cache's sync stays off because its file is at its
+// ceiling, and hands back the measurement it decided on — nil when there was none.
+//
+// The janitor's verdict is the only way in, and the record's condition is what keeps the
+// cache there: pausing releases the store claim, which closes the file — and a closed file
+// reports OverSizeLimit false, so a pass reading the verdict alone would restart the cache
+// it had just stopped, refill it, and stop it again.
+//
+// Which is why the way out is the bytes rather than the verdict. Nothing writes a stopped
+// cache, so there is no WAL mid-checkpoint for a measurement and the janitor to disagree
+// over. A limit of zero is an unbounded manager or a file that is not there; both release.
+//
+// A measurement that failed decides nothing: answering under would restart a cache nobody
+// measured, and answering over would stop one over an error.
+func (c *clusterCacheController) checkSizeLimit(
+	ctx context.Context,
+	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
+) (bool, *kubestore.Stats) {
+	// Presence, not status: a liveness condition an earlier process wrote reads as Unknown
+	// until this pass re-confirms it, and reading that as "not stopped" would release every
+	// stopped cache on restart.
+	stopped := FindCondition(obj.Conditions, ConditionSynced) != nil
+
+	stats, err := c.kubestoreMgr.Stats(ctx, int64(obj.ID))
+	if err != nil {
+		slog.Warn("cluster cache: size check failed", "cacheID", obj.ID, "err", err)
+		return stopped, nil
+	}
+	if stopped {
+		return stats.SizeLimitBytes > 0 && stats.Bytes() > stats.SizeLimitBytes, &stats
+	}
+	return stats.OverSizeLimit, &stats
+}
+
+// reportSizeLimit keeps the record's Synced condition in step with the verdict above. It is
+// written while the cache is stopped — a restart needs the re-confirmation, since the
+// condition it left behind reads as Unknown — and deleted on the way out. A cache that was
+// never over its limit is written nothing, which is every cache on every pass.
+//
+// An unmeasured pass writes nothing either: it has no size to name, and what already stands
+// is the last measurement anyone took.
+func (c *clusterCacheController) reportSizeLimit(
+	ctx context.Context,
+	client beehive.ControllerClient[ClusterCacheStatus],
+	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
+	limited bool,
+	measured *kubestore.Stats,
+) error {
+	switch {
+	case limited && measured != nil:
+		cond := LiveCondition(ConditionSynced, ConditionFalse, ReasonSizeLimit,
+			fmt.Sprintf("cache is %d bytes, over its %d-byte limit", measured.Bytes(), measured.SizeLimitBytes))
+		if err := client.SetCondition(ctx, cond); err != nil {
+			return fmt.Errorf("set cluster cache %d size condition: %w", obj.ID, err)
+		}
+	case !limited && FindCondition(obj.Conditions, ConditionSynced) != nil:
+		if err := client.DeleteCondition(ctx, string(ConditionSynced)); err != nil {
+			return fmt.Errorf("clear cluster cache %d size condition: %w", obj.ID, err)
+		}
+	}
+	return nil
+}
+
 // armSync relays the pause switch onto the whole subtree, in one call each way. Arming is
 // policy and never interest: nothing a reader does starts a sync, and pausing writes no
 // record and requeues none — the kinds stay registered under kubesync, so a resume starts
@@ -896,6 +987,7 @@ func (c *clusterCacheController) armSync(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCacheStatus],
 	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
+	sizeLimited bool,
 ) error {
 	cacheID := int64(obj.ID)
 
@@ -914,7 +1006,7 @@ func (c *clusterCacheController) armSync(
 	// Only a kubeconfig-sourced record has credentials to dial over. Another source's are
 	// not this pass's to guess at, so nothing is armed rather than a session with no context.
 	kubeconfigSource := clusterObj.Spec.Source.Kubeconfig
-	if kubeconfigSource == nil || !cacheSyncEnabled(clusterObj, obj.Spec.ServerUID) {
+	if kubeconfigSource == nil || sizeLimited || !cacheSyncEnabled(clusterObj, obj.Spec.ServerUID) {
 		c.kubesyncSvc.ForgetDiscovery(cacheID)
 		return nil
 	}

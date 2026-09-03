@@ -151,13 +151,12 @@ repeated here:
 8. [Updates say what they actually are](specs/8-updates-say-what-they-are.md)
 10. [A kubeconfig exec plugin waits for approval](specs/10-approve-exec-credential-plugins.md)
 11. [The host sends only the operations the app ships](specs/11-allowlist-graphql-operations.md)
-14. [A cache over its ceiling stops growing](specs/14-stop-a-cache-over-its-size-ceiling.md)
 15. [A cache stops outliving the user's interest in its cluster](specs/15-cache-retention.md)
 
 An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
 distinguishable from an unnoticed one. **Decided against:** aging out cached events by their own
-TTL — 13 and 14 bound the whole file instead, and between relists events still accumulate without
-a bound of their own. → [bound the cache by total size](adr/2026-09-03-bound-the-cache-by-total-size.md)
+TTL — the whole-file ceiling bounds them instead, and between relists events still accumulate
+without a bound of their own. → [bound the cache by total size](adr/2026-09-03-bound-the-cache-by-total-size.md)
 
 **Without a spec yet:** the threat model's H-3. `src-tauri/entitlements.plist` sets
 `com.apple.security.cs.disable-library-validation` so the hardened runtime will exec the sidecar,

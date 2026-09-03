@@ -363,6 +363,8 @@ type cacheControllerClient struct {
 	beehive.ControllerClient[ClusterCacheStatus]
 	events       []beehive.EventSpec
 	dependencies []beehive.ObjectID
+	conditions   []Condition
+	deleted      []string
 	// dependErr and eventErr fail the two writes a pass makes through this client, which
 	// is the only way to reach what a pass does when one of them will not land.
 	dependErr error
@@ -372,6 +374,16 @@ type cacheControllerClient struct {
 func (c *cacheControllerClient) AddDependency(_ context.Context, toID beehive.ObjectID) error {
 	c.dependencies = append(c.dependencies, toID)
 	return c.dependErr
+}
+
+func (c *cacheControllerClient) SetCondition(_ context.Context, cond Condition) error {
+	c.conditions = append(c.conditions, cond)
+	return nil
+}
+
+func (c *cacheControllerClient) DeleteCondition(_ context.Context, conditionType string) error {
+	c.deleted = append(c.deleted, conditionType)
+	return nil
 }
 
 func (c *cacheControllerClient) AddEvent(_ context.Context, event beehive.EventSpec) error {
@@ -1754,7 +1766,7 @@ func TestTheSyncReadsSkipARecordAlreadyGoing(t *testing.T) {
 	require.NoError(t, d.kindClient.Delete(ctx, kind.ID))
 	a := cachesAPI{serviceOver(t, d)}
 
-	health, err := a.readCacheHealth(ctx, ClusterCacheID(cache.ID))
+	health, err := a.readCacheHealth(ctx, cache)
 	require.NoError(t, err)
 	status, err := a.readSyncStatus(ctx, ClusterCacheID(cache.ID))
 	require.NoError(t, err)
@@ -1770,7 +1782,7 @@ func TestTheSyncReadsReportRecordsTheyCannotList(t *testing.T) {
 	d, cache := cacheOverABrokenStore(t)
 	a := cachesAPI{serviceOver(t, d)}
 
-	_, healthErr := a.readCacheHealth(ctx, ClusterCacheID(cache.ID))
+	_, healthErr := a.readCacheHealth(ctx, cache)
 	_, statusErr := a.readSyncStatus(ctx, ClusterCacheID(cache.ID))
 
 	assert.ErrorContains(t, healthErr, "cached kinds")
@@ -1943,7 +1955,7 @@ func TestArmingReportsAClusterItCannotRead(t *testing.T) {
 
 	c := &clusterCacheController{deps: d}
 	_, loadErr := c.loadCluster(context.Background(), cache)
-	armErr := c.armSync(context.Background(), &cacheControllerClient{}, cache)
+	armErr := c.armSync(context.Background(), &cacheControllerClient{}, cache, false)
 
 	assert.ErrorContains(t, loadErr, "owner")
 	assert.ErrorContains(t, armErr, "owner")
@@ -2008,4 +2020,226 @@ func TestMeasureCacheCarriesTheSizeCeiling(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, got.OverSizeLimit)
 	assert.Equal(t, int64(512), got.SizeLimitBytes)
+}
+
+// --- the size ceiling ---
+
+// overLimit is a cache whose file has passed its ceiling, as the janitor reports it.
+func overLimit() kubestore.Stats {
+	return kubestore.Stats{Exists: true, DBBytes: 3 * gib, SizeLimitBytes: 2 * gib, OverSizeLimit: true}
+}
+
+// gib is the unit the ceiling is set in, so a fixture reads as a size.
+const gib = 1 << 30
+
+// A cache at its ceiling stops syncing, and the record is told why — the pause closes the
+// file, so the condition is the only thing that will still remember.
+func TestCachePassStopsACacheOverItsSizeLimit(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kubestoreFake(d).setStats(overLimit())
+
+	client := reconcileCache(t, d, cache)
+
+	_, armed := syncFake(d).armedDiscovery(int64(cache.ID))
+	assert.False(t, armed, "a cache at its ceiling syncs nothing")
+	require.Len(t, client.conditions, 1)
+	assert.Equal(t, string(ConditionSynced), client.conditions[0].Type)
+	assert.Equal(t, ConditionFalse, client.conditions[0].Status)
+	assert.Equal(t, ReasonSizeLimit, client.conditions[0].Reason)
+	assert.Contains(t, client.conditions[0].Message, "3221225472")
+	assert.Contains(t, client.conditions[0].Message, "2147483648")
+}
+
+// sizeStopped is the condition the pass writes when a cache hits its ceiling, as a record
+// that has already been stopped carries it into the next pass.
+func sizeStopped() []Condition {
+	return []Condition{LiveCondition(ConditionSynced, ConditionFalse, ReasonSizeLimit, "over")}
+}
+
+// The pause closes the file, and a closed file reports no verdict at all — so a pass that
+// read the verdict alone would restart the cache it had just stopped, refill it, and stop
+// it again. The record is what remembers.
+func TestCachePassKeepsACacheStoppedOnceItsFileIsClosed(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	cache.Conditions = sizeStopped()
+	closed := overLimit()
+	closed.OverSizeLimit = false
+	kubestoreFake(d).setStats(closed)
+
+	client := reconcileCache(t, d, cache)
+
+	_, armed := syncFake(d).armedDiscovery(int64(cache.ID))
+	assert.False(t, armed, "a stopped cache stays stopped while its bytes are over")
+	assert.Empty(t, client.deleted, "nothing releases a cache still over its limit")
+}
+
+// The verdict is the only way in. Bytes over the limit with no verdict behind them are a
+// file nobody has open, which cannot be growing — stopping it would stop caches nothing is
+// filling.
+func TestCachePassDoesNotStopACacheOnBytesAlone(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	closed := overLimit()
+	closed.OverSizeLimit = false
+	kubestoreFake(d).setStats(closed)
+
+	client := reconcileCache(t, d, cache)
+
+	_, armed := syncFake(d).armedDiscovery(int64(cache.ID))
+	assert.True(t, armed, "a cache nobody has open is not one that is filling")
+	assert.Empty(t, client.conditions)
+}
+
+// The release: a cleared or unbounded cache starts again, and the condition goes with it.
+func TestCachePassRestartsACacheBackUnderItsLimit(t *testing.T) {
+	tests := map[string]kubestore.Stats{
+		"cleared":   {},
+		"under":     {Exists: true, DBBytes: gib, SizeLimitBytes: 2 * gib},
+		"unbounded": {Exists: true, DBBytes: 9 * gib},
+	}
+
+	for name, stats := range tests {
+		t.Run(name, func(t *testing.T) {
+			d, status := newClusterStatusDeps(t)
+			cluster := storedCluster(t, d, status, true, "uid-1")
+			cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+			cache.Conditions = sizeStopped()
+			kubestoreFake(d).setStats(stats)
+
+			client := reconcileCache(t, d, cache)
+
+			_, armed := syncFake(d).armedDiscovery(int64(cache.ID))
+			assert.True(t, armed, "a cache back under its ceiling syncs again")
+			assert.Equal(t, []string{string(ConditionSynced)}, client.deleted)
+		})
+	}
+}
+
+// Every cache that was never over its limit is this case, on every pass: a condition write
+// per pass per cache would be a transaction for a verdict nothing formed.
+func TestCachePassWritesNoConditionForAnOrdinaryCache(t *testing.T) {
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kubestoreFake(d).setStats(kubestore.Stats{Exists: true, DBBytes: gib, SizeLimitBytes: 2 * gib})
+
+	client := reconcileCache(t, d, cache)
+
+	assert.Empty(t, client.conditions)
+	assert.Empty(t, client.deleted)
+}
+
+// A measurement that failed decides nothing: answering under would restart a cache nobody
+// measured, and answering over would stop one over an error.
+func TestTheSizeCheckLeavesAFailedMeasurementAlone(t *testing.T) {
+	tests := map[string]struct {
+		conditions []Condition
+		want       bool
+	}{
+		"a stopped cache stays stopped": {conditions: sizeStopped(), want: true},
+		"a running cache keeps running": {want: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d, status := newClusterStatusDeps(t)
+			cluster := storedCluster(t, d, status, true, "uid-1")
+			cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+			cache.Conditions = tt.conditions
+			kubestoreFake(d).err = assert.AnError
+
+			limited, measured := (&clusterCacheController{deps: d}).checkSizeLimit(context.Background(), cache)
+
+			assert.Equal(t, tt.want, limited)
+			assert.Nil(t, measured, "an unmeasured pass has no size to write")
+		})
+	}
+}
+
+// sizeStoppedCache is a synced cluster's cache whose record carries the ceiling's
+// condition, as the pass that stopped it left the record.
+func sizeStoppedCache(t *testing.T) (deps, ClusterCacheID) {
+	t.Helper()
+	d, bh := newTestDepsAndBeehive(t)
+	cluster := storedCluster(t, d, beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind), true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	admin := beehive.NewAdminClient[ClusterCacheStatus](bh, ClusterCacheGroupKind)
+	require.NoError(t, admin.SetCondition(context.Background(), cache.ID, sizeStopped()[0]))
+	return d, ClusterCacheID(cache.ID)
+}
+
+// The condition is where the ceiling's verdict lives, and the gauge is the only place the
+// UI looks — so the fold reads it back. Nothing else stops a cache without arming a kind
+// that could say so.
+func TestCachesWatchHealthReportsACacheStoppedByItsCeiling(t *testing.T) {
+	d, _ := sizeStoppedCache(t)
+
+	healths, err := cachesAPI{serviceOver(t, d)}.readAllCacheHealth(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, healths, 1)
+	assert.Equal(t, ConditionFalse, healths[0].Status)
+	assert.Equal(t, ReasonSizeLimit, healths[0].Reason)
+}
+
+// The arm ordering, the other way round: a cache that is both at its ceiling and paused
+// kind by kind is stopped by the ceiling, and reporting it as merely paused is the
+// confusion the two reasons exist to keep apart.
+func TestCachesWatchHealthReadsTheCeilingAboveAFullyPausedCache(t *testing.T) {
+	d, cacheID := sizeStoppedCache(t)
+	createKind(t, d, beehive.ObjectID(cacheID), podsSpec)
+	pauseKind(t, d, beehive.ObjectID(cacheID), podsSpec.APIVersion, podsSpec.Resource)
+
+	healths, err := cachesAPI{serviceOver(t, d)}.readAllCacheHealth(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, healths, 1)
+	assert.Equal(t, ReasonSizeLimit, healths[0].Reason)
+}
+
+// The user's remedy has to reach the pass. A stopped cache holds no claim, so Manager.Clear
+// reopens nothing: no file, no janitor, and no verdict to wake the record — the clear does
+// the waking itself, or the cache stays stopped until the next start.
+//
+// Everything here is arranged so the requeue is the only wake left. The record is stopped
+// before beehive starts, carrying the message the pass itself would write, so the startup
+// pass changes nothing and wakes nothing. The file then empties as the clear runs, so no
+// earlier pass could have released it either.
+func TestClearingACacheReleasesItsSizeStop(t *testing.T) {
+	ctx := context.Background()
+	d, bh := newTestDepsAndBeehive(t)
+	cluster := storedCluster(t, d, beehive.NewAdminClient[ClusterStatus](bh, ClusterGroupKind), true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	store := kubestoreFake(d)
+	store.setStats(overLimit())
+	store.onClear = func(int64) { store.setStats(kubestore.Stats{}) }
+	measured := testutil.NewProbe[int64](8)
+	store.onStats = measured.Fire
+	admin := beehive.NewAdminClient[ClusterCacheStatus](bh, ClusterCacheGroupKind)
+	require.NoError(t, admin.SetCondition(ctx, cache.ID, LiveCondition(ConditionSynced, ConditionFalse,
+		ReasonSizeLimit, "cache is 3221225472 bytes, over its 2147483648-byte limit")))
+	// The edge the pass declares, declared up front: a first pass that writes it would wake
+	// the record again, and this test's whole point is that nothing else does.
+	require.NoError(t, admin.AddDependency(ctx, cache.ID, cluster.ID))
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+	// Two passes, not one: settling the first is itself a write, and that write wakes the
+	// record once more. Waiting for the second is waiting for the quiet in which the only
+	// wake left is the clear's own.
+	require.Equal(t, int64(cache.ID), measured.Await(t, "the startup pass to measure the cache"))
+	require.Equal(t, int64(cache.ID), measured.Await(t, "the pass its settling woke"))
+
+	_, clearErr := serviceOver(t, d).Caches().Clear(ctx, ClusterCacheID(cache.ID))
+
+	require.NoError(t, clearErr)
+	require.Eventually(t, func() bool {
+		obj, err := d.cacheClient.Get(ctx, cache.ID)
+		return err == nil && FindCondition(obj.Conditions, ConditionSynced) == nil
+	}, 5*time.Second, time.Millisecond, "the clear to release the cache's size stop")
 }

@@ -49,5 +49,4 @@ spec's header says otherwise. They come from
 | [8 · Updates say what they actually are](8-updates-say-what-they-are.md) | host · docs · ci | Planned |
 | [10 · A kubeconfig exec plugin waits for approval](10-approve-exec-credential-plugins.md) | sidecar · frontend | Planned |
 | [11 · The host sends only the operations the app ships](11-allowlist-graphql-operations.md) | host · frontend · build | Planned |
-| [14 · A cache over its ceiling stops growing](14-stop-a-cache-over-its-size-ceiling.md) | sidecar | Planned |
 | [15 · A cache stops outliving the user's interest in its cluster](15-cache-retention.md) | sidecar | Planned |

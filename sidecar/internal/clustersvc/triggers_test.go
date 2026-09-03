@@ -196,3 +196,15 @@ func TestKubesyncKindTriggerNamesTheKindsRecord(t *testing.T) {
 	assert.Equal(t, ClusterCachedKindName(7, "apps/v1", "deployments"),
 		testutil.Recv(t, tr.Wakes(), "the kind's poke"))
 }
+
+// The size feed carries the cache whose file crossed its ceiling, and a cache id addresses
+// its own record — so the key is the whole wake, as it is for discovery.
+func TestKubestoreSizeLimitTriggerWakesTheCacheThatMoved(t *testing.T) {
+	store := newFakeKubestore(t)
+	tr := newKubestoreSizeLimitTrigger(store)
+	startTrigger(t, tr)
+
+	store.publishSizeLimitNews(7)
+
+	assert.Equal(t, beehive.ObjectID(7), testutil.Recv(t, tr.Wakes(), "the cache's poke"))
+}

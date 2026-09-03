@@ -323,8 +323,9 @@ const (
 	// and it is what gates the cache, since a cache is named for the identity it
 	// mirrors.
 	ConditionIdentified ConditionType = "Identified"
-	// ConditionSynced reports the state of a sync. Nothing writes one today — the seam
-	// that fills a cache is being redesigned.
+	// ConditionSynced reports the state of a sync. A cache's pass is its only writer, and
+	// writes it for one reason: the size ceiling. Its presence is what holds that pause —
+	// the file closes with the sync, so the verdict the pause was made on is gone.
 	ConditionSynced ConditionType = "Synced"
 )
 
@@ -355,6 +356,10 @@ const (
 	// ReasonPaused: nothing is syncing — the record is sync-disabled, deactivated,
 	// orphaned, or archived.
 	ReasonPaused = "Paused"
+	// ReasonSizeLimit: nothing is syncing because the cache's file is at its size
+	// ceiling. Apart from ReasonPaused so that "the user turned sync off" and "this
+	// cache filled up" stay distinguishable to whatever keys on the reason.
+	ReasonSizeLimit = "SizeLimit"
 )
 
 // Condition aliases beehive's status condition. Conditions are beehive object

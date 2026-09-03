@@ -191,6 +191,9 @@ type fakeKubestore struct {
 	// mu guards the measurement, which a test moves while the gauge reads it.
 	mu    sync.Mutex
 	stats kubestore.Stats
+	// onStats runs inside Stats, so a test can tell when a pass has measured — which is
+	// what says the pass ran at all, since a pass that changes nothing writes nothing.
+	onStats func(cacheID int64)
 	// onRemove runs inside Remove, so a test can assert what had already happened by
 	// the time the file went.
 	onRemove func(cacheID int64)
@@ -254,7 +257,10 @@ func (f *fakeKubestore) Clear(cacheID int64) error {
 
 // Stats is what the gauge measures; setStats moves it under a live subscription, which
 // is what the gauge re-emits on.
-func (f *fakeKubestore) Stats(context.Context, int64) (kubestore.Stats, error) {
+func (f *fakeKubestore) Stats(_ context.Context, cacheID int64) (kubestore.Stats, error) {
+	if f.onStats != nil {
+		f.onStats(cacheID)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.stats, f.err

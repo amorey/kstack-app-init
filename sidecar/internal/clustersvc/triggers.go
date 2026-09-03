@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubesync"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/kubeconfig"
@@ -167,6 +168,20 @@ type discoveryNewsSource interface {
 func newKubesyncDiscoveryTrigger(newsSource discoveryNewsSource) *trigger[gobus.Event[int64, struct{}], beehive.ObjectID] {
 	return newTrigger(
 		func() feed[gobus.Event[int64, struct{}]] { return newsSource.WatchDiscoveryNews() },
+		func(ev gobus.Event[int64, struct{}]) beehive.ObjectID { return beehive.ObjectID(ev.Key) },
+	)
+}
+
+// sizeLimitNewsSource is the size-limit half of the store seam, all a trigger needs.
+type sizeLimitNewsSource interface {
+	WatchSizeLimitNews() kubestore.SizeLimitNews
+}
+
+// newKubestoreSizeLimitTrigger wakes the cache record whose file crossed its size ceiling. By ID,
+// for the reason the discovery trigger is: the key already IS the record's id.
+func newKubestoreSizeLimitTrigger(newsSource sizeLimitNewsSource) *trigger[gobus.Event[int64, struct{}], beehive.ObjectID] {
+	return newTrigger(
+		func() feed[gobus.Event[int64, struct{}]] { return newsSource.WatchSizeLimitNews() },
 		func(ev gobus.Event[int64, struct{}]) beehive.ObjectID { return beehive.ObjectID(ev.Key) },
 	)
 }

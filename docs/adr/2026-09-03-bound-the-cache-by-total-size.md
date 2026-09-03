@@ -28,11 +28,11 @@ and a whole-file ceiling that pauses the sync when the footprint crosses it.
 
 **Bound the cache by its total footprint, and do not add per-table event retention.**
 
-The ceiling is built in two stages. Detection has landed: the janitor measures the database plus its
-`-wal`/`-shm` sidecars each sweep and publishes an edge-triggered verdict (`kubestore/janitor.go`).
-[Stop a cache over its ceiling](../specs/14-stop-a-cache-over-its-size-ceiling.md) is the half that
-acts on it, pausing the sync through `armSync`'s existing switch and reporting `ReasonSizeLimit` on
-the health gauge.
+The ceiling is built in two halves, both landed. The janitor measures the database plus its
+`-wal`/`-shm` sidecars each sweep and publishes an edge-triggered verdict (`kubestore/janitor.go`);
+the cache pass acts on it, stopping the sync through `armSync`'s existing switch and reporting
+`ReasonSizeLimit` on the health gauge (`clustersvc/caches.go`, → [a stopped cache is held by its
+record](2026-09-03-a-stopped-cache-is-held-by-its-record.md)).
 
 The janitor's stance on events is unchanged, and now deliberate at both levels: events retention
 stays the server's, mirrored by the relist's prune (→ [one janitor per open cache
@@ -52,7 +52,7 @@ outcome, so building the narrower mechanism first spends the delicate work befor
 the general one leaves anything worth trimming. If it does, the events TTL is still available — see
 *Revisit when*.
 
-**Evict rows to stay under the ceiling.** Rejected in the enforcing spec, and it is what makes this
+**Evict rows to stay under the ceiling.** Rejected, and it is what makes this
 decision safe: a cache that silently drops what it was asked to mirror answers questions wrongly,
 and a delta watch on top of it never recovers, because it applies deltas to rows it assumes are
 whole. Stopping is legible; a truncated mirror is not.
