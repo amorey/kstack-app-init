@@ -159,111 +159,26 @@ distinguishable from an unnoticed one. **Decided against:**
 
 **Without a spec yet:**
 
-- **Give the *Held by review* rows a fence, and admit which ones cannot have one.** Seven rows in
-  [`security-model.md`](security-model.md) are true today with nothing stopping the next change
-  undoing them. Each wants one test or one rule, not a design — which is why this is one item rather
-  than seven. They do not all want the same mechanism, and sorting that out is the point of the
-  pass: today all seven read alike, and two of them will still read alike afterwards because no test
-  can exist for them. In rough value order:
+- **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Four rows
+  in [`security-model.md`](security-model.md) are true today with nothing holding them. None wants a
+  design; each wants one rule, a type, or a decision — which is why this is one item rather than
+  four. They do not all want the same mechanism, and sorting that out is the point: two of them end
+  the pass still held by review, and should stop reading like the two that can be fenced.
 
-  - **The production CSP** (`src-tauri/tauri.conf.json`) — a Rust test over
-    `include_str!("../tauri.conf.json")` asserting the directives. The conf's `csp` is structured
-    JSON, so this is cheap, and it is the most valuable of the seven: the CSP is the *whole*
-    containment for a compromised page ([no GraphQL operation
-    allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md)) and nothing holds it.
-  - **GraphQL errors never log `variables`** — a Go test driving an error through the presenter and
-    asserting the record carries none. `sidecar/graph/server_test.go` is already there.
-  - **The idle-read bound on every non-watch request** — a test at the construction seam. There is
-    an ADR ([every non-watch request carries an idle-read
-    bound](adr/2026-09-02-idle-read-bound.md)) and no test file at all.
   - **Printer columns go through the restricted reader** — lint, not a test.
     `src/lib/jsonpath.test.ts` already pins the reader's behaviour; what is unfenced is a future
     template engine, which is the `custom/no-html-sinks` config object's job extended.
-  - **The unverified ID-token decode is display-only** — types, not a test. Give
-    `ParseIdentityUnverified` a return type that cannot be passed where an authorization input is
-    expected, and the compiler holds what a comment holds today.
+  - **The unverified ID-token decode is display-only** — types, not a test.
+    `oauth.ParseIdentityUnverified` has exactly one production caller (`auth/grant.go`, assigning
+    `s.identity`), so the blast radius is small; the question to answer first is what reads
+    `s.identity` afterwards, since that decides whether a distinct type is worth its churn. A
+    compiler check would replace what a comment holds today.
   - **Tokens never appear on the GraphQL surface** — a golden snapshot of `schema.graphqls` is the
-    only available fence, and a weak one: it does not judge a new field, it just forces whoever adds
-    one to look at it.
+    only available fence and a weak one: it judges no new field, it only forces whoever adds one to
+    look. Worth deciding against in an ADR if the snapshot would just be rubber-stamped.
   - **No authority granted ahead of a consumer** — no fence is possible; it is review over two
     declarative files (`src-tauri/capabilities/default.json`, `sidecar/graph/schema.graphqls`). If we
     want that to read as decided rather than pending, it is an ADR, not a test.
-
-- **A kubeconfig `exec` plugin waits for approval.** A context can name an `exec` credential
-  plugin — a binary `clientcmd` runs to mint a token. The sidecar imports **every** context as an
-  enabled cluster (`clustersvc/clusters.go`), and the connection probe dials every enabled cluster
-  on startup and on every kubeconfig change, so writing a file into `~/.kube/` runs a program of the
-  writer's choosing, repeatedly, for contexts the user has never opened. `kubectl` runs the same
-  plugins, so the bar is not "never exec" — it is *not before the user has approved that program for
-  that cluster*.
-
-  **Two decisions the shape rests on.** *Approve on first use; do not import these clusters
-  disabled* — EKS, GKE and AKS all authenticate through `exec`, the picker filters on `spec.enabled`
-  (`src/lib/kube-config.tsx`), so defaulting them off empties the context picker for most cloud
-  users and hides the explanation with it. The cluster imports enabled and visible; what waits is
-  the **dial**. *Approval names the credentials, not the cluster* — the threat is a file write, and
-  a file write can also change the `command` of a context approved last month, so a flag on the
-  record reopens the hole for every context the user actually uses. `kubeconfig.RESTConfig` already
-  returns a **fingerprint** beside the config, hashing everything that resolves the context's
-  credentials including the plugin's command, args, env and API version
-  (`kubeconfig/restconfig.go`); the probe already recomputes it every run. Approval stores that —
-  nothing new is hashed.
-
-  **The gate goes in the probe, not the controller.** The kubeconfig watch wakes `kubeconn` directly
-  (`WakeAll(nameConnection)`) in parallel with the controller's pass, so a controller-side gate
-  races the probe re-reading the same change and dialling the new plugin before the lease is gone.
-  The one place with no window is `connectionProbe.Run`, after `RESTConfig` has returned `cfg` and
-  the fingerprint and before the rebuild arm: with `cfg.ExecProvider != nil` and the fingerprint
-  unapproved, retire the connection and `supervisor.Suspend` on a new `ReasonExecNotApproved` — a
-  suspended probe is what the pool already does for a departed context, so `Conn` returns
-  `ErrNoConnection` and nothing in the process can reach a transport for it.
-
-  **The rest of the sidecar work.** The approval reaches the probe through the lease
-  (`ApproveExec(fingerprint)`, stored beside the claims, a change waking the probe so a fresh
-  approval dials at once), written every pass from `obj.Spec.ExecApproved` beside `ensureLease`.
-  `observeKubeconfig` reads the user entry's exec block onto the user half of the status block —
-  command, args and the fingerprint from `RESTConfig`, **observed off the file and never resolved**,
-  since knowing a plugin exists must not require running it; the departed-context branch copies the
-  previous block wholesale, so the value is retained for free. On the schema that is `execPlugin` on
-  `ClusterStatusSourceKubeconfigUser`, a *projection* of an authInfo entry rather than a mirror
-  ([status mirrors the kubeconfig](adr/2026-09-03-status-mirrors-the-kubeconfig.md)) — a path and
-  flags are not credentials, but the plugin's `env` folds into the fingerprint and is never shown.
-  `ExecApproved` goes on `ClusterSpec` with a `clusterExecApprovalSet(id, fingerprint)` mutation
-  taking **the fingerprint the caller displayed**, so what is approved is what the user read rather
-  than whatever the file says when the click lands.
-
-  **The trap: a reason is not a condition, and the two will disagree.** Folding the verdict into
-  `reconcileConnection` as an `inactive` finding is right — this is a choice the user has not made,
-  not a server that failed — but `observeIdentified` hardcodes `ReasonInactive` for *any* inactive
-  finding, so the record would carry `Connected=False/ExecPluginNeedsApproval` beside
-  `Identified=False/Inactive`. Pass the finding's reason through the inactive arm so both say the
-  same thing, and keep the reason distinct from a disabled cluster's `ReasonInactive` — the UI has
-  to tell those apart. The timeline event is written by the **controller**, not the probe (`kubeconn`
-  never touches beehive), every pass like `logDiscoveryVerdict`: beehive extends a run when
-  `(Category, Type, Reason)` repeats, so "no noise per dial" falls out of the store rather than a
-  guard. Word it *resolved* credentials via exec plugin `<command>` — `clientcmd` runs the plugin
-  lazily, when a token is first needed.
-
-  **Frontend:** a banner in the context bar over `useActiveCluster()`, when `Connected` is false
-  with the approval reason — *This context runs `<command> <args…>` to sign in* — whose button calls
-  the mutation with the fingerprint from the frame that rendered it. Conditions are already selected
-  in full (`src/lib/clusters.tsx`), so the only addition to the watch is
-  `execPlugin { command args fingerprint }`. The picker needs nothing: the cluster is enabled.
-
-  **What it does not cover:** `PATH` still decides which binary `command: aws` resolves to (that is
-  `kubectl` parity — the approval names the command as written), and a context deleted and re-added
-  with the same block inherits its approval. A rotated CA or a moved `proxy-url` re-asks, since the
-  fingerprint covers the whole credential block — the price of one value meaning "what you
-  approved". **Tests:** in `kubeconn`, that an unapproved exec context never builds a connection
-  (through the fixture, not by timing), that a matching fingerprint arms the next run and a stale
-  one does not, that a fingerprint moving under an approved context suspends and retires, and that a
-  context with no exec block is untouched; in `clustersvc`, the observation, that such a cluster
-  imports **enabled**, the two conditions carrying the same reason, the mutation reaching the lease,
-  and a second pass extending the event's run rather than adding a row. **When it lands:** move *"A
-  gesture before a kubeconfig `exec` plugin runs"* in [`security-model.md`](security-model.md) to
-  **Enforced**, naming the `kubeconn` tests, and give `sidecar/CLAUDE.md`'s "every enabled cluster is
-  dialled" its exception where someone will find it.
-
 - **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
   `release.yml` ships is signed direct downloads — a notarized `.dmg` with the sidecar signed
   inside it, an `.msi` signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and

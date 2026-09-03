@@ -403,6 +403,53 @@ mod tests {
     }
 
     #[test]
+    fn production_csp_admits_no_remote_code() {
+        // The CSP is the containment for a compromised page: the host forwards
+        // whatever operation the webview sends, so script execution there carries
+        // the whole cluster surface. See
+        // docs/adr/2026-09-03-no-graphql-operation-allowlist.md. It is pinned here
+        // because `build_window` creates every webview the policy governs.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid config JSON");
+        let csp = &config["app"]["security"]["csp"];
+
+        assert_eq!(
+            csp["script-src"].as_str(),
+            Some("'self'"),
+            "script-src must admit the bundle alone — no remote origin, no 'unsafe-inline', no 'unsafe-eval'"
+        );
+        assert_eq!(csp["default-src"].as_str(), Some("'self'"));
+        for directive in ["object-src", "base-uri", "frame-src", "form-action"] {
+            assert_eq!(
+                csp[directive].as_str(),
+                Some("'none'"),
+                "{directive} must admit nothing"
+            );
+        }
+
+        // Every directive, so a source added to one nobody thought to name above is
+        // still caught. Tauri's asset and IPC hosts are the only origins with a
+        // host part; everything else is a keyword or a scheme (`data:`, `ipc:`).
+        for (directive, value) in csp.as_object().expect("csp is a directive map") {
+            let value = value
+                .as_str()
+                .unwrap_or_else(|| panic!("{directive} must be a string"));
+            assert!(
+                !value.contains("unsafe-eval"),
+                "{directive} admits 'unsafe-eval'"
+            );
+            for source in value.split_whitespace() {
+                assert!(
+                    !source.contains("//")
+                        || source == "http://asset.localhost"
+                        || source == "http://ipc.localhost",
+                    "{directive} admits the remote origin {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn labels_increase_monotonically() {
         let wm = WindowManager::new();
         assert_eq!(wm.next_label(), "window-1");
