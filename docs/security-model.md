@@ -52,6 +52,7 @@ nothing stops the next change undoing it. **Not built** links the work.
 | Production CSP admits no remote script, no `eval`, no frames, no form posts | `src-tauri/tauri.conf.json` | **Held by review** |
 | The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Enforced** — the `custom/no-html-sinks` config object in `eslint.config.ts` |
 | Printer columns evaluated by a restricted reader, not a template engine | `src/lib/jsonpath.ts` | **Held by review** |
+| An unverified cluster connection is visible in the UI | `src/lib/kube-config.tsx` (verdict), `clustersvc/clusters.go` (the mirrored entry) | **Enforced** — `tlsUnverifiedReason`'s tests and the context bar's two badge tests; the sidecar draws no verdict, so the frontend tests are the fence |
 | GraphQL errors log the operation but never `variables` | `sidecar/graph/server.go` | **Held by review** |
 | ID tokens verified against the JWKS; the unverified decode is display-only | `sidecar/internal/auth/oauth/oauth.go` | **Held by review** — a comment is the only fence |
 | Tokens never appear on the GraphQL surface | `sidecar/graph/schema.graphqls` | **Held by review** |
@@ -60,7 +61,6 @@ nothing stops the next change undoing it. **Not built** links the work.
 | Cache encryption at rest, and a retention policy for what it holds | — | **Not built** — [spec 12](specs/12-decide-what-the-cache-is.md) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
 | Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
-| An unverified cluster connection is visible in the UI | — | **Not built** — [spec 6](specs/6-surface-unverified-tls.md) |
 | Cloud and OAuth endpoints come from the host's arguments, not from inherited environment | — | **Not built** — [spec 7](specs/7-endpoints-as-arguments.md) |
 | The host forwards only operations the app ships | — | **Not built** — [spec 11](specs/11-allowlist-graphql-operations.md) |
 | Signed in-app updates | — | **Not built** — [spec 8](specs/8-updates-say-what-they-are.md) |

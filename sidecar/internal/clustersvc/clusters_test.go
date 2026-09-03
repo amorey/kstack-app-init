@@ -90,7 +90,12 @@ func TestObserveKubeconfigRecordsAPresentContext(t *testing.T) {
 
 	require.NotNil(t, observed)
 	assert.Equal(t, ClusterStatusSourceKubeconfig{
-		Cluster: "prod-cluster", User: "prod-user", IsPresent: true, IsDefault: true,
+		Cluster: ClusterStatusSourceKubeconfigCluster{
+			Name:  "prod-cluster",
+			Entry: &ClusterStatusSourceKubeconfigClusterEntry{Server: "https://prod.example:6443"},
+		},
+		User:      ClusterStatusSourceKubeconfigUser{Name: "prod-user"},
+		IsPresent: true, IsDefault: true,
 	}, *observed)
 }
 
@@ -106,13 +111,18 @@ func TestObserveKubeconfigMarksANonCurrentContext(t *testing.T) {
 // identifiable in a list, and blanking it would leave the row nameless.
 func TestObserveKubeconfigKeepsLastKnownNamesWhenAbsent(t *testing.T) {
 	prev := &ClusterStatusSourceKubeconfig{
-		Cluster: "prod-cluster", User: "prod-user", IsPresent: true, IsDefault: true,
+		Cluster:   ClusterStatusSourceKubeconfigCluster{Name: "prod-cluster"},
+		User:      ClusterStatusSourceKubeconfigUser{Name: "prod-user"},
+		IsPresent: true, IsDefault: true,
 	}
 
 	observed := observeKubeconfig(cfgCurrent("staging", "staging"), kubeconfigSrc("prod"), prev)
 
 	require.NotNil(t, observed)
-	assert.Equal(t, ClusterStatusSourceKubeconfig{Cluster: "prod-cluster", User: "prod-user"}, *observed)
+	assert.Equal(t, ClusterStatusSourceKubeconfig{
+		Cluster: ClusterStatusSourceKubeconfigCluster{Name: "prod-cluster"},
+		User:    ClusterStatusSourceKubeconfigUser{Name: "prod-user"},
+	}, *observed)
 	assert.True(t, prev.IsPresent, "the previous observation is the caller's, not this fold's to clear")
 }
 
@@ -122,7 +132,50 @@ func TestObserveKubeconfigMarksAnUnseenContextAbsent(t *testing.T) {
 
 	require.NotNil(t, observed)
 	assert.False(t, observed.IsPresent)
-	assert.Empty(t, observed.Cluster)
+	assert.Empty(t, observed.Cluster.Name)
+}
+
+// The entry the context names, mirrored as the file states it — no verdict is drawn
+// here, so a reader of the block sees the same two facts the file does.
+func TestObserveKubeconfigMirrorsTheClusterEntry(t *testing.T) {
+	cfg := cfgCurrent("prod", "prod")
+	cfg.Clusters["prod-cluster"].InsecureSkipTLSVerify = true
+
+	observed := observeKubeconfig(cfg, kubeconfigSrc("prod"), nil)
+
+	require.NotNil(t, observed)
+	assert.Equal(t, &ClusterStatusSourceKubeconfigClusterEntry{
+		Server: "https://prod.example:6443", InsecureSkipTLSVerify: true,
+	}, observed.Cluster.Entry)
+}
+
+// A context can name a cluster entry the file never defines. Nil says so, which is
+// what keeps "unresolvable" distinguishable from "resolved and verified".
+func TestObserveKubeconfigLeavesTheClusterEntryNilWhenUndefined(t *testing.T) {
+	cfg := cfgCurrent("prod", "prod")
+	delete(cfg.Clusters, "prod-cluster")
+
+	observed := observeKubeconfig(cfg, kubeconfigSrc("prod"), nil)
+
+	require.NotNil(t, observed)
+	assert.Nil(t, observed.Cluster.Entry)
+}
+
+// The entry outlives the context, like the rest of the cached block: an orphaned
+// record that was reached insecurely must not read as secure.
+func TestObserveKubeconfigKeepsTheClusterEntryWhenAbsent(t *testing.T) {
+	prev := &ClusterStatusSourceKubeconfig{
+		Cluster: ClusterStatusSourceKubeconfigCluster{
+			Name:  "prod-cluster",
+			Entry: &ClusterStatusSourceKubeconfigClusterEntry{Server: "http://localhost:8080"},
+		},
+	}
+
+	observed := observeKubeconfig(cfgCurrent("staging", "staging"), kubeconfigSrc("prod"), prev)
+
+	require.NotNil(t, observed)
+	require.NotNil(t, observed.Cluster.Entry)
+	assert.Equal(t, "http://localhost:8080", observed.Cluster.Entry.Server)
 }
 
 // Another source's record is not this observation's to write — its own variant is,
@@ -643,7 +696,10 @@ func TestReconcileReportsAFailedStatusWrite(t *testing.T) {
 func TestReconcileSettlesWhenNothingMoved(t *testing.T) {
 	// The seed config holds no contexts, so this is what the reconcile will observe.
 	obj := kubeconfigObj("prod", &ClusterStatus{Source: ClusterStatusSource{
-		Kubeconfig: &ClusterStatusSourceKubeconfig{Cluster: "prod-cluster", User: "prod-user"},
+		Kubeconfig: &ClusterStatusSourceKubeconfig{
+			Cluster: ClusterStatusSourceKubeconfigCluster{Name: "prod-cluster"},
+			User:    ClusterStatusSourceKubeconfigUser{Name: "prod-user"},
+		},
 	}})
 	obj.Generation = 3
 
@@ -1619,7 +1675,9 @@ func observePresence(t *testing.T, status *beehive.AdminClient[ClusterStatus], o
 	t.Helper()
 	require.NoError(t, status.UpdateStatus(context.Background(), obj.ID, ClusterStatus{
 		Source: ClusterStatusSource{Kubeconfig: &ClusterStatusSourceKubeconfig{
-			Cluster: "prod-cluster", User: "prod-user", IsPresent: present,
+			Cluster:   ClusterStatusSourceKubeconfigCluster{Name: "prod-cluster"},
+			User:      ClusterStatusSourceKubeconfigUser{Name: "prod-user"},
+			IsPresent: present,
 		}},
 	}))
 }

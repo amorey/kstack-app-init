@@ -34,7 +34,7 @@ func TestClustersQuery(t *testing.T) {
 		generation
 		spec { name syncEnabled enabled source { kubeconfig { context } } }
 		status {
-			source { kubeconfig { cluster user isPresent isDefault } }
+			source { kubeconfig { cluster { name entry { server insecureSkipTLSVerify } } user { name } isPresent isDefault } }
 			server { uid version endpoint }
 			principal { username groups }
 		}
@@ -60,8 +60,12 @@ func TestClustersQuery(t *testing.T) {
 	if p := status["principal"].(map[string]any); p["username"] != "system:admin" {
 		t.Errorf("probed principal: %v", p)
 	}
-	if kc := status["source"].(map[string]any)["kubeconfig"].(map[string]any); kc["cluster"] != "prod-cluster" || kc["isPresent"] != true || kc["isDefault"] != true {
+	kc := status["source"].(map[string]any)["kubeconfig"].(map[string]any)
+	if kc["isPresent"] != true || kc["isDefault"] != true {
 		t.Errorf("probed kubeconfig: %v", kc)
+	}
+	if c := kc["cluster"].(map[string]any); c["name"] != "prod-cluster" {
+		t.Errorf("probed kubeconfig cluster: %v", c)
 	}
 
 	unprobed := clusters[1].(map[string]any)

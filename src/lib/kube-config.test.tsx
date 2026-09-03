@@ -28,7 +28,7 @@ vi.mock('@tauri-apps/api/core', () => factory());
 
 const { createGraphqlClient } = await import('@/lib/graphql/client');
 const { ClustersProvider } = await import('./clusters');
-const { KubeConfigProvider, useKubeConfig } = await import('./kube-config');
+const { KubeConfigProvider, useKubeConfig, tlsUnverifiedReason } = await import('./kube-config');
 
 // Helpers -------------------------------------------------------------
 
@@ -81,7 +81,38 @@ describe('useKubeConfig', () => {
 
     const probe = screen.getByTestId('probe');
     const kubeConfig = JSON.parse(probe.textContent ?? '');
-    expect(kubeConfig.contexts).toEqual([{ name: 'prod', cluster: 'prod-cluster', user: 'prod-user' }]);
+    expect(kubeConfig.contexts).toEqual([
+      {
+        name: 'prod',
+        cluster: 'prod-cluster',
+        user: 'prod-user',
+        clusterEntry: { server: 'https://prod.example:6443', insecureSkipTLSVerify: false },
+      },
+    ]);
     expect(kubeConfig.currentContext).toBe('prod');
+  });
+});
+
+describe('tlsUnverifiedReason', () => {
+  it('names skip-verify, which the file states outright', () => {
+    expect(tlsUnverifiedReason({ server: 'https://prod.example:6443', insecureSkipTLSVerify: true })).toBe(
+      'skip-verify',
+    );
+  });
+
+  // No certificate is presented at all, so the entry's own flag says nothing.
+  it('names plain http, whatever the flag says', () => {
+    expect(tlsUnverifiedReason({ server: 'http://localhost:8080', insecureSkipTLSVerify: false })).toBe('plain-http');
+  });
+
+  it('reads the scheme case-insensitively, and does not match https', () => {
+    expect(tlsUnverifiedReason({ server: 'HTTP://localhost:8080', insecureSkipTLSVerify: false })).toBe('plain-http');
+    expect(tlsUnverifiedReason({ server: 'https://prod.example:6443', insecureSkipTLSVerify: false })).toBeNull();
+  });
+
+  // An entry the kubeconfig never defined resolves to nothing, so there is no
+  // connection to call unverified; the record's own isPresent reports that.
+  it('says nothing about a missing entry', () => {
+    expect(tlsUnverifiedReason(null)).toBeNull();
   });
 });

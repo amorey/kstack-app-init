@@ -6,8 +6,10 @@ status: Planned
 
 # A kubeconfig `exec` plugin waits for approval
 
-**Needs:** [6-surface-unverified-tls.md](6-surface-unverified-tls.md) — it adds the first new
-observation to `observeKubeconfig` and its status block, and this follows the same shape.
+**Needs:** nothing. `observeKubeconfig` and its status block already carry one such
+observation, `cluster.entry`; this follows its shape — mirror what the file says and leave
+the verdict to the frontend, per
+[ADR: status mirrors the kubeconfig](../adr/2026-09-03-status-mirrors-the-kubeconfig.md).
 **Hands on:** nothing.
 
 ## Goal
@@ -91,7 +93,8 @@ can reach a transport for this context. `ReasonExecNotApproved` is a new `superv
 `ReasonContextNotFound`.
 
 **3. Observe the plugin, for the prompt.** In `observeKubeconfig` (`clusters.go:806`), read the
-user entry's exec block onto the status block, beside the fields it already caches:
+user entry's exec block onto the user half of the status block, which today carries the entry name
+alone:
 
 ```go
 // ExecPlugin is the credential plugin the context would run, nil when it has none.
@@ -108,8 +111,8 @@ value stands, since a file that will not resolve cannot be approved either and t
 that on its own. The departed-context branch copies the previous block wholesale, so the value is
 retained for free.
 
-The schema field, on `ClusterStatusSourceKubeconfig` beside `tlsUnverified` from
-[spec 6](6-surface-unverified-tls.md):
+The schema field, on `ClusterStatusSourceKubeconfigUser` beside `name` — a projection of the
+authInfo entry, never a mirror of it, since that entry holds the credentials:
 
 ```graphql
 "The credential plugin this context would run; null when it has none. `fingerprint` is what

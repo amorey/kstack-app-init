@@ -95,6 +95,39 @@ describe('KubeContextBar', () => {
     expect(screen.getByText('staging-user')).toBeInTheDocument();
   });
 
+  it('warns when the active context reaches its cluster unverified, naming the cause', async () => {
+    await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
+    await act(async () => {
+      pushClusters(channelFor, [
+        { id: 'a', name: 'prod', isDefault: true },
+        { id: 'b', name: 'staging', insecureSkipTLSVerify: true },
+      ]);
+    });
+
+    expect(screen.getByText('Unverified TLS')).toHaveAttribute(
+      'title',
+      expect.stringContaining('insecure-skip-tls-verify'),
+    );
+  });
+
+  it('warns for a plain http server too', async () => {
+    await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
+    await act(async () => {
+      pushClusters(channelFor, [{ id: 'b', name: 'staging', isDefault: true, server: 'http://localhost:8080' }]);
+    });
+
+    expect(screen.getByText('Unverified TLS')).toHaveAttribute('title', expect.stringContaining('plain http'));
+  });
+
+  it('shows no warning for a verified context', async () => {
+    await renderWithRouter(buildTree(), '/chat?kubeContext=staging');
+    await act(async () => {
+      pushClusters(channelFor, [{ id: 'b', name: 'staging', isDefault: true }]);
+    });
+
+    expect(screen.queryByText('Unverified TLS')).not.toBeInTheDocument();
+  });
+
   it('renders no metadata when there is no kubeconfig', async () => {
     await renderWithRouter(buildTree(), '/chat');
     await act(async () => {

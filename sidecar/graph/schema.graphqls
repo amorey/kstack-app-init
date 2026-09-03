@@ -331,14 +331,49 @@ identify an orphaned record. In a malformed kubeconfig the referenced entries
 may not resolve.
 """
 type ClusterStatusSourceKubeconfig {
-  "Name of the cluster entry the context references; cached."
-  cluster: String!
-  "Name of the user (authInfo) entry the context references; cached."
-  user: String!
+  "The cluster half of the context: the entry name it references, and that entry; cached."
+  cluster: ClusterStatusSourceKubeconfigCluster!
+  "The user half of the context; cached."
+  user: ClusterStatusSourceKubeconfigUser!
   "True while the context is currently present in the kubeconfig; false when orphaned."
   isPresent: Boolean!
   "True when the context is the kubeconfig's `current-context`; false otherwise."
   isDefault: Boolean!
+}
+
+"""
+The cluster half of a context. `name` is stated by the context, `entry` by the file,
+so the two go missing independently: a context always names a cluster, and the file
+may define no entry under that name.
+"""
+type ClusterStatusSourceKubeconfigCluster {
+  "Name of the cluster entry the context references."
+  name: String!
+  "The entry `name` resolves to; null when the kubeconfig defines no such entry."
+  entry: ClusterStatusSourceKubeconfigClusterEntry
+}
+
+"""
+The user (authInfo) half of a context. It carries the entry name alone: an authInfo
+entry holds credentials, so anything served from it is a chosen projection, never a
+mirror of the file.
+"""
+type ClusterStatusSourceKubeconfigUser {
+  "Name of the user entry the context references."
+  name: String!
+}
+
+"""
+A kubeconfig cluster entry. Fields are a subset of what the file holds, added as a
+consumer needs them, and each is what the file says — no verdict is drawn here: a
+client asking whether the connection is verified reads `insecureSkipTLSVerify` and
+`server`'s scheme, both stated before anything is dialled.
+"""
+type ClusterStatusSourceKubeconfigClusterEntry {
+  "The entry's `server` URL."
+  server: String!
+  "The entry's `insecure-skip-tls-verify`."
+  insecureSkipTLSVerify: Boolean!
 }
 
 "Last-known facts about the remote cluster, discovered by probing. Fields are null until a successful probe."

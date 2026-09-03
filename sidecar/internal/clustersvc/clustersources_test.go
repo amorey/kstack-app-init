@@ -16,6 +16,7 @@ package clustersvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -143,11 +144,11 @@ func TestKubeconfigFingerprintSeparatesAdjacentValues(t *testing.T) {
 // server until its next poll.
 func TestKubeconfigFingerprintMovesWhenCredentialsChange(t *testing.T) {
 	cfg := cfgWith("prod")
-	cfg.Clusters = map[string]*api.Cluster{"prod-cluster": {Server: "https://one.example"}}
+	cfg.AuthInfos = map[string]*api.AuthInfo{"prod-user": {Token: "one"}}
 	base := fingerprintOf(t, cfg)
 	baseFold := observedFold(t, cfg)
 
-	cfg.Clusters["prod-cluster"] = &api.Cluster{Server: "https://two.example"}
+	cfg.AuthInfos["prod-user"] = &api.AuthInfo{Token: "two"}
 
 	assert.Equal(t, baseFold, observedFold(t, cfg), "the observation cannot tell them apart")
 	assert.NotEqual(t, base, fingerprintOf(t, cfg), "the credentials fold can")
@@ -162,7 +163,7 @@ func TestKubeconfigFingerprintMovesForWhatNoRecordObserves(t *testing.T) {
 	baseFold := observedFold(t, cfg)
 
 	// An entry no context references, and a preferences block nothing here reads.
-	cfg.Clusters = map[string]*api.Cluster{"unreferenced": {Server: "https://example"}}
+	cfg.Clusters["unreferenced"] = &api.Cluster{Server: "https://example"}
 	cfg.Preferences = api.Preferences{Colors: true}
 
 	assert.Equal(t, baseFold, observedFold(t, cfg), "no record observes any of it")
@@ -189,12 +190,15 @@ func TestKubeconfigFingerprintFollowsTheObservation(t *testing.T) {
 }
 
 // observedFold renders what every record would observe, as the digest's own input
-// does — the value the fingerprint must be a function of.
+// does — the value the fingerprint must be a function of. JSON, not %+v: the
+// observation holds a pointer, whose address says nothing about the fold.
 func observedFold(t *testing.T, cfg *api.Config) string {
 	t.Helper()
 	var b strings.Builder
 	for _, name := range []string{"dev", "prod", "staging"} {
-		fmt.Fprintf(&b, "%s=%+v;", name, observeKubeconfig(cfg, &ClusterSpecSourceKubeconfig{Context: name}, nil))
+		observed, err := json.Marshal(observeKubeconfig(cfg, &ClusterSpecSourceKubeconfig{Context: name}, nil))
+		require.NoError(t, err)
+		fmt.Fprintf(&b, "%s=%s;", name, observed)
 	}
 	return b.String()
 }
@@ -470,7 +474,7 @@ func TestSourceWakesADepartedContextsRecord(t *testing.T) {
 
 	orphan := storedClusterFor(t, svc, "staging")
 	require.NotNil(t, orphan)
-	assert.Equal(t, "staging-cluster", orphan.Status.Source.Kubeconfig.Cluster,
+	assert.Equal(t, "staging-cluster", orphan.Status.Source.Kubeconfig.Cluster.Name,
 		"an orphaned record keeps its last-known names, or the row goes nameless")
 	assert.True(t, orphan.Spec.Enabled, "and the user's toggles, since the context may come back")
 }

@@ -17,6 +17,7 @@
 import { HistoryNav } from '@/components/widgets/history-nav';
 import { KubeContextPicker } from '@/components/widgets/kube-context-picker';
 import { useActiveKubeContext } from '@/lib/active-kube-context';
+import { tlsUnverifiedReason } from '@/lib/kube-config';
 
 function Meta({ label, value }: { label: string; value: string }) {
   return (
@@ -29,13 +30,31 @@ function Meta({ label, value }: { label: string; value: string }) {
   );
 }
 
+const UNVERIFIED_TLS_TITLE: Record<'skip-verify' | 'plain-http', string> = {
+  'skip-verify': "The server's certificate is not checked: this context's cluster sets insecure-skip-tls-verify.",
+  'plain-http': "The server's certificate is not checked: this context's server URL is plain http.",
+};
+
+function UnverifiedTLSBadge({ reason }: { reason: 'skip-verify' | 'plain-http' }) {
+  return (
+    <span
+      className="inline-block shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+      title={UNVERIFIED_TLS_TITLE[reason]}
+    >
+      Unverified TLS
+    </span>
+  );
+}
+
 export function KubeContextBar() {
   const { active } = useActiveKubeContext();
+  const unverified = tlsUnverifiedReason(active?.clusterEntry ?? null);
 
   return (
     <div className="flex h-11 shrink-0 items-center gap-4 border-b border-border bg-background px-4">
       <HistoryNav />
       <KubeContextPicker />
+      {unverified && <UnverifiedTLSBadge reason={unverified} />}
       {active && (active.cluster || active.user) && (
         <div className="flex min-w-0 items-center gap-4 text-xs text-muted-foreground">
           {active.cluster && <Meta label="cluster" value={active.cluster} />}

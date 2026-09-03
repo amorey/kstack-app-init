@@ -57,6 +57,15 @@ models:
   ClusterStatusSourceKubeconfig:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterStatusSourceKubeconfig
 
+  ClusterStatusSourceKubeconfigCluster:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterStatusSourceKubeconfigCluster
+
+  ClusterStatusSourceKubeconfigUser:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterStatusSourceKubeconfigUser
+
+  ClusterStatusSourceKubeconfigClusterEntry:
+    model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterStatusSourceKubeconfigClusterEntry
+
   ClusterPrincipal:
     model: github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc.ClusterPrincipal
     fields:

@@ -467,9 +467,10 @@ func (f *fakeKubeconfigSource) close() { f.hub.Close() }
 // cfgWith builds a snapshot holding one context per name, each naming its own cluster
 // and user entry.
 func cfgWith(names ...string) *api.Config {
-	cfg := &api.Config{Contexts: map[string]*api.Context{}}
+	cfg := &api.Config{Contexts: map[string]*api.Context{}, Clusters: map[string]*api.Cluster{}}
 	for _, n := range names {
 		cfg.Contexts[n] = &api.Context{Cluster: n + "-cluster", AuthInfo: n + "-user"}
+		cfg.Clusters[n+"-cluster"] = &api.Cluster{Server: "https://" + n + ".example:6443"}
 	}
 	return cfg
 }

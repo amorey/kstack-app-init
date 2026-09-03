@@ -89,7 +89,9 @@ React 19 + TanStack Router + [urql] (GraphQL) + Vite + Tailwind v4. UI primitive
 
 `kubeContext` (on `_app`, kept across mode switches via `retainSearchParams`) and `resource` (on `/dashboard`) are search params — per-window, deep-linkable, history-pushing. → [ADR: URL params as window state](docs/adr/2026-08-09-url-params-as-window-state.md). Accessors: `useActiveKubeContext` (`src/lib/active-kube-context.tsx`; falls back to the kubeconfig current context; `setContext` writes the param — a frontend view-scope only, never rewrites the kubeconfig) and `resolveDashboardResource`. Links writing one param must spread the previous search (`(prev) => ({ ...prev, resource })`).
 
-The **context bar** (`components/widgets/kube-context-bar.tsx`, mounted in `AppLayout` above the `Outlet`) holds the picker (`kube-context-picker.tsx`), the context's cluster/user metadata, and the back/forward **`HistoryNav`** (`history-nav.tsx`), which walks router history via `__TSR_index` read through `useSyncExternalStore`.
+The **context bar** (`components/widgets/kube-context-bar.tsx`, mounted in `AppLayout` above the `Outlet`) holds the picker (`kube-context-picker.tsx`), the context's cluster/user metadata, an "Unverified TLS" badge, and the back/forward **`HistoryNav`** (`history-nav.tsx`), which walks router history via `__TSR_index` read through `useSyncExternalStore`.
+
+**The sidecar mirrors the kubeconfig and draws no verdicts over it.** `status.source.kubeconfig.cluster` is `{ name, entry }` — the name the context references, and the entry the file defines under it (`server`, `insecureSkipTLSVerify`; null when there is none). `user` is the name alone: an authInfo entry holds credentials, so anything served from it is a projection, never a mirror, and `tlsUnverifiedReason` in `src/lib/kube-config.tsx` is the one place that turns it into the bar's badge — a second inline copy is how the plain-`http` arm goes missing, and no sidecar test would catch it. → [ADR: status mirrors the kubeconfig](docs/adr/2026-09-03-status-mirrors-the-kubeconfig.md).
 
 ### Dashboard resource nav
 

@@ -25,7 +25,25 @@ export type KubeContextInfo = {
   name: string;
   cluster: string;
   user: string;
+  // The cluster entry `cluster` names, as the file states it; null when the
+  // kubeconfig defines no such entry.
+  clusterEntry: KubeClusterEntry | null;
 };
+
+export type KubeClusterEntry = {
+  server: string;
+  insecureSkipTLSVerify: boolean;
+};
+
+// Why a connection through this entry checks no certificate, or null when it does.
+// The sidecar mirrors the file and draws no verdict, so this is the one place the
+// question is answered — a second caller re-deriving it is how the http arm goes
+// missing.
+export function tlsUnverifiedReason(entry: KubeClusterEntry | null): 'skip-verify' | 'plain-http' | null {
+  if (!entry) return null;
+  if (entry.server.toLowerCase().startsWith('http://')) return 'plain-http';
+  return entry.insecureSkipTLSVerify ? 'skip-verify' : null;
+}
 
 export type KubeConfig = {
   currentContext: string;
@@ -58,8 +76,9 @@ export function KubeConfigProvider({ children }: { children: React.ReactNode }) 
           present.find((c) => c.status.source.kubeconfig?.isDefault)?.spec.source.kubeconfig?.context ?? '',
         contexts: present.map((c) => ({
           name: c.spec.source.kubeconfig?.context ?? '',
-          cluster: c.status.source.kubeconfig?.cluster ?? '',
-          user: c.status.source.kubeconfig?.user ?? '',
+          cluster: c.status.source.kubeconfig?.cluster.name ?? '',
+          user: c.status.source.kubeconfig?.user.name ?? '',
+          clusterEntry: c.status.source.kubeconfig?.cluster.entry ?? null,
         })),
       },
     };

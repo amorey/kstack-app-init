@@ -69,8 +69,16 @@ const ClustersWatchSubscription = graphql(`
         status {
           source {
             kubeconfig {
-              cluster
-              user
+              cluster {
+                name
+                entry {
+                  server
+                  insecureSkipTLSVerify
+                }
+              }
+              user {
+                name
+              }
               isPresent
               isDefault
             }

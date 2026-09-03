@@ -262,6 +262,20 @@ type ComplexityRoot struct {
 		User      func(childComplexity int) int
 	}
 
+	ClusterStatusSourceKubeconfigCluster struct {
+		Entry func(childComplexity int) int
+		Name  func(childComplexity int) int
+	}
+
+	ClusterStatusSourceKubeconfigClusterEntry struct {
+		InsecureSkipTLSVerify func(childComplexity int) int
+		Server                func(childComplexity int) int
+	}
+
+	ClusterStatusSourceKubeconfigUser struct {
+		Name func(childComplexity int) int
+	}
+
 	ClusterWatchFrame struct {
 		Cluster func(childComplexity int) int
 		Type    func(childComplexity int) int
@@ -1264,6 +1278,39 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterStatusSourceKubeconfig.User(childComplexity), true
+
+	case "ClusterStatusSourceKubeconfigCluster.entry":
+		if e.ComplexityRoot.ClusterStatusSourceKubeconfigCluster.Entry == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterStatusSourceKubeconfigCluster.Entry(childComplexity), true
+	case "ClusterStatusSourceKubeconfigCluster.name":
+		if e.ComplexityRoot.ClusterStatusSourceKubeconfigCluster.Name == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterStatusSourceKubeconfigCluster.Name(childComplexity), true
+
+	case "ClusterStatusSourceKubeconfigClusterEntry.insecureSkipTLSVerify":
+		if e.ComplexityRoot.ClusterStatusSourceKubeconfigClusterEntry.InsecureSkipTLSVerify == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterStatusSourceKubeconfigClusterEntry.InsecureSkipTLSVerify(childComplexity), true
+	case "ClusterStatusSourceKubeconfigClusterEntry.server":
+		if e.ComplexityRoot.ClusterStatusSourceKubeconfigClusterEntry.Server == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterStatusSourceKubeconfigClusterEntry.Server(childComplexity), true
+
+	case "ClusterStatusSourceKubeconfigUser.name":
+		if e.ComplexityRoot.ClusterStatusSourceKubeconfigUser.Name == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterStatusSourceKubeconfigUser.Name(childComplexity), true
 
 	case "ClusterWatchFrame.cluster":
 		if e.ComplexityRoot.ClusterWatchFrame.Cluster == nil {
@@ -2314,6 +2361,34 @@ func (ec *executionContext) childFields_ClusterStatusSourceKubeconfig(ctx contex
 		return ec.fieldContext_ClusterStatusSourceKubeconfig_isDefault(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterStatusSourceKubeconfig", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterStatusSourceKubeconfigCluster(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "name":
+		return ec.fieldContext_ClusterStatusSourceKubeconfigCluster_name(ctx, field)
+	case "entry":
+		return ec.fieldContext_ClusterStatusSourceKubeconfigCluster_entry(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterStatusSourceKubeconfigCluster", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterStatusSourceKubeconfigClusterEntry(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "server":
+		return ec.fieldContext_ClusterStatusSourceKubeconfigClusterEntry_server(ctx, field)
+	case "insecureSkipTLSVerify":
+		return ec.fieldContext_ClusterStatusSourceKubeconfigClusterEntry_insecureSkipTLSVerify(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterStatusSourceKubeconfigClusterEntry", field.Name)
+}
+
+func (ec *executionContext) childFields_ClusterStatusSourceKubeconfigUser(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "name":
+		return ec.fieldContext_ClusterStatusSourceKubeconfigUser_name(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type ClusterStatusSourceKubeconfigUser", field.Name)
 }
 
 func (ec *executionContext) childFields_ClusterWatchFrame(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -6352,15 +6427,24 @@ func (ec *executionContext) _ClusterStatusSourceKubeconfig_cluster(ctx context.C
 			return obj.Cluster, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
-			return ec.marshalNString2string(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v clustersvc.ClusterStatusSourceKubeconfigCluster) graphql.Marshaler {
+			return ec.marshalNClusterStatusSourceKubeconfigCluster2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterStatusSourceKubeconfigCluster(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfig_cluster(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfig", field, false, false, errors.New("field of type String does not have child fields"))
+	fc = &graphql.FieldContext{
+		Object:     "ClusterStatusSourceKubeconfig",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterStatusSourceKubeconfigCluster(ctx, field)
+		},
+	}
+	return fc, nil
 }
 
 func (ec *executionContext) _ClusterStatusSourceKubeconfig_user(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfig) (ret graphql.Marshaler) {
@@ -6375,15 +6459,24 @@ func (ec *executionContext) _ClusterStatusSourceKubeconfig_user(ctx context.Cont
 			return obj.User, nil
 		},
 		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
-			return ec.marshalNString2string(ctx, selections, v)
+		func(ctx context.Context, selections ast.SelectionSet, v clustersvc.ClusterStatusSourceKubeconfigUser) graphql.Marshaler {
+			return ec.marshalNClusterStatusSourceKubeconfigUser2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterStatusSourceKubeconfigUser(ctx, selections, v)
 		},
 		true,
 		true,
 	)
 }
 func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfig_user(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfig", field, false, false, errors.New("field of type String does not have child fields"))
+	fc = &graphql.FieldContext{
+		Object:     "ClusterStatusSourceKubeconfig",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterStatusSourceKubeconfigUser(ctx, field)
+		},
+	}
+	return fc, nil
 }
 
 func (ec *executionContext) _ClusterStatusSourceKubeconfig_isPresent(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfig) (ret graphql.Marshaler) {
@@ -6430,6 +6523,130 @@ func (ec *executionContext) _ClusterStatusSourceKubeconfig_isDefault(ctx context
 }
 func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfig_isDefault(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfig", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigCluster_name(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfigCluster) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterStatusSourceKubeconfigCluster_name(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Name, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfigCluster_name(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfigCluster", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigCluster_entry(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfigCluster) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterStatusSourceKubeconfigCluster_entry(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Entry, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *clustersvc.ClusterStatusSourceKubeconfigClusterEntry) graphql.Marshaler {
+			return ec.marshalOClusterStatusSourceKubeconfigClusterEntry2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterStatusSourceKubeconfigClusterEntry(ctx, selections, v)
+		},
+		true,
+		false,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfigCluster_entry(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "ClusterStatusSourceKubeconfigCluster",
+		Field:      field,
+		IsMethod:   false,
+		IsResolver: false,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_ClusterStatusSourceKubeconfigClusterEntry(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigClusterEntry_server(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfigClusterEntry) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterStatusSourceKubeconfigClusterEntry_server(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Server, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfigClusterEntry_server(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfigClusterEntry", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigClusterEntry_insecureSkipTLSVerify(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfigClusterEntry) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterStatusSourceKubeconfigClusterEntry_insecureSkipTLSVerify(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.InsecureSkipTLSVerify, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfigClusterEntry_insecureSkipTLSVerify(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfigClusterEntry", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigUser_name(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterStatusSourceKubeconfigUser) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterStatusSourceKubeconfigUser_name(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Name, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterStatusSourceKubeconfigUser_name(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterStatusSourceKubeconfigUser", field, false, false, errors.New("field of type String does not have child fields"))
 }
 
 func (ec *executionContext) _ClusterWatchFrame_type(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterWatchFrame) (ret graphql.Marshaler) {
@@ -11336,6 +11553,130 @@ func (ec *executionContext) _ClusterStatusSourceKubeconfig(ctx context.Context, 
 	return out
 }
 
+var clusterStatusSourceKubeconfigClusterImplementors = []string{"ClusterStatusSourceKubeconfigCluster"}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigCluster(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterStatusSourceKubeconfigCluster) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterStatusSourceKubeconfigClusterImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterStatusSourceKubeconfigCluster")
+		case "name":
+			out.Values[i] = ec._ClusterStatusSourceKubeconfigCluster_name(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "entry":
+			out.Values[i] = ec._ClusterStatusSourceKubeconfigCluster_entry(ctx, field, obj)
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
+var clusterStatusSourceKubeconfigClusterEntryImplementors = []string{"ClusterStatusSourceKubeconfigClusterEntry"}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigClusterEntry(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterStatusSourceKubeconfigClusterEntry) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterStatusSourceKubeconfigClusterEntryImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterStatusSourceKubeconfigClusterEntry")
+		case "server":
+			out.Values[i] = ec._ClusterStatusSourceKubeconfigClusterEntry_server(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "insecureSkipTLSVerify":
+			out.Values[i] = ec._ClusterStatusSourceKubeconfigClusterEntry_insecureSkipTLSVerify(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
+var clusterStatusSourceKubeconfigUserImplementors = []string{"ClusterStatusSourceKubeconfigUser"}
+
+func (ec *executionContext) _ClusterStatusSourceKubeconfigUser(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterStatusSourceKubeconfigUser) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, clusterStatusSourceKubeconfigUserImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferred := make(map[string]*graphql.FieldSet)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("ClusterStatusSourceKubeconfigUser")
+		case "name":
+			out.Values[i] = ec._ClusterStatusSourceKubeconfigUser_name(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferred), math.MaxInt32)))
+
+	for label, dfs := range deferred {
+		ec.ProcessDeferredGroup(graphql.DeferredGroup{
+			Label:    label,
+			Path:     graphql.GetPath(ctx),
+			FieldSet: dfs,
+			Context:  ctx,
+		})
+	}
+
+	return out
+}
+
 var clusterWatchFrameImplementors = []string{"ClusterWatchFrame"}
 
 func (ec *executionContext) _ClusterWatchFrame(ctx context.Context, sel ast.SelectionSet, obj *clustersvc.ClusterWatchFrame) graphql.Marshaler {
@@ -12894,6 +13235,14 @@ func (ec *executionContext) marshalNClusterStatusSource2githubᚗcomᚋkubetail�
 	return ec._ClusterStatusSource(ctx, sel, &v)
 }
 
+func (ec *executionContext) marshalNClusterStatusSourceKubeconfigCluster2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterStatusSourceKubeconfigCluster(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterStatusSourceKubeconfigCluster) graphql.Marshaler {
+	return ec._ClusterStatusSourceKubeconfigCluster(ctx, sel, &v)
+}
+
+func (ec *executionContext) marshalNClusterStatusSourceKubeconfigUser2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterStatusSourceKubeconfigUser(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterStatusSourceKubeconfigUser) graphql.Marshaler {
+	return ec._ClusterStatusSourceKubeconfigUser(ctx, sel, &v)
+}
+
 func (ec *executionContext) marshalNClusterWatchFrame2githubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterWatchFrame(ctx context.Context, sel ast.SelectionSet, v clustersvc.ClusterWatchFrame) graphql.Marshaler {
 	return ec._ClusterWatchFrame(ctx, sel, &v)
 }
@@ -13475,6 +13824,13 @@ func (ec *executionContext) marshalOClusterStatusSourceKubeconfig2ᚖgithubᚗco
 		return graphql.Null
 	}
 	return ec._ClusterStatusSourceKubeconfig(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalOClusterStatusSourceKubeconfigClusterEntry2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐClusterStatusSourceKubeconfigClusterEntry(ctx context.Context, sel ast.SelectionSet, v *clustersvc.ClusterStatusSourceKubeconfigClusterEntry) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return ec._ClusterStatusSourceKubeconfigClusterEntry(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalOEvent2ᚖgithubᚗcomᚋkubetailᚑorgᚋkstackᚑappᚋsidecarᚋinternalᚋclustersvcᚐEvent(ctx context.Context, sel ast.SelectionSet, v *clustersvc.Event) graphql.Marshaler {

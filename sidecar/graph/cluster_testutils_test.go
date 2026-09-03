@@ -660,7 +660,8 @@ func clusterFixtures() []clusterFixture {
 			},
 			connStatus: clustersvc.ClusterStatus{
 				Source: clustersvc.ClusterStatusSource{Kubeconfig: &clustersvc.ClusterStatusSourceKubeconfig{
-					Cluster: "prod-cluster", User: "prod-user",
+					Cluster:   clustersvc.ClusterStatusSourceKubeconfigCluster{Name: "prod-cluster"},
+					User:      clustersvc.ClusterStatusSourceKubeconfigUser{Name: "prod-user"},
 					IsPresent: true, IsDefault: true,
 				}},
 				Server:    clustersvc.ClusterServer{UID: &uid1, Version: &ver},
@@ -674,7 +675,8 @@ func clusterFixtures() []clusterFixture {
 			},
 			connStatus: clustersvc.ClusterStatus{
 				Source: clustersvc.ClusterStatusSource{Kubeconfig: &clustersvc.ClusterStatusSourceKubeconfig{
-					Cluster: "staging-cluster", User: "staging-user",
+					Cluster: clustersvc.ClusterStatusSourceKubeconfigCluster{Name: "staging-cluster"},
+					User:    clustersvc.ClusterStatusSourceKubeconfigUser{Name: "staging-user"},
 				}},
 			},
 		},

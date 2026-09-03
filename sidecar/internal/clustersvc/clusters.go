@@ -53,10 +53,37 @@ func KubeconfigName(contextName string) string {
 // kubeconfig observation: the cluster/user entry names and presence. Cached from the
 // last time the context was present, so it survives orphaning.
 type ClusterStatusSourceKubeconfig struct {
-	Cluster   string `json:"cluster"`
-	User      string `json:"user"`
-	IsPresent bool   `json:"isPresent"`
-	IsDefault bool   `json:"isDefault"`
+	Cluster   ClusterStatusSourceKubeconfigCluster `json:"cluster"`
+	User      ClusterStatusSourceKubeconfigUser    `json:"user"`
+	IsPresent bool                                 `json:"isPresent"`
+	IsDefault bool                                 `json:"isDefault"`
+}
+
+// ClusterStatusSourceKubeconfigCluster is the cluster half of a context: the entry name
+// it references, and the entry that name resolves to. The name is stated by the context
+// itself and the entry by the file, so the two go missing independently.
+type ClusterStatusSourceKubeconfigCluster struct {
+	Name string `json:"name"`
+	// nil when the kubeconfig defines no entry by that name. Read from the file rather
+	// than off the resolved rest.Config, so it is known before a first probe.
+	Entry *ClusterStatusSourceKubeconfigClusterEntry `json:"entry,omitempty"`
+}
+
+// ClusterStatusSourceKubeconfigClusterEntry mirrors the kubeconfig cluster entry.
+// Fields are added as a consumer needs them, so this is a subset of what the file
+// holds — but every field present is what the file says, and no verdict is drawn over
+// them here. A cluster entry carries no credential; the user half does, which is why
+// only this one mirrors.
+type ClusterStatusSourceKubeconfigClusterEntry struct {
+	Server                string `json:"server"`
+	InsecureSkipTLSVerify bool   `json:"insecureSkipTLSVerify"`
+}
+
+// ClusterStatusSourceKubeconfigUser is the user half of a context. It carries the entry
+// name alone: an authInfo entry holds credentials (token, client key, exec env), so
+// whatever is served from it is a chosen projection, never a mirror.
+type ClusterStatusSourceKubeconfigUser struct {
+	Name string `json:"name"`
 }
 
 // ClusterSpecSource is the discriminated union naming where a cluster record
@@ -809,12 +836,19 @@ func observeKubeconfig(cfg *api.Config, src *ClusterSpecSourceKubeconfig, prev *
 	}
 
 	if kctx := cfg.Contexts[src.Context]; kctx != nil {
-		return &ClusterStatusSourceKubeconfig{
-			Cluster:   kctx.Cluster,
-			User:      kctx.AuthInfo,
+		observed := &ClusterStatusSourceKubeconfig{
+			Cluster:   ClusterStatusSourceKubeconfigCluster{Name: kctx.Cluster},
+			User:      ClusterStatusSourceKubeconfigUser{Name: kctx.AuthInfo},
 			IsPresent: true,
 			IsDefault: src.Context == cfg.CurrentContext,
 		}
+		if c := cfg.Clusters[kctx.Cluster]; c != nil {
+			observed.Cluster.Entry = &ClusterStatusSourceKubeconfigClusterEntry{
+				Server:                c.Server,
+				InsecureSkipTLSVerify: c.InsecureSkipTLSVerify,
+			}
+		}
+		return observed
 	}
 
 	observed := ClusterStatusSourceKubeconfig{}

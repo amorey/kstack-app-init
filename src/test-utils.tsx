@@ -79,6 +79,10 @@ export type ClusterRow = {
   enabled?: boolean;
   present?: boolean;
   isDefault?: boolean;
+  // The cluster entry the context names; null puts the record in the state a
+  // kubeconfig naming an undefined entry produces.
+  server?: string;
+  insecureSkipTLSVerify?: boolean;
   // Set to mark the record as being torn down; the boundary streams these through.
   deleting?: boolean;
 };
@@ -96,8 +100,14 @@ export function clusterOf(r: ClusterRow) {
     status: {
       source: {
         kubeconfig: {
-          cluster: `${r.name}-cluster`,
-          user: `${r.name}-user`,
+          cluster: {
+            name: `${r.name}-cluster`,
+            entry: {
+              server: r.server ?? `https://${r.name}.example:6443`,
+              insecureSkipTLSVerify: r.insecureSkipTLSVerify ?? false,
+            },
+          },
+          user: { name: `${r.name}-user` },
           isPresent: r.present ?? true,
           isDefault: r.isDefault ?? false,
         },
