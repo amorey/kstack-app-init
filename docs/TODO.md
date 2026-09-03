@@ -162,23 +162,45 @@ distinguishable from an unnoticed one. **Decided against:**
 - **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Four rows
   in [`security-model.md`](security-model.md) are true today with nothing holding them. None wants a
   design; each wants one rule, a type, or a decision — which is why this is one item rather than
-  four. They do not all want the same mechanism, and sorting that out is the point: two of them end
-  the pass still held by review, and should stop reading like the two that can be fenced.
+  four. Two of them end this pass still held by review, and the point of doing it is that they stop
+  reading like the two that can be fenced.
+
+  **The rule the first pass set, and the only part worth insisting on: prove every fence by breaking
+  the thing it guards.** A green test proves less than a red one — the CSP test was checked against a
+  widened `script-src` *and* a widened `connect-src`, which are two different assertions inside it,
+  and the log test by adding `"variables", oc.Variables` to the presenter and watching the sentinel
+  appear. Move each row to **Enforced** naming its test in the same change, and shorten this item to
+  the rows still standing.
 
   - **Printer columns go through the restricted reader** — lint, not a test.
-    `src/lib/jsonpath.test.ts` already pins the reader's behaviour; what is unfenced is a future
-    template engine, which is the `custom/no-html-sinks` config object's job extended.
-  - **The unverified ID-token decode is display-only** — types, not a test.
-    `oauth.ParseIdentityUnverified` has exactly one production caller (`auth/grant.go`, assigning
-    `s.identity`), so the blast radius is small; the question to answer first is what reads
-    `s.identity` afterwards, since that decides whether a distinct type is worth its churn. A
-    compiler check would replace what a comment holds today.
-  - **Tokens never appear on the GraphQL surface** — a golden snapshot of `schema.graphqls` is the
-    only available fence and a weak one: it judges no new field, it only forces whoever adds one to
-    look. Worth deciding against in an ADR if the snapshot would just be rubber-stamped.
-  - **No authority granted ahead of a consumer** — no fence is possible; it is review over two
-    declarative files (`src-tauri/capabilities/default.json`, `sidecar/graph/schema.graphqls`). If we
-    want that to read as decided rather than pending, it is an ADR, not a test.
+    `src/lib/jsonpath.test.ts` already pins the reader's behaviour, so what is unfenced is a *future
+    template engine*, not the current code. Extend the `custom/no-html-sinks` config object in
+    `eslint.config.ts`; decide first whether the rule bans the import (a dependency arriving) or the
+    call (a helper someone writes by hand) — the honest answer is probably both, and the rule's name
+    should then say what it protects rather than how. Break it with a scratch file that interpolates
+    into a template and confirm `pnpm lint` fails.
+
+  - **The unverified ID-token decode is display-only** — types, not a test, and **read before
+    writing**: `oauth.ParseIdentityUnverified` has exactly one production caller
+    (`sidecar/internal/auth/grant.go`, assigning `s.identity`), so start by following what reads
+    `s.identity` afterwards. That answer decides the shape. If nothing authorization-shaped touches
+    it, a distinct type is cheap and the compiler comes to hold what a comment holds today; if
+    something does, that is a finding worth more than the fence, and it belongs in
+    [`security/`](security/) before anything is refactored.
+
+  - **Tokens never appear on the GraphQL surface** — **decide before building.** A golden snapshot of
+    `schema.graphqls` is the only mechanism available and it judges nothing: it cannot tell a token
+    field from any other new field, it only forces whoever adds one to accept a diff. Weigh that
+    against a snapshot everyone learns to re-bless. If the answer is no, that is an ADR rather than a
+    silent omission, and the row stays **Held by review** naming it — so the gap keeps reading as one
+    we looked at.
+
+  - **No authority granted ahead of a consumer** — no fence is possible, and the row already says so:
+    it is review over two declarative files (`src-tauri/capabilities/default.json`,
+    `sidecar/graph/schema.graphqls`). The only work available is deciding whether that is acceptable
+    and writing it down. If the row above also ends in a decision, both belong in **one** ADR about
+    what the security model holds by review and why, rather than two.
+
 - **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
   `release.yml` ships is signed direct downloads — a notarized `.dmg` with the sidecar signed
   inside it, an `.msi` signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and
@@ -226,5 +248,33 @@ distinguishable from an unnoticed one. **Decided against:**
   still launches, drop the entitlement, since it is also what would let an injected dylib load.
 
 ## Testing
+
+- **`make test-rust` does not run in the Linux sandbox — check whether it still doesn't before
+  trusting this.** Two separate faults, seen 2026-09-03 on a sandbox whose `target/` had been in use
+  since August; a rebuilt sandbox may clear either or both, so **re-run the two commands below
+  first and delete this item if they pass**.
+
+  1. **The crate does not compile.** `cargo build --lib` fails in `schemars 0.8.22` with
+     `E0107: struct takes 3 generic arguments but 2 generic arguments were supplied` — its
+     `Map<K, V>` alias wants the three-parameter `IndexMap` of indexmap 2.x, and `Cargo.lock` pins
+     that crate (a `tauri-build` build-dependency) to `indexmap 1.9.3`. **The lock is not the
+     problem and must not be "fixed":** the same commit builds and tests clean on the macOS host,
+     so this is Linux-only feature unification — some Linux-only crate in the GTK/WebKit chain
+     enables a different `indexmap` on `schemars`. `cargo tree -e features -i schemars@0.8.22` runs
+     without compiling and is where to start.
+  2. **The bind-mounted `target/` is not coherent.** `mkdir` returns `EEXIST` for directories cargo
+     has just created (the directory is there, freshly stamped, when you look), and
+     `.fingerprint/*/invoked.timestamp` files read back missing right after being written. Each
+     retry gets one directory further, so a loop makes progress — which is how to tell this fault
+     from the one above, and why a stuck build is worth retrying a few times before believing its
+     error. `CARGO_TARGET_DIR` is set to `.sandbox-linux/target` by `scripts/sandbox-dev-setup.sh`
+     ([ADR: sandbox build-output isolation](adr/2026-08-09-sandbox-build-separation.md)); the host's
+     own `src-tauri/target` is untouched and unaffected.
+
+  **Until it is fixed, a Rust change made in the sandbox is unverified there.** Go and JS suites are
+  unaffected. What worked meanwhile: compiling the test body verbatim in a throwaway crate against
+  the real input (`cargo new`, one `serde_json` dependency, `include_str!` repointed at a copy of
+  `tauri.conf.json`) — enough to prove the assertions and their failure modes, not enough to prove
+  it compiles in place, so the host still has to run it.
 
 - **Keep the no-wall-clock rule.** Both `CLAUDE.md` files state it, and the tree is currently clean: the frontend suites use `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `waitFor`, or the `flush()` helper with no `setTimeout` waits; Go's three `time.Sleep` calls are all the permitted kind and each says so — a widened truncate window in `kubeconfig_test.go`, a writer racing a gauge in `caches_test.go`, and `kubesync`'s deliberate exit latency; and `src-tauri/.../sidecar/ipc.rs`'s retry test — `#[tokio::test(start_paused = true)]`, letting tokio auto-advance virtual time between parked timers — is the shape to match. **What to watch for:** not `time.Sleep` but *thin real-timer margins* — tests that never sleep yet still fail on a loaded machine because they race short real durations. The fix shape is an injectable clock/timer seam so the test advances virtual time. The ~30 `time.After(...)` uses in sidecar tests are almost all *deadlines* guarding a channel receive, which the rule explicitly permits; keep those separate from any load-bearing wait. A `-count=20` soak on a loaded machine is the cheapest way to find regressions.
