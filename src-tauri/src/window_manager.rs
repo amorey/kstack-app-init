@@ -450,6 +450,37 @@ mod tests {
     }
 
     #[test]
+    fn default_capability_grants_only_window_chrome() {
+        // A capability is authority handed to a page that already holds the whole
+        // cluster surface, so it is granted when a consumer needs it and not before.
+        // Nothing judges that but a reader, so pin the list: a new permission has to
+        // be added here too, where the diff is about authority rather than a feature.
+        // Pinned beside the CSP because `build_window` creates the windows this
+        // capability names.
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("valid capability JSON");
+        let permissions: Vec<&str> = capability["permissions"]
+            .as_array()
+            .expect("permissions is a list")
+            .iter()
+            .map(|p| p.as_str().expect("permission is a string"))
+            .collect();
+        assert_eq!(
+            permissions,
+            [
+                "core:default",
+                "core:window:allow-start-dragging",
+                "core:window:allow-start-resize-dragging",
+                "core:window:allow-minimize",
+                "core:window:allow-toggle-maximize",
+                "core:window:allow-close",
+            ],
+            "the webview holds window chrome and nothing else — add a permission here only with the consumer that needs it"
+        );
+    }
+
+    #[test]
     fn labels_increase_monotonically() {
         let wm = WindowManager::new();
         assert_eq!(wm.next_label(), "window-1");

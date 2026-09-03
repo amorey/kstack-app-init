@@ -156,26 +156,13 @@ distinguishable from an unnoticed one. **Decided against:**
   hold a line the app is not already crossing. H-1 stands: the CSP and the absence of an HTML sink
   are the containment. → [no GraphQL operation
   allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md)
+- Pinning the GraphQL schema against a field served ahead of its consumer — it changes with nearly
+  every feature, so the pin would be re-blessed by habit. `src-tauri/capabilities/default.json` is
+  pinned instead, the auth projection's fields are pinned by type, and a mutation with no caller is
+  what review is for. → [the schema's breadth is held by
+  review](adr/2026-09-03-schema-breadth-is-held-by-review.md)
 
 **Without a spec yet:**
-
-- **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Two rows
-  in [`security-model.md`](security-model.md) are true today with nothing holding them. Neither
-  wants a design; each wants a pinned assertion or a decision, which is why this is one item rather
-  than two.
-
-  **The rule the first pass set, and the only part worth insisting on: prove every fence by breaking
-  the thing it guards.** A green test proves less than a red one — the CSP test was checked against a
-  widened `script-src` *and* a widened `connect-src`, which are two different assertions inside it,
-  and the log test by adding `"variables", oc.Variables` to the presenter and watching the sentinel
-  appear. Move each row to **Enforced** naming its test in the same change, and shorten this item to
-  the rows still standing.
-
-  - **No authority granted ahead of a consumer** — no fence is possible, and the row already says so:
-    it is review over two declarative files (`src-tauri/capabilities/default.json`,
-    `sidecar/graph/schema.graphqls`). The only work available is deciding whether that is acceptable
-    and writing it down. If the row above also ends in a decision, both belong in **one** ADR about
-    what the security model holds by review and why, rather than two.
 
 - **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
   `release.yml` ships is signed direct downloads — a notarized `.dmg` with the sidecar signed

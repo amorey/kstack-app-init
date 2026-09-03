@@ -118,3 +118,4 @@ usually just documentation in the wrong place.
 | 2026-09-03 | [Status mirrors the kubeconfig; the frontend draws the verdicts](2026-09-03-status-mirrors-the-kubeconfig.md) | cross-cutting | Accepted |
 | 2026-09-03 | [Bound the cache by total size, not by per-table event retention](2026-09-03-bound-the-cache-by-total-size.md) | sidecar | Accepted |
 | 2026-09-03 | [No GraphQL operation allowlist; the shipped set converges on the schema](2026-09-03-no-graphql-operation-allowlist.md) | cross-cutting | Accepted |
+| 2026-09-03 | [The schema's breadth is held by review; the capability file is pinned](2026-09-03-schema-breadth-is-held-by-review.md) | cross-cutting | Accepted |
