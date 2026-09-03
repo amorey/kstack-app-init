@@ -34,7 +34,8 @@ Four boundaries, in the order an attacker meets them:
 
 ## Protections
 
-**Enforced** means a test fails if it regresses. **Held by review** means it is true today and
+**Enforced** means the build stops if it regresses — a failing test, a lint error, or a type the
+compiler refuses; the row names which. **Held by review** means it is true today and
 nothing stops the next change undoing it. **By decision** means the gap is a risk we accepted, and
 links the ADR that accepted it. **Not built** links the work.
 
@@ -86,8 +87,8 @@ is why the rows above are worth keeping honest.
 
 ## How this is recorded
 
-- **This file** — what is true now. A row moves to *Enforced* when a test lands, never because the
-  code looks right.
+- **This file** — what is true now. A row moves to *Enforced* when the mechanism holding it lands,
+  never because the code looks right.
 - **[`docs/security/`](security/)** — dated review records, append-only, each naming the commit it
   reviewed. Like ADRs, they are exempt from the describe-the-present rule: a review says what was
   believed on the day. A later review is a new file, not an edit.
