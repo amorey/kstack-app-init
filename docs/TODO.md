@@ -264,33 +264,28 @@ distinguishable from an unnoticed one. **Decided against:**
   **Enforced**, naming the `kubeconn` tests, and give `sidecar/CLAUDE.md`'s "every enabled cluster is
   dialled" its exception where someone will find it.
 
-- **Updates say what they actually are.** `src-tauri/CLAUDE.md:7` claims in-app updates use
-  `tauri-plugin-updater` with signed bundles and a hosted manifest. Neither `src-tauri/Cargo.toml`
-  nor `src-tauri/tauri.conf.json` declares the plugin or an update public key, so a documented
-  verification step does not exist — worse than a missing one nobody assumed. What `release.yml`
-  ships is signed direct downloads: a notarized `.dmg` with the sidecar signed inside it, an `.msi`
-  signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and `SHA256SUMS` with a detached GPG
-  signature beside all of them. So a download is verifiable by hand everywhere and by the OS on two
-  platforms; what is missing is the in-app path — nothing checks for a newer build, and nothing
-  would verify one. **Correcting the sentence is five minutes and should not wait for the updater:**
-  say bundles are signed direct downloads and updating means downloading a new build by hand.
-  **The updater itself**, when we want it: a keypair from `pnpm tauri signer generate` whose private
-  half lives only in the `production` environment's secrets (`TAURI_SIGNING_PRIVATE_KEY` and its
-  password, which the three bundle jobs already run under); `tauri-plugin-updater` in `Cargo.toml`
-  and registered in `lib.rs`, with **nothing added to `src-tauri/capabilities/default.json`** — the
-  host checks, prompts and installs, and granting `updater:default` to the webview would hand a
-  compromised page the download-and-install path for no reason; `plugins.updater` in
-  `tauri.conf.json` carrying the **public** key (that key is what makes a substituted download fail
-  to install — the endpoint's TLS is not) and an `https` manifest endpoint, cheapest being the
-  GitHub release's `latest.json`; and `bundle.createUpdaterArtifacts: true`, after which the bundle
-  jobs emit a `.sig` beside each updater-capable artifact (`.dmg`/`.app.tar.gz`, `.msi`,
-  `.AppImage` — `.deb` and `.rpm` update through the package manager) and the `release` job
-  assembles `latest.json` from them. The sidecar rides the same signature as an `externalBin`, so it
-  needs no channel of its own. **Nothing here is unit-testable**; the check is manual and done once:
-  install an older build, publish a signed newer one to a test release and confirm it updates, then
-  publish one signed with a different key and confirm it is refused. **When it lands:** move
-  *"Signed in-app updates"* in [`security-model.md`](security-model.md) from **Not built** to **Held
-  by review**, and restore `src-tauri/CLAUDE.md`'s original sentence, which will by then be true.
+- **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
+  `release.yml` ships is signed direct downloads — a notarized `.dmg` with the sidecar signed
+  inside it, an `.msi` signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and
+  `SHA256SUMS` with a detached GPG signature beside all of them — so a download is verifiable by
+  hand everywhere and by the OS on two platforms. The in-app path is what is missing. **What it
+  takes:** a keypair from `pnpm tauri signer generate` whose private half lives only in the
+  `production` environment's secrets (`TAURI_SIGNING_PRIVATE_KEY` and its password, which the three
+  bundle jobs already run under); `tauri-plugin-updater` in `Cargo.toml` and registered in
+  `lib.rs`, with **nothing added to `src-tauri/capabilities/default.json`** — the host checks,
+  prompts and installs, and granting `updater:default` to the webview would hand a compromised page
+  the download-and-install path for no reason; `plugins.updater` in `tauri.conf.json` carrying the
+  **public** key (that key is what makes a substituted download fail to install — the endpoint's TLS
+  is not) and an `https` manifest endpoint, cheapest being the GitHub release's `latest.json`; and
+  `bundle.createUpdaterArtifacts: true`, after which the bundle jobs emit a `.sig` beside each
+  updater-capable artifact (`.dmg`/`.app.tar.gz`, `.msi`, `.AppImage` — `.deb` and `.rpm` update
+  through the package manager) and the `release` job assembles `latest.json` from them. The sidecar
+  rides the same signature as an `externalBin`, so it needs no channel of its own. **Nothing here is
+  unit-testable**; the check is manual and done once: install an older build, publish a signed newer
+  one to a test release and confirm it updates, then publish one signed with a different key and
+  confirm it is refused. **When it lands:** move *"Signed in-app updates"* in
+  [`security-model.md`](security-model.md) from **Not built** to **Held by review**, and rewrite
+  `src-tauri/CLAUDE.md`'s distribution paragraph, which states today that there are none.
 
 - **A cache stops outliving the user's interest in its cluster.** The one obligation left open by
   [the cache is ordinary application data](adr/2026-09-02-the-cache-is-ordinary-application-data.md):

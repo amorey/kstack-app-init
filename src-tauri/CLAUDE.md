@@ -4,7 +4,7 @@ The desktop app's native host (Tauri 2). It owns windows, the tray and menus, th
 
 ## Distribution & updates
 
-**Not distributed through the Mac App Store** — notarized direct downloads (`.dmg`/`.app`) plus Windows/Linux bundles; no MAS build target. In-app updates use the official `tauri-plugin-updater` (signed bundles + hosted manifest). The app and its bundled sidecar (`externalBin`) are versioned and updated together — a release bump covers either side changing.
+**Not distributed through the Mac App Store** — direct downloads, no MAS build target. **There are no in-app updates** — nothing checks for a newer build, and updating means downloading one by hand. `release.yml` signs what it ships: a notarized `.dmg` with the sidecar signed inside it, an `.msi` signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and `SHA256SUMS` with a detached GPG signature beside all of them. The app and its bundled sidecar (`externalBin`) are versioned and released together — a release bump covers either side changing.
 
 ## Layout
 
