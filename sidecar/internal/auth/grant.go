@@ -214,13 +214,15 @@ func (s *grant) ensureLoaded() error {
 	return nil
 }
 
-// applyToken caches a loaded token and decodes its identity. The unverified decode is
-// safe because Identity is display-only — the cloud re-verifies per request.
+// applyToken caches a loaded token and decodes its identity. DisplayOnly is the one place an
+// unchecked claim becomes an Identity: s.identity is only ever published on State, which no
+// caller authorizes from.
 func (s *grant) applyToken(tok Token) {
 	s.tok = tok
 	s.loaded = true
 	if tok.RefreshToken != "" {
-		s.identity, _ = oauth.ParseIdentityUnverified(tok.IDToken)
+		claims, _ := oauth.ParseIdentityUnverified(tok.IDToken)
+		s.identity = claims.DisplayOnly()
 	}
 }
 

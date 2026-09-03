@@ -159,11 +159,10 @@ distinguishable from an unnoticed one. **Decided against:**
 
 **Without a spec yet:**
 
-- **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Three rows
-  in [`security-model.md`](security-model.md) are true today with nothing holding them. None wants a
-  design; each wants a type or a decision — which is why this is one item rather than three. One of
-  them ends this pass still held by review, and the point of doing it is that it stops reading like
-  the two that can be fenced.
+- **Give the remaining *Held by review* rows a fence, and admit which cannot have one.** Two rows
+  in [`security-model.md`](security-model.md) are true today with nothing holding them. Neither
+  wants a design; each wants a pinned assertion or a decision, which is why this is one item rather
+  than two.
 
   **The rule the first pass set, and the only part worth insisting on: prove every fence by breaking
   the thing it guards.** A green test proves less than a red one — the CSP test was checked against a
@@ -171,14 +170,6 @@ distinguishable from an unnoticed one. **Decided against:**
   and the log test by adding `"variables", oc.Variables` to the presenter and watching the sentinel
   appear. Move each row to **Enforced** naming its test in the same change, and shorten this item to
   the rows still standing.
-
-  - **The unverified ID-token decode is display-only** — types, not a test, and **read before
-    writing**: `oauth.ParseIdentityUnverified` has exactly one production caller
-    (`sidecar/internal/auth/grant.go`, assigning `s.identity`), so start by following what reads
-    `s.identity` afterwards. That answer decides the shape. If nothing authorization-shaped touches
-    it, a distinct type is cheap and the compiler comes to hold what a comment holds today; if
-    something does, that is a finding worth more than the fence, and it belongs in
-    [`security/`](security/) before anything is refactored.
 
   - **Tokens never appear on the GraphQL surface** — **decide before building.** A golden snapshot of
     `schema.graphqls` is the only mechanism available and it judges nothing: it cannot tell a token

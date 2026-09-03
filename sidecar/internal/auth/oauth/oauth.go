@@ -41,12 +41,27 @@ func (t Token) Valid(now time.Time) bool {
 	return t.AccessToken != "" && now.Before(t.Expiry.Add(-expiryLeeway))
 }
 
-// Identity is the ID-token claims the app cares about; the JSON tags decode straight from
-// the OIDC claims, so both Verify and the startup decode unmarshal into it.
+// Identity is the ID-token claims the app cares about, from a token whose signature Verify
+// checked. The JSON tags decode straight from the OIDC claims.
 type Identity struct {
 	UserID string `json:"sub"`
 	Email  string `json:"email"`
 	Name   string `json:"name"`
+}
+
+// UnverifiedIdentity is the same claims from a token nobody checked. A separate type so the
+// compiler keeps an unchecked claim out of everywhere a verified one is expected; DisplayOnly
+// is the only way across, and it is named for the one thing such a value may be used for.
+type UnverifiedIdentity struct {
+	UserID string `json:"sub"`
+	Email  string `json:"email"`
+	Name   string `json:"name"`
+}
+
+// DisplayOnly hands the claims over to be shown. Nothing gates on them — the cloud re-verifies
+// the access token per request.
+func (u UnverifiedIdentity) DisplayOnly() Identity {
+	return Identity{UserID: u.UserID, Email: u.Email, Name: u.Name}
 }
 
 // Config is the OAuth client's static configuration. Endpoints are explicit rather than
@@ -182,22 +197,21 @@ func (c *Client) Verify(ctx context.Context, rawIDToken string) (Identity, error
 	return id, nil
 }
 
-// ParseIdentityUnverified decodes an ID token's claims WITHOUT verifying its signature —
-// only to restore display identity at startup from our own keychain. Never use it for an
-// authorization decision (use Verify); it grants no access, since the cloud re-verifies
-// the access token per request.
-func ParseIdentityUnverified(rawIDToken string) (Identity, error) {
+// ParseIdentityUnverified decodes an ID token's claims WITHOUT checking its signature — only
+// to restore display identity at startup from our own keychain. An authorization decision
+// takes Verify, and the return type is what holds that line.
+func ParseIdentityUnverified(rawIDToken string) (UnverifiedIdentity, error) {
 	parts := strings.Split(rawIDToken, ".")
 	if len(parts) != 3 {
-		return Identity{}, fmt.Errorf("oauth: malformed ID token")
+		return UnverifiedIdentity{}, fmt.Errorf("oauth: malformed ID token")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return Identity{}, fmt.Errorf("oauth: decode ID token payload: %w", err)
+		return UnverifiedIdentity{}, fmt.Errorf("oauth: decode ID token payload: %w", err)
 	}
-	var id Identity
+	var id UnverifiedIdentity
 	if err := json.Unmarshal(payload, &id); err != nil {
-		return Identity{}, fmt.Errorf("oauth: unmarshal ID token claims: %w", err)
+		return UnverifiedIdentity{}, fmt.Errorf("oauth: unmarshal ID token claims: %w", err)
 	}
 	return id, nil
 }
