@@ -145,24 +145,175 @@ The current picture — boundaries, and which protections a test actually pins �
 [`security-model.md`](security-model.md); the findings behind these items are
 [`security/2026-09-02-threat-model.md`](security/2026-09-02-threat-model.md).
 
-**Each item has a spec.** They live in [`docs/specs/`](specs/), numbered in build order, and are not
-repeated here:
-
-8. [Updates say what they actually are](specs/8-updates-say-what-they-are.md)
-10. [A kubeconfig exec plugin waits for approval](specs/10-approve-exec-credential-plugins.md)
-11. [The host sends only the operations the app ships](specs/11-allowlist-graphql-operations.md)
-15. [A cache stops outliving the user's interest in its cluster](specs/15-cache-retention.md)
-
 An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
-distinguishable from an unnoticed one. **Decided against:** aging out cached events by their own
-TTL — the whole-file ceiling bounds them instead, and between relists events still accumulate
-without a bound of their own. → [bound the cache by total size](adr/2026-09-03-bound-the-cache-by-total-size.md)
+distinguishable from an unnoticed one. **Decided against:**
 
-**Without a spec yet:** the threat model's H-3. `src-tauri/entitlements.plist` sets
-`com.apple.security.cs.disable-library-validation` so the hardened runtime will exec the sidecar,
-but `release.yml` now signs the sidecar inside the bundle under the same Team ID, which is the
-condition that entitlement was working around. Try a release build without it; if the sidecar
-still launches, drop the entitlement, since it is also what would let an injected dylib load.
+- Aging out cached events by their own TTL — the whole-file ceiling bounds them instead, and between
+  relists events still accumulate without a bound of their own. → [bound the cache by total
+  size](adr/2026-09-03-bound-the-cache-by-total-size.md)
+- Allowlisting the operations the host forwards (the threat model's **S-9**, which would have blunted
+  **H-1**) — the set of operations the app ships converges on the whole schema, so the cap would not
+  hold a line the app is not already crossing. H-1 stands: the CSP and the absence of an HTML sink
+  are the containment. → [no GraphQL operation
+  allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md)
+
+**Without a spec yet:**
+
+- **Give the *Held by review* rows a fence, and admit which ones cannot have one.** Seven rows in
+  [`security-model.md`](security-model.md) are true today with nothing stopping the next change
+  undoing them. Each wants one test or one rule, not a design — which is why this is one item rather
+  than seven. They do not all want the same mechanism, and sorting that out is the point of the
+  pass: today all seven read alike, and two of them will still read alike afterwards because no test
+  can exist for them. In rough value order:
+
+  - **The production CSP** (`src-tauri/tauri.conf.json`) — a Rust test over
+    `include_str!("../tauri.conf.json")` asserting the directives. The conf's `csp` is structured
+    JSON, so this is cheap, and it is the most valuable of the seven: the CSP is the *whole*
+    containment for a compromised page ([no GraphQL operation
+    allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md)) and nothing holds it.
+  - **GraphQL errors never log `variables`** — a Go test driving an error through the presenter and
+    asserting the record carries none. `sidecar/graph/server_test.go` is already there.
+  - **The idle-read bound on every non-watch request** — a test at the construction seam. There is
+    an ADR ([every non-watch request carries an idle-read
+    bound](adr/2026-09-02-idle-read-bound.md)) and no test file at all.
+  - **Printer columns go through the restricted reader** — lint, not a test.
+    `src/lib/jsonpath.test.ts` already pins the reader's behaviour; what is unfenced is a future
+    template engine, which is the `custom/no-html-sinks` config object's job extended.
+  - **The unverified ID-token decode is display-only** — types, not a test. Give
+    `ParseIdentityUnverified` a return type that cannot be passed where an authorization input is
+    expected, and the compiler holds what a comment holds today.
+  - **Tokens never appear on the GraphQL surface** — a golden snapshot of `schema.graphqls` is the
+    only available fence, and a weak one: it does not judge a new field, it just forces whoever adds
+    one to look at it.
+  - **No authority granted ahead of a consumer** — no fence is possible; it is review over two
+    declarative files (`src-tauri/capabilities/default.json`, `sidecar/graph/schema.graphqls`). If we
+    want that to read as decided rather than pending, it is an ADR, not a test.
+
+- **A kubeconfig `exec` plugin waits for approval.** A context can name an `exec` credential
+  plugin — a binary `clientcmd` runs to mint a token. The sidecar imports **every** context as an
+  enabled cluster (`clustersvc/clusters.go`), and the connection probe dials every enabled cluster
+  on startup and on every kubeconfig change, so writing a file into `~/.kube/` runs a program of the
+  writer's choosing, repeatedly, for contexts the user has never opened. `kubectl` runs the same
+  plugins, so the bar is not "never exec" — it is *not before the user has approved that program for
+  that cluster*.
+
+  **Two decisions the shape rests on.** *Approve on first use; do not import these clusters
+  disabled* — EKS, GKE and AKS all authenticate through `exec`, the picker filters on `spec.enabled`
+  (`src/lib/kube-config.tsx`), so defaulting them off empties the context picker for most cloud
+  users and hides the explanation with it. The cluster imports enabled and visible; what waits is
+  the **dial**. *Approval names the credentials, not the cluster* — the threat is a file write, and
+  a file write can also change the `command` of a context approved last month, so a flag on the
+  record reopens the hole for every context the user actually uses. `kubeconfig.RESTConfig` already
+  returns a **fingerprint** beside the config, hashing everything that resolves the context's
+  credentials including the plugin's command, args, env and API version
+  (`kubeconfig/restconfig.go`); the probe already recomputes it every run. Approval stores that —
+  nothing new is hashed.
+
+  **The gate goes in the probe, not the controller.** The kubeconfig watch wakes `kubeconn` directly
+  (`WakeAll(nameConnection)`) in parallel with the controller's pass, so a controller-side gate
+  races the probe re-reading the same change and dialling the new plugin before the lease is gone.
+  The one place with no window is `connectionProbe.Run`, after `RESTConfig` has returned `cfg` and
+  the fingerprint and before the rebuild arm: with `cfg.ExecProvider != nil` and the fingerprint
+  unapproved, retire the connection and `supervisor.Suspend` on a new `ReasonExecNotApproved` — a
+  suspended probe is what the pool already does for a departed context, so `Conn` returns
+  `ErrNoConnection` and nothing in the process can reach a transport for it.
+
+  **The rest of the sidecar work.** The approval reaches the probe through the lease
+  (`ApproveExec(fingerprint)`, stored beside the claims, a change waking the probe so a fresh
+  approval dials at once), written every pass from `obj.Spec.ExecApproved` beside `ensureLease`.
+  `observeKubeconfig` reads the user entry's exec block onto the user half of the status block —
+  command, args and the fingerprint from `RESTConfig`, **observed off the file and never resolved**,
+  since knowing a plugin exists must not require running it; the departed-context branch copies the
+  previous block wholesale, so the value is retained for free. On the schema that is `execPlugin` on
+  `ClusterStatusSourceKubeconfigUser`, a *projection* of an authInfo entry rather than a mirror
+  ([status mirrors the kubeconfig](adr/2026-09-03-status-mirrors-the-kubeconfig.md)) — a path and
+  flags are not credentials, but the plugin's `env` folds into the fingerprint and is never shown.
+  `ExecApproved` goes on `ClusterSpec` with a `clusterExecApprovalSet(id, fingerprint)` mutation
+  taking **the fingerprint the caller displayed**, so what is approved is what the user read rather
+  than whatever the file says when the click lands.
+
+  **The trap: a reason is not a condition, and the two will disagree.** Folding the verdict into
+  `reconcileConnection` as an `inactive` finding is right — this is a choice the user has not made,
+  not a server that failed — but `observeIdentified` hardcodes `ReasonInactive` for *any* inactive
+  finding, so the record would carry `Connected=False/ExecPluginNeedsApproval` beside
+  `Identified=False/Inactive`. Pass the finding's reason through the inactive arm so both say the
+  same thing, and keep the reason distinct from a disabled cluster's `ReasonInactive` — the UI has
+  to tell those apart. The timeline event is written by the **controller**, not the probe (`kubeconn`
+  never touches beehive), every pass like `logDiscoveryVerdict`: beehive extends a run when
+  `(Category, Type, Reason)` repeats, so "no noise per dial" falls out of the store rather than a
+  guard. Word it *resolved* credentials via exec plugin `<command>` — `clientcmd` runs the plugin
+  lazily, when a token is first needed.
+
+  **Frontend:** a banner in the context bar over `useActiveCluster()`, when `Connected` is false
+  with the approval reason — *This context runs `<command> <args…>` to sign in* — whose button calls
+  the mutation with the fingerprint from the frame that rendered it. Conditions are already selected
+  in full (`src/lib/clusters.tsx`), so the only addition to the watch is
+  `execPlugin { command args fingerprint }`. The picker needs nothing: the cluster is enabled.
+
+  **What it does not cover:** `PATH` still decides which binary `command: aws` resolves to (that is
+  `kubectl` parity — the approval names the command as written), and a context deleted and re-added
+  with the same block inherits its approval. A rotated CA or a moved `proxy-url` re-asks, since the
+  fingerprint covers the whole credential block — the price of one value meaning "what you
+  approved". **Tests:** in `kubeconn`, that an unapproved exec context never builds a connection
+  (through the fixture, not by timing), that a matching fingerprint arms the next run and a stale
+  one does not, that a fingerprint moving under an approved context suspends and retires, and that a
+  context with no exec block is untouched; in `clustersvc`, the observation, that such a cluster
+  imports **enabled**, the two conditions carrying the same reason, the mutation reaching the lease,
+  and a second pass extending the event's run rather than adding a row. **When it lands:** move *"A
+  gesture before a kubeconfig `exec` plugin runs"* in [`security-model.md`](security-model.md) to
+  **Enforced**, naming the `kubeconn` tests, and give `sidecar/CLAUDE.md`'s "every enabled cluster is
+  dialled" its exception where someone will find it.
+
+- **Updates say what they actually are.** `src-tauri/CLAUDE.md:7` claims in-app updates use
+  `tauri-plugin-updater` with signed bundles and a hosted manifest. Neither `src-tauri/Cargo.toml`
+  nor `src-tauri/tauri.conf.json` declares the plugin or an update public key, so a documented
+  verification step does not exist — worse than a missing one nobody assumed. What `release.yml`
+  ships is signed direct downloads: a notarized `.dmg` with the sidecar signed inside it, an `.msi`
+  signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and `SHA256SUMS` with a detached GPG
+  signature beside all of them. So a download is verifiable by hand everywhere and by the OS on two
+  platforms; what is missing is the in-app path — nothing checks for a newer build, and nothing
+  would verify one. **Correcting the sentence is five minutes and should not wait for the updater:**
+  say bundles are signed direct downloads and updating means downloading a new build by hand.
+  **The updater itself**, when we want it: a keypair from `pnpm tauri signer generate` whose private
+  half lives only in the `production` environment's secrets (`TAURI_SIGNING_PRIVATE_KEY` and its
+  password, which the three bundle jobs already run under); `tauri-plugin-updater` in `Cargo.toml`
+  and registered in `lib.rs`, with **nothing added to `src-tauri/capabilities/default.json`** — the
+  host checks, prompts and installs, and granting `updater:default` to the webview would hand a
+  compromised page the download-and-install path for no reason; `plugins.updater` in
+  `tauri.conf.json` carrying the **public** key (that key is what makes a substituted download fail
+  to install — the endpoint's TLS is not) and an `https` manifest endpoint, cheapest being the
+  GitHub release's `latest.json`; and `bundle.createUpdaterArtifacts: true`, after which the bundle
+  jobs emit a `.sig` beside each updater-capable artifact (`.dmg`/`.app.tar.gz`, `.msi`,
+  `.AppImage` — `.deb` and `.rpm` update through the package manager) and the `release` job
+  assembles `latest.json` from them. The sidecar rides the same signature as an `externalBin`, so it
+  needs no channel of its own. **Nothing here is unit-testable**; the check is manual and done once:
+  install an older build, publish a signed newer one to a test release and confirm it updates, then
+  publish one signed with a different key and confirm it is refused. **When it lands:** move
+  *"Signed in-app updates"* in [`security-model.md`](security-model.md) from **Not built** to **Held
+  by review**, and restore `src-tauri/CLAUDE.md`'s original sentence, which will by then be true.
+
+- **A cache stops outliving the user's interest in its cluster.** The one obligation left open by
+  [the cache is ordinary application data](adr/2026-09-02-the-cache-is-ordinary-application-data.md):
+  the file is protected as well as the kubeconfig beside it, but a token expires and a certificate
+  is revoked while the file keeps answering. **Shape:** evict a cache whose cluster has not been
+  opened in N days, and clear every cache on sign-out (`internal/auth`'s `Logout` is the hook) —
+  sign-out is the user saying the machine no longer speaks for them. `kubestore`'s `Manager.Remove`
+  already owns the teardown (closes the file, unlinks it and its `-wal`/`-shm`, refuses a later
+  open of the same id), so eviction is a policy above it rather than new machinery; what it needs
+  is a last-opened timestamp per cache, written where the cache record lives rather than inside the
+  file it is about to delete. **The open question is N**, which trades a cold relist on return
+  against how long a revoked credential's answers persist — settle it, and say why, before
+  building. **Constraints:** eviction is not a failure, so nothing may render a missing file as an
+  error state; and a claim still out must not resurrect the file, `Remove`'s retirement discipline
+  (decision recorded first, unlink retried after) being the reference. **When it lands:** move the
+  *"A retention policy…"* row in [`security-model.md`](security-model.md) to **Enforced**, naming
+  the test, and fold the policy into `sidecar/CLAUDE.md`.
+
+- **The threat model's H-3.** `src-tauri/entitlements.plist` sets
+  `com.apple.security.cs.disable-library-validation` so the hardened runtime will exec the sidecar,
+  but `release.yml` now signs the sidecar inside the bundle under the same Team ID, which is the
+  condition that entitlement was working around. Try a release build without it; if the sidecar
+  still launches, drop the entitlement, since it is also what would let an injected dylib load.
 
 ## Testing
 

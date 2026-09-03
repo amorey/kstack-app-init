@@ -51,7 +51,7 @@ path of every object.
 certificate is revoked, an employee is offboarded — the file still answers. That is the single way
 the cache is genuinely not "the same as the kubeconfig beside it", and the answer to it is
 retention, not encryption: a cache whose cluster the user has stopped opening should stop existing.
-That work is [spec 15](../specs/15-cache-retention.md).
+That work is tracked in [`TODO.md`](../TODO.md#security).
 
 ## Alternatives considered
 
@@ -83,7 +83,7 @@ its `-wal`/`-shm` sidecars stay `0600` in a `0700` directory (`TestCacheFileIsOw
 deletes its files rather than orphaning them (`TestRemoveDeletesTheFilesAndDropsTheOpenStore`). On
 Windows the mode is the inherited profile ACL, [by decision](2026-09-02-windows-cache-files-rely-on-the-profile-acl.md).
 
-Retention is now owed. Until spec 15 lands, a cache outlives the user's interest in the cluster it
+Retention is now owed. Until it lands, a cache outlives the user's interest in the cluster it
 mirrors, and this decision is only sound with that qualification stated.
 
 ## Revisit when

@@ -35,7 +35,7 @@ the webview, by `tlsUnverifiedReason` in `src/lib/kube-config.tsx`.
 **The two halves are not symmetric, and must not be made so.** A cluster entry holds no
 credential, so it is mirrored and says which fields it carries. An authInfo entry holds tokens,
 client keys and exec environments, so the user half carries the name alone today, and anything
-served from it later (spec 10's `execPlugin`) is a chosen projection — never "the entry, as the
+served from it later (the planned `execPlugin`) is a chosen projection — never "the entry, as the
 file states it".
 
 Kubeconfig facts go on **status**, never on `ClusterSpec` and never on a kubeconfig surface of
