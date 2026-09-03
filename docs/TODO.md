@@ -171,13 +171,6 @@ distinguishable from an unnoticed one. **Decided against:**
   appear. Move each row to **Enforced** naming its test in the same change, and shorten this item to
   the rows still standing.
 
-  - **Tokens never appear on the GraphQL surface** — **decide before building.** A golden snapshot of
-    `schema.graphqls` is the only mechanism available and it judges nothing: it cannot tell a token
-    field from any other new field, it only forces whoever adds one to accept a diff. Weigh that
-    against a snapshot everyone learns to re-bless. If the answer is no, that is an ADR rather than a
-    silent omission, and the row stays **Held by review** naming it — so the gap keeps reading as one
-    we looked at.
-
   - **No authority granted ahead of a consumer** — no fence is possible, and the row already says so:
     it is review over two declarative files (`src-tauri/capabilities/default.json`,
     `sidecar/graph/schema.graphqls`). The only work available is deciding whether that is acceptable
