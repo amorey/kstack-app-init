@@ -96,6 +96,11 @@ type ClusterCacheStats struct {
 	// (events are not a catalog kind).
 	ObjectCount int
 	KindCount   int
+	// OverSizeLimit is the janitor's verdict on the footprint, and SizeLimitBytes the
+	// ceiling it judged against (0 when unbounded). The verdict is soft by one sweep
+	// interval, and reads false for a cache nobody has open, which cannot grow.
+	OverSizeLimit  bool
+	SizeLimitBytes int64
 }
 
 // ClusterCacheHealth is one cache's sync verdict over every kind it syncs.
@@ -415,13 +420,15 @@ func (a cachesAPI) measureCache(ctx context.Context, cacheID ClusterCacheID) (Cl
 		return ClusterCacheStats{}, fmt.Errorf("measure cache %d: %w", cacheID, err)
 	}
 	return ClusterCacheStats{
-		Exists:      stats.Exists,
-		Bytes:       stats.Bytes(),
-		DBBytes:     stats.DBBytes,
-		WALBytes:    stats.WALBytes,
-		SHMBytes:    stats.SHMBytes,
-		ObjectCount: stats.ObjectCount,
-		KindCount:   stats.KindCount,
+		Exists:         stats.Exists,
+		Bytes:          stats.Bytes(),
+		DBBytes:        stats.DBBytes,
+		WALBytes:       stats.WALBytes,
+		SHMBytes:       stats.SHMBytes,
+		ObjectCount:    stats.ObjectCount,
+		KindCount:      stats.KindCount,
+		OverSizeLimit:  stats.OverSizeLimit,
+		SizeLimitBytes: stats.SizeLimitBytes,
 	}, nil
 }
 

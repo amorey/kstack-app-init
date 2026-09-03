@@ -60,6 +60,10 @@ type Manager struct {
 	// creates one, so a watch opened before the first worker or sweep has nothing to bind
 	// to and would otherwise wait out a poll.
 	opens *conflate.Hub[int64, struct{}]
+	// sizeLimitHub says a cache's size verdict has changed, keyed by cache. The manager's
+	// rather than a file's: the reader watches every cache, and the file a verdict is about
+	// is the one a Clear replaces.
+	sizeLimitHub *conflate.Hub[int64, struct{}]
 	// deleteFiles is the unlink step, and closeFile the close both clears go through:
 	// seams, so a white-box test can drive a clear whose files will not go or whose
 	// database will not close.
@@ -85,6 +89,10 @@ type entry struct {
 // OpenSubscription reports that a cache's file has come into existence. The value carries
 // nothing — the key is the whole news, and the reader answers it by binding.
 type OpenSubscription = *conflate.Receiver[int64, struct{}]
+
+// SizeLimitNews carries the caches whose size verdict has changed. The key is the whole
+// news; the reader answers it by calling Stats.
+type SizeLimitNews = *conflate.Receiver[int64, struct{}]
 
 var (
 	// ErrRemoved is what OpenOrCreate answers for a cache Remove retired.
@@ -122,12 +130,13 @@ func withCloseFile(fn func(f *file) error) option {
 // newManagerWithOptions is NewManager plus the seams.
 func newManagerWithOptions(dir string, opts ...option) *Manager {
 	m := &Manager{
-		dir:         dir,
-		entries:     map[int64]*entry{},
-		opens:       conflate.New[int64, struct{}](),
-		deleteFiles: deleteStoreFiles,
-		closeFile:   (*file).close,
-		removed:     map[int64]bool{},
+		dir:          dir,
+		entries:      map[int64]*entry{},
+		opens:        conflate.New[int64, struct{}](),
+		sizeLimitHub: conflate.New[int64, struct{}](),
+		deleteFiles:  deleteStoreFiles,
+		closeFile:    (*file).close,
+		removed:      map[int64]bool{},
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -154,7 +163,7 @@ func (m *Manager) openOrCreateLocked(cacheID int64) (*Store, error) {
 	}
 	e, ok := m.entries[cacheID]
 	if !ok {
-		f, err := openFile(m.path(cacheID), cacheID, m.retention)
+		f, err := openFile(m.path(cacheID), cacheID, m.retention, m.sizeLimitHub.Sender())
 		if err != nil {
 			return nil, err
 		}
@@ -178,6 +187,11 @@ func (m *Manager) openOrCreateLocked(cacheID int64) (*Store, error) {
 func (m *Manager) WatchOpen(cacheID int64) OpenSubscription {
 	return m.opens.Receiver(m.opens.WithKey(cacheID))
 }
+
+// WatchSizeLimitNews reports every cache that crossed its size limit or came back under
+// it. **Close it when done.** Edge-triggered: a reader hears that the verdict changed, and
+// reads what it is now from Stats.
+func (m *Manager) WatchSizeLimitNews() SizeLimitNews { return m.sizeLimitHub.Receiver() }
 
 // Subscribe returns the change feed for a cache someone already holds open, narrowed to
 // keys — or ok false, since the feed lives on the open file and there is none. **It takes
@@ -256,7 +270,7 @@ func (m *Manager) Clear(cacheID int64) error {
 	// usable. On a failed delete too: the caller retries the clear, and the cache has to
 	// keep working until it lands.
 	if held {
-		f, err := openFile(path, cacheID, m.retention)
+		f, err := openFile(path, cacheID, m.retention, m.sizeLimitHub.Sender())
 		if err != nil {
 			// Nothing usable to swap in, so retire the entry: a later OpenOrCreate opens
 			// the cache fresh, and the claims left on this one answer ErrClosed rather
@@ -319,20 +333,19 @@ func (m *Manager) Stats(ctx context.Context, cacheID int64) (Stats, error) {
 	defer m.mu.Unlock()
 
 	path := m.path(cacheID)
-	fi, err := os.Stat(path)
+	usage, err := statDiskUsage(path)
 	if os.IsNotExist(err) {
 		return Stats{}, nil
 	}
 	if err != nil {
 		return Stats{}, fmt.Errorf("stats: %w", err)
 	}
-	out := Stats{Exists: true, DBBytes: fi.Size()}
-	// Absent is zero, not an error: the sidecars exist only while the file is open.
-	if walInfo, err := os.Stat(path + "-wal"); err == nil {
-		out.WALBytes = walInfo.Size()
+	out := Stats{
+		Exists: true, DBBytes: usage.db, WALBytes: usage.wal, SHMBytes: usage.shm,
+		SizeLimitBytes: m.retention.SizeLimit,
 	}
-	if shmInfo, err := os.Stat(path + "-shm"); err == nil {
-		out.SHMBytes = shmInfo.Size()
+	if e, ok := m.entries[cacheID]; ok && e.file != nil {
+		out.OverSizeLimit = e.file.sizeVerdict.Load() == sizeOver
 	}
 
 	counts, err := m.countsLocked(ctx, path, cacheID)
@@ -341,6 +354,46 @@ func (m *Manager) Stats(ctx context.Context, cacheID int64) (Stats, error) {
 	}
 	out.Counts = counts
 	return out, nil
+}
+
+// diskUsage is the size of the three files a cache is: the database and its -wal/-shm
+// sidecars. The one measurement of a cache's size — Stats reports it and the janitor judges
+// it, so the gauge and the size limit can never disagree.
+type diskUsage struct{ db, wal, shm int64 }
+
+func (u diskUsage) total() int64 { return u.db + u.wal + u.shm }
+
+// statDiskUsage measures the cache at path. The main file's error comes back as is, for
+// the caller to interpret: Stats reads os.IsNotExist as "not cached", and zeroes for it
+// would report a full cache as absent.
+func statDiskUsage(path string) (diskUsage, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return diskUsage{}, err
+	}
+	u := diskUsage{db: fi.Size()}
+	if u.wal, err = sidecarSize(path + "-wal"); err != nil {
+		return diskUsage{}, err
+	}
+	if u.shm, err = sidecarSize(path + "-shm"); err != nil {
+		return diskUsage{}, err
+	}
+	return u, nil
+}
+
+// sidecarSize is the size of a -wal or -shm file, zero when it is absent: the pair exists
+// only while the file is open. Only absence is zero. Any other failure is returned, or a
+// sidecar that will not stat would undercount the cache and publish a release nothing
+// released.
+func sidecarSize(path string) (int64, error) {
+	fi, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
 }
 
 // counts reads the per-kind tallies without taking a claim: through the open file when
@@ -420,7 +473,9 @@ func deleteStoreFiles(path string) error {
 // The janitor starts HERE rather than at either call site: Clear reopens a fresh file for the
 // claims still held, and a start at the open alone would leave a cleared cache without a
 // sweeper — the cache most likely to need one, since a clear is what frees the pages.
-func openFile(path string, cacheID int64, ret Retention) (*file, error) {
+func openFile(
+	path string, cacheID int64, ret Retention, sizeLimitSender *conflate.Sender[int64, struct{}],
+) (*file, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
@@ -472,8 +527,8 @@ func openFile(path string, cacheID int64, ret Retention) (*file, error) {
 		return nil, err
 	}
 
-	f := newFile(db, readDB, writeStmts, readStmts)
-	f.startJanitor(cacheID, ret)
+	f := newFile(path, cacheID, db, readDB, writeStmts, readStmts, sizeLimitSender)
+	f.startJanitor(ret)
 	return f, nil
 }
 
@@ -488,6 +543,7 @@ func (m *Manager) Close() error {
 	// Ends every waiter, including one on a cache nothing ever opened — the only thing
 	// that would otherwise hold it is its own context.
 	m.opens.Close()
+	m.sizeLimitHub.Close()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -511,6 +567,15 @@ type Stats struct {
 	DBBytes  int64
 	WALBytes int64
 	SHMBytes int64
+	// OverSizeLimit is the janitor's last verdict on this file, never a comparison made
+	// here: a sweep checkpoints a WAL-heavy file before deciding and this measurement does
+	// not, so recomputing would disagree with the pause that hangs off the verdict. False
+	// when the cache does not exist, when nobody has it open (a closed cache cannot grow),
+	// and when the manager runs no janitor because its Interval is zero.
+	OverSizeLimit bool
+	// SizeLimitBytes is the limit itself, 0 when unbounded, so a client can render how
+	// close a cache is without hardcoding this package's default.
+	SizeLimitBytes int64
 	Counts
 }
 

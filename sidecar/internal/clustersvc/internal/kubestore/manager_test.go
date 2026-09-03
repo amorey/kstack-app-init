@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/gobus/conflate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/watch"
@@ -745,7 +746,7 @@ func TestOpenFileRepairsAFileThatPredatesTheDSN(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, legacy.Close())
 
-	f, err := openFile(path, 1, Retention{})
+	f, err := openFile(path, 1, Retention{}, conflate.New[int64, struct{}]().Sender())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, f.close()) })
 
@@ -918,4 +919,90 @@ func TestOpenReportsAReadStatementItCannotPrepare(t *testing.T) {
 	_, err := m.OpenOrCreate(1)
 
 	assert.ErrorContains(t, err, "kind_counts")
+}
+
+// statDiskUsage is the one measurement both callers share: the gauge through Stats, and
+// the janitor's size check. Its error return is what keeps "not cached" and "cannot read
+// this file" apart — collapsing them would report a full cache as absent.
+func TestStatDiskUsageMeasuresTheThreeFiles(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	require.NoError(t, store.SetCookie(context.Background(), "v1", "pods", "1"))
+
+	usage, err := statDiskUsage(filepath.Join(dir, "1.db"))
+
+	require.NoError(t, err)
+	main, statErr := os.Stat(filepath.Join(dir, "1.db"))
+	require.NoError(t, statErr)
+	assert.Equal(t, main.Size(), usage.db)
+	assert.Positive(t, usage.shm, "the sidecars are there while the file is open")
+	assert.GreaterOrEqual(t, usage.wal, int64(0))
+	assert.Equal(t, usage.db+usage.wal+usage.shm, usage.total())
+}
+
+// A missing main file is the caller's to interpret, so it comes back as a plain
+// os.IsNotExist rather than as zeroes: Stats reads it as "not cached", the janitor as a
+// file that went while it swept.
+func TestStatDiskUsageReportsAMissingFile(t *testing.T) {
+	_, err := statDiskUsage(filepath.Join(t.TempDir(), "nope.db"))
+
+	assert.True(t, os.IsNotExist(err), "got %v", err)
+}
+
+// The gauge reports the janitor's verdict rather than recomputing one. A sweep checkpoints
+// a WAL-heavy file before deciding and a bare measurement does not, so two verdicts would
+// disagree mid-checkpoint — and the pause hangs off this one.
+func TestStatsReportsTheJanitorsVerdict(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir(), Retention{SizeLimit: gib})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+
+	sweep(ctx, openFileOf(t, store), Retention{SizeLimit: 1})
+
+	got, err := m.Stats(ctx, 1)
+	require.NoError(t, err)
+	assert.True(t, got.OverSizeLimit)
+	assert.Equal(t, int64(gib), got.SizeLimitBytes, "the ceiling a client renders against")
+}
+
+// A cache nobody has open has no janitor and so no verdict. It is the right answer — a
+// closed cache cannot grow — but it sits beside a Bytes of whatever the file holds, so it
+// has to be stated rather than discovered.
+func TestStatsReportsNoVerdictForAClosedCache(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir(), Retention{SizeLimit: 1})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	store.Release()
+	require.False(t, cacheIsOpen(m, 1))
+
+	got, err := m.Stats(ctx, 1)
+
+	require.NoError(t, err)
+	assert.True(t, got.Exists)
+	assert.False(t, got.OverSizeLimit, "no open file, no verdict")
+}
+
+// A manager with no interval runs no janitor, so nothing ever forms a verdict. Every test
+// that opens a manager for some other reason is in this state.
+func TestStatsReportsNoVerdictWithoutAJanitor(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir(), Retention{SizeLimit: 1})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+
+	got, err := m.Stats(ctx, 1)
+
+	require.NoError(t, err)
+	assert.False(t, got.OverSizeLimit)
 }

@@ -48,3 +48,19 @@ func TestCacheFileIsOwnerOnly(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
 }
+
+// A sidecar that will not stat is not an absent one. Only absence is zero; any other
+// failure has to surface, or a transient error would undercount an over-limit cache and
+// the sweep would publish a release. A symlink to itself is a stat that fails with ELOOP
+// rather than ENOENT.
+func TestStatDiskUsageReportsASidecarItCannotStat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "1.db")
+	require.NoError(t, os.WriteFile(path, []byte("db"), 0o600))
+	require.NoError(t, os.Symlink(path+"-wal", path+"-wal"))
+
+	_, err := statDiskUsage(path)
+
+	require.Error(t, err)
+	assert.False(t, os.IsNotExist(err), "a failure, not an absence: %v", err)
+}

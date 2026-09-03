@@ -24,6 +24,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/watch"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // addStatusRow appends one status transition at a given age, standing in for the write an
@@ -43,7 +48,7 @@ func TestSweepTrimsStatusHistoryPastItsTTL(t *testing.T) {
 	addStatusRow(t, store, "uid-old", 48*time.Hour)
 	addStatusRow(t, store, "uid-fresh", time.Minute)
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 
 	assert.Equal(t, 0, countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE uid = 'uid-old'`))
 	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE uid = 'uid-fresh'`))
@@ -82,7 +87,7 @@ func TestSweepHandsFreePagesBack(t *testing.T) {
 	fillStatusHistory(t, store, 5000)
 	require.Zero(t, freelist(t, store), "a file that has freed nothing yet")
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 
 	assert.Zero(t, freelist(t, store), "the pages the delete freed went back to the OS")
 }
@@ -95,11 +100,11 @@ func TestSweepBoundsWhatOneVacuumHandsBack(t *testing.T) {
 	fillStatusHistory(t, store, 5000)
 	shrinkVacuumBound(t, 8)
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 	before := freelist(t, store)
 	require.NotZero(t, before, "a bounded sweep leaves a backlog")
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{StatusHistoryTTL: time.Hour})
 
 	assert.Equal(t, before-8, freelist(t, store), "the backlog drains at the same bound")
 }
@@ -201,7 +206,7 @@ func TestASweepSurvivesAVacuumItCannotRun(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, displaced.Close()) })
 	f.db = readOnly
 
-	assert.NotPanics(t, func() { sweep(ctx, "1", f, Retention{StatusHistoryTTL: time.Hour}) })
+	assert.NotPanics(t, func() { sweep(ctx, f, Retention{StatusHistoryTTL: time.Hour}) })
 }
 
 // addDeleteEntry logs one delete at a given age, standing in for the entry a delete left.
@@ -230,7 +235,7 @@ func TestSweepTrimsTheDeletesLogPastItsTTL(t *testing.T) {
 	addDeleteEntry(t, store, "Pod", "uid-older", 4, 49*time.Hour)
 	addDeleteEntry(t, store, "Pod", "uid-fresh", 9, time.Minute)
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: time.Hour})
 
 	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM deletes`), "only the fresh entry stays")
 	assert.Equal(t, int64(7), trimmedMark(t, store, "Pod"), "the highest position removed")
@@ -244,7 +249,7 @@ func TestSweepMarksEachKindSeparately(t *testing.T) {
 	addDeleteEntry(t, store, "ConfigMap", "uid-2", 8, 48*time.Hour)
 	addDeleteEntry(t, store, "Secret", "uid-3", 9, time.Minute)
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: time.Hour})
 
 	assert.Equal(t, int64(3), trimmedMark(t, store, "Pod"))
 	assert.Equal(t, int64(8), trimmedMark(t, store, "ConfigMap"))
@@ -259,7 +264,7 @@ func TestAZeroTTLTrimsNothing(t *testing.T) {
 	addDeleteEntry(t, store, "Pod", "uid-1", 5, 48*time.Hour)
 	addStatusRow(t, store, "uid-1", 48*time.Hour)
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{})
+	sweep(context.Background(), openFileOf(t, store), Retention{})
 
 	assert.Equal(t, 1, countRows(t, store, `SELECT COUNT(*) FROM deletes`))
 	assert.Zero(t, trimmedMark(t, store, "Pod"), "nothing went, so nothing is marked")
@@ -271,9 +276,9 @@ func TestAZeroTTLTrimsNothing(t *testing.T) {
 func TestASweepThatRemovesNothingLeavesTheMarkAlone(t *testing.T) {
 	store := newTestStore(t)
 	addDeleteEntry(t, store, "Pod", "uid-1", 5, 48*time.Hour)
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: time.Hour})
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: time.Hour})
 
 	assert.Equal(t, int64(5), trimmedMark(t, store, "Pod"))
 }
@@ -289,9 +294,9 @@ func TestASweepNeverLowersAKindsMark(t *testing.T) {
 	addDeleteEntry(t, store, "Pod", "uid-high", 200, 90*time.Minute)
 	addDeleteEntry(t, store, "Pod", "uid-low", 100, 30*time.Minute)
 
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+	sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: time.Hour})
 	require.Equal(t, int64(200), trimmedMark(t, store, "Pod"))
-	sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: 10 * time.Minute})
+	sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: 10 * time.Minute})
 
 	assert.Equal(t, int64(200), trimmedMark(t, store, "Pod"), "the older entry's lower position")
 	assert.Zero(t, countRows(t, store, `SELECT COUNT(*) FROM deletes`), "both entries went")
@@ -305,6 +310,177 @@ func TestSweepSurvivesATrimItCannotMake(t *testing.T) {
 		`SELECT 1 AS seq, 'v1' AS api_version, 'Pod' AS kind, 'uid-1' AS uid, 0 AS at`)
 
 	assert.NotPanics(t, func() {
-		sweep(context.Background(), "1", openFileOf(t, store), Retention{DeletesTTL: time.Hour})
+		sweep(context.Background(), openFileOf(t, store), Retention{DeletesTTL: time.Hour})
 	})
+}
+
+// The ceiling is the whole footprint, so a sweep's verdict is the sum of the three files
+// against SizeLimit — measured after the vacuum, or the freelist would trip a limit
+// nothing is filling.
+func TestSweepMarksAFileOverItsLimit(t *testing.T) {
+	store := newTestStore(t)
+	f := openFileOf(t, store)
+
+	sweep(context.Background(), f, Retention{SizeLimit: 1})
+
+	assert.Equal(t, sizeOver, f.sizeVerdict.Load())
+}
+
+func TestSweepMarksAFileUnderItsLimit(t *testing.T) {
+	store := newTestStore(t)
+	f := openFileOf(t, store)
+
+	sweep(context.Background(), f, Retention{SizeLimit: gib})
+
+	assert.Equal(t, sizeUnder, f.sizeVerdict.Load())
+}
+
+// Zero is unbounded, and it forms no verdict at all rather than answering "under". That is
+// what keeps the first sweep of a file always publishing while an unbounded manager never
+// does — and what leaves a limit that later becomes non-zero its own first edge.
+func TestSweepFormsNoVerdictWithoutALimit(t *testing.T) {
+	store := newTestStore(t)
+	f := openFileOf(t, store)
+
+	sweep(context.Background(), f, Retention{})
+
+	assert.Equal(t, sizeUnknown, f.sizeVerdict.Load())
+}
+
+// A sync's writes sit in the WAL until a checkpoint moves them, so a file can cross its
+// ceiling on a log that is about to be reclaimed. Pausing a cache whose contents fit is the
+// wrong answer, so the sweep checkpoints first and judges the size that remains.
+func TestSweepCheckpointsBeforeJudgingAWALHeavyFile(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	f := openFileOf(t, store)
+	// Nothing reclaims the log on its own, so the writes below stay in it.
+	_, err := f.db.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0`)
+	require.NoError(t, err)
+	fillStatusHistory(t, store, 5000)
+	usage, err := statDiskUsage(f.path)
+	require.NoError(t, err)
+	require.Greater(t, usage.wal, usage.db, "the writes are in the log, not the file")
+
+	// A limit the pair crosses and the checkpointed file does not.
+	sweep(ctx, f, Retention{SizeLimit: usage.db + usage.wal - 1})
+
+	assert.Equal(t, sizeUnder, f.sizeVerdict.Load())
+}
+
+// The verdict is published as an edge: a reader is woken when the answer changes and left
+// alone while it stands. A ping per sweep would wake a controller pass every interval per
+// cache to say what it already knew.
+func TestSweepPublishesOnlyWhenTheVerdictChanges(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	f := openFileOf(t, store)
+	news := m.WatchSizeLimitNews()
+	t.Cleanup(news.Close)
+
+	sweep(ctx, f, Retention{SizeLimit: 1})
+	assert.Equal(t, int64(1), testutil.Recv(t, news.Chan(), "the first verdict").Key)
+
+	sweep(ctx, f, Retention{SizeLimit: 1})
+	testutil.NoRecv(t, news.Chan(), 50*time.Millisecond, "a verdict that did not change")
+
+	sweep(ctx, f, Retention{SizeLimit: gib})
+	assert.Equal(t, int64(1), testutil.Recv(t, news.Chan(), "the release").Key)
+}
+
+// Unbounded publishes nothing at all. The memo stays unknown, so a limit that later becomes
+// non-zero still gets an edge off its own first sweep.
+func TestSweepPublishesNothingWithoutALimit(t *testing.T) {
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	news := m.WatchSizeLimitNews()
+	t.Cleanup(news.Close)
+
+	sweep(context.Background(), openFileOf(t, store), Retention{})
+
+	testutil.NoRecv(t, news.Chan(), 50*time.Millisecond, "an unbounded manager")
+}
+
+// A clear swaps in a fresh file, and its verdict memo starts unknown rather than under —
+// so the first sweep of the new file reports the release. A two-state memo would read the
+// swap as "under, unchanged" and the cache would stay paused with nothing left to pause it.
+func TestAClearedFilePublishesItsFirstVerdict(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(store.Release)
+	sweep(ctx, openFileOf(t, store), Retention{SizeLimit: 1})
+	news := m.WatchSizeLimitNews()
+	t.Cleanup(news.Close)
+
+	require.NoError(t, m.Clear(1))
+	sweep(ctx, openFileOf(t, store), Retention{SizeLimit: gib})
+
+	assert.Equal(t, int64(1), testutil.Recv(t, news.Chan(), "the fresh file's first verdict").Key)
+}
+
+// The sweep interval is five minutes in production, which is a lot of cluster on a cache
+// filling fast — and a long wait for the release after a clear shrinks one. So every write
+// path that commits wakes the janitor, whether it grew the file or shrank it. The interval
+// here is an hour precisely so nothing but the wake can explain the second sweep, and the
+// expired status row is what says a sweep ran: no write below touches it, and only the
+// sweep trims it.
+func TestEveryCommitWakesTheJanitor(t *testing.T) {
+	pods := Kind{APIVersion: "v1", Kind: "Pod", Resource: "pods"}
+	writes := map[string]func(t *testing.T, ctx context.Context, store *Store){
+		"apply change": func(t *testing.T, ctx context.Context, store *Store) {
+			require.NoError(t, store.ApplyChange(ctx, pods, watch.Added, pod("uid-1", "api-0", "1")))
+		},
+		"relist page": func(t *testing.T, ctx context.Context, store *Store) {
+			session, err := store.BeginReplace(pods)
+			require.NoError(t, err)
+			require.NoError(t, session.WritePage(ctx, []*unstructured.Unstructured{pod("uid-1", "api-0", "1")}))
+		},
+		"relist commit": func(t *testing.T, ctx context.Context, store *Store) {
+			session, err := store.BeginReplace(pods)
+			require.NoError(t, err)
+			_, err = session.Commit(ctx, "1")
+			require.NoError(t, err)
+		},
+		"sync kinds": func(t *testing.T, ctx context.Context, store *Store) {
+			require.NoError(t, store.SyncKinds(ctx, []KindRow{{APIVersion: "v1", Kind: "Pod", Resource: "pods"}}, true, 1))
+		},
+		"clear kind": func(t *testing.T, ctx context.Context, store *Store) {
+			require.NoError(t, store.ClearKind(ctx, pods))
+		},
+		"set cookie": func(t *testing.T, ctx context.Context, store *Store) {
+			require.NoError(t, store.SetCookie(ctx, "v1", "pods", "1"))
+		},
+	}
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			m := NewManager(t.TempDir(), Retention{StatusHistoryTTL: time.Hour, Interval: time.Hour, SizeLimit: gib})
+			t.Cleanup(func() { require.NoError(t, m.Close()) })
+			news := m.WatchSizeLimitNews()
+			t.Cleanup(news.Close)
+			store, err := m.OpenOrCreate(1)
+			require.NoError(t, err)
+			t.Cleanup(store.Release)
+			// The opening sweep's verdict, which is what says that sweep is over: the row
+			// added after it is the woken sweep's to trim and nobody else's.
+			testutil.Recv(t, news.Chan(), "the opening sweep")
+			addStatusRow(t, store, "uid-old", 48*time.Hour)
+
+			write(t, ctx, store)
+
+			require.Eventually(t, func() bool {
+				return countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE uid = 'uid-old'`) == 0
+			}, 5*time.Second, time.Millisecond, "the write woke a sweep before the ticker could")
+		})
+	}
 }

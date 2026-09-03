@@ -1993,3 +1993,19 @@ func TestTheCacheGaugesEndCleanlyWhenTheConsumerLeaves(t *testing.T) {
 	assert.NoError(t, health.Err())
 	assert.NoError(t, stats.Err())
 }
+
+// The ceiling reaches the UI on the gauge the size is already on, so a client renders how
+// close a cache is without a second subscription — and without hardcoding our default.
+func TestMeasureCacheCarriesTheSizeCeiling(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.kubestoreMgr = &fakeKubestore{stats: kubestore.Stats{
+		Exists: true, DBBytes: 100, OverSizeLimit: true, SizeLimitBytes: 512,
+	}}
+	svc := &service{deps: deps}
+
+	got, err := cachesAPI{s: svc}.measureCache(context.Background(), 1)
+
+	require.NoError(t, err)
+	assert.True(t, got.OverSizeLimit)
+	assert.Equal(t, int64(512), got.SizeLimitBytes)
+}

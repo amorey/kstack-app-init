@@ -115,3 +115,4 @@ usually just documentation in the wrong place.
 | 2026-09-02 | [Let the profile ACL protect the cache files on Windows](2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) | cross-cutting | Accepted |
 | 2026-09-02 | [The cluster cache is ordinary application data, not credential-bearing storage](2026-09-02-the-cache-is-ordinary-application-data.md) | sidecar | Accepted |
 | 2026-09-03 | [Status mirrors the kubeconfig; the frontend draws the verdicts](2026-09-03-status-mirrors-the-kubeconfig.md) | cross-cutting | Accepted |
+| 2026-09-03 | [Bound the cache by total size, not by per-table event retention](2026-09-03-bound-the-cache-by-total-size.md) | sidecar | Accepted |

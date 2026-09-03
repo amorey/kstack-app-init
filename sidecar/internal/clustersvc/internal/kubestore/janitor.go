@@ -41,21 +41,32 @@ type Retention struct {
 	// Interval is the sweep cadence. Zero runs no janitor at all, which is what a test
 	// about anything else opens its manager with.
 	Interval time.Duration
+	// SizeLimit caps the cache's whole footprint in bytes — the database plus its
+	// -wal/-shm sidecars, the same sum Stats.Bytes reports. Zero is unbounded. The limit
+	// is soft: a sweep is what notices, so a cache overshoots by whatever the cluster
+	// sends between one sweep and the next.
+	SizeLimit int64
 }
+
+// gib is one gibibyte, the unit SizeLimit is set in.
+const gib = 1 << 30
 
 // DefaultRetention is the production setting.
 var DefaultRetention = Retention{
 	StatusHistoryTTL: 7 * 24 * time.Hour,
 	DeletesTTL:       time.Hour,
 	Interval:         5 * time.Minute,
+	SizeLimit:        2 * gib,
 }
 
-// runJanitor sweeps on a fixed interval until ctx is cancelled, surviving an individual
-// sweep's failure — the next interval retries. The first sweep runs HERE rather than at the
-// open that spawned this: inline it would run a vacuum under m.mu, which Clear holds across
-// close → unlink → reopen and Stats holds for its whole measurement.
-func runJanitor(ctx context.Context, id string, f *file, ret Retention) {
-	sweep(ctx, id, f, ret)
+// runJanitor sweeps until ctx is cancelled; a sweep that fails is retried by the next one.
+// Two things wake it: a write, so a cache filling fast is measured within seconds, and the
+// ticker, for the checkpoints and vacuums that move a file's size with no write behind
+// them. The first sweep runs here rather than in the open that spawned this goroutine:
+// inline it would vacuum under m.mu, which Clear holds across close → unlink → reopen and
+// Stats holds for its whole measurement.
+func runJanitor(ctx context.Context, f *file, ret Retention) {
+	sweep(ctx, f, ret)
 
 	t := time.NewTicker(ret.Interval)
 	defer t.Stop()
@@ -64,14 +75,16 @@ func runJanitor(ctx context.Context, id string, f *file, ret Retention) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-f.janitorWakeups:
 		}
-		sweep(ctx, id, f, ret)
+		sweep(ctx, f, ret)
 	}
 }
 
-// sweep trims what this cache's own tables hold past their retention. Sweeps are ordinary
-// writes, so they serialize with the syncs behind the writer pool's single connection.
-func sweep(ctx context.Context, id string, f *file, ret Retention) {
+// sweep is one janitor pass: trim the tables past their retention, hand freed pages back
+// to the OS, then check the file against its size limit. Sweeps are ordinary writes, so
+// they serialize with the syncs behind the writer pool's single connection.
+func sweep(ctx context.Context, f *file, ret Retention) {
 	// A zero TTL is a table this manager was not given a retention for, and the fields are
 	// independent — so a partial Retention must leave each unset one alone. Without the
 	// guard the cutoff is now, which trims the whole table: for deletes that also raises
@@ -84,32 +97,92 @@ func sweep(ctx context.Context, id string, f *file, ret Retention) {
 		if _, err := f.stmts().exec(ctx, stmtSweepStatusHistory,
 			time.Now().Add(-ret.StatusHistoryTTL).UnixMilli(),
 		); err != nil {
-			slog.Warn("kubestore: status_history sweep failed", "cacheID", id, "err", err)
+			slog.Warn("kubestore: status_history sweep failed", "cacheID", f.cacheID, "err", err)
 		}
 	}
 
 	if ret.DeletesTTL > 0 {
 		if err := trimDeletes(ctx, f, time.Now().Add(-ret.DeletesTTL).UnixMilli()); err != nil {
-			slog.Warn("kubestore: deletes sweep failed", "cacheID", id, "err", err)
+			slog.Warn("kubestore: deletes sweep failed", "cacheID", f.cacheID, "err", err)
 		}
 	}
 
-	// Hand freed pages back to the OS; under auto_vacuum=INCREMENTAL this walks only the
-	// freelist. THE FREELIST decides, never what this sweep itself deleted — the writers
-	// that actually free pages (a relist's prune, ClearKind, a Remove) do not vacuum, so a
-	// rows-deleted gate would strand the file at its high-water mark forever.
+	// Under auto_vacuum=INCREMENTAL this walks only the freelist. THE FREELIST decides,
+	// never what this sweep itself deleted — the writers that actually free pages (a
+	// relist's prune, ClearKind, a Remove) do not vacuum, so a rows-deleted gate would
+	// strand the file at its high-water mark forever.
 	var freePages int64
 	if err := f.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
-		slog.Warn("kubestore: freelist_count failed", "cacheID", id, "err", err)
-		return
+		slog.Warn("kubestore: freelist_count failed", "cacheID", f.cacheID, "err", err)
+	} else if freePages > 0 {
+		vacuum(ctx, f, freePages)
 	}
-	if freePages == 0 {
-		return
-	}
-	// Bounded: the argument-less form reclaims the whole freelist in one statement, holding
-	// the single writer for as long as that takes.
+
+	checkSizeLimit(ctx, f, ret.SizeLimit)
+}
+
+// vacuum hands at most vacuumPagesPerSweep free pages back to the OS. Bounded because the
+// argument-less form reclaims the whole freelist in one statement, holding the single
+// writer for as long as that takes.
+func vacuum(ctx context.Context, f *file, freePages int64) {
 	pages := min(freePages, vacuumPagesPerSweep)
 	if _, err := f.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, pages)); err != nil {
-		slog.Warn("kubestore: incremental_vacuum failed", "cacheID", id, "err", err)
+		slog.Warn("kubestore: incremental_vacuum failed", "cacheID", f.cacheID, "err", err)
+	}
+}
+
+// checkpoint moves the write-ahead log into the database and truncates it. A reader still
+// on the log leaves part of it behind, which SQLite reports as busy rather than as a
+// failure: the sweep judges whatever size that left, and the next one takes the rest.
+func checkpoint(ctx context.Context, f *file) {
+	var busy, logPages, movedPages int64
+	if err := f.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).
+		Scan(&busy, &logPages, &movedPages); err != nil {
+		slog.Warn("kubestore: wal_checkpoint failed", "cacheID", f.cacheID, "err", err)
+	}
+}
+
+// A sweep's verdict on the file's size, kept in file.sizeVerdict. sizeUnknown is where a
+// file starts and where an unbounded manager leaves it. It is not "under": the first
+// checked sweep of any file is a change and gets published — including the fresh file a
+// Clear swaps in, whose release nothing else would report.
+const (
+	sizeUnknown int32 = iota
+	sizeUnder
+	sizeOver
+)
+
+// checkSizeLimit measures the file, records whether it is over its limit, and publishes
+// the verdict when it changed. It runs after the vacuum: before it the size is the file's
+// high-water mark, and free pages would trip a limit nothing is filling.
+//
+// A failed measurement leaves the verdict alone. A file gone from under a sweep is a clear
+// or a teardown, and answering "under" for it would publish a release nothing released.
+func checkSizeLimit(ctx context.Context, f *file, limit int64) {
+	if limit <= 0 {
+		return
+	}
+	usage, err := statDiskUsage(f.path)
+	if err != nil {
+		slog.Warn("kubestore: size check failed", "cacheID", f.cacheID, "err", err)
+		return
+	}
+	// A log larger than its database is a checkpoint owed, not a full cache: its pages
+	// overwrite ones the database already counts, so the sum would count them twice and
+	// could pause a cache whose contents fit.
+	if usage.wal > usage.db {
+		checkpoint(ctx, f)
+		if usage, err = statDiskUsage(f.path); err != nil {
+			slog.Warn("kubestore: size check failed", "cacheID", f.cacheID, "err", err)
+			return
+		}
+	}
+	verdict := sizeUnder
+	if usage.total() > limit {
+		verdict = sizeOver
+	}
+	if f.sizeVerdict.Swap(verdict) != verdict {
+		// Fails only on a closed hub: the manager shutting down under a sweep in flight.
+		_ = f.sizeLimitSender.Send(f.cacheID, struct{}{})
 	}
 }

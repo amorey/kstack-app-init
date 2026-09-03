@@ -104,6 +104,10 @@ type kubestoreManager interface {
 	Clear(cacheID int64) error
 	Remove(cacheID int64) error
 	Stats(ctx context.Context, cacheID int64) (kubestore.Stats, error)
+	// WatchSizeLimitNews carries the caches whose size verdict has changed. Edge-triggered
+	// and payload-free, like every feed a trigger rides: the pass reads Stats for the
+	// verdict itself.
+	WatchSizeLimitNews() kubestore.SizeLimitNews
 }
 
 // kubesyncService is the seam that fills a cache, as this package reaches it. It speaks

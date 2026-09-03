@@ -114,13 +114,15 @@ type ComplexityRoot struct {
 	}
 
 	ClusterCacheStats struct {
-		Bytes       func(childComplexity int) int
-		DBBytes     func(childComplexity int) int
-		Exists      func(childComplexity int) int
-		KindCount   func(childComplexity int) int
-		ObjectCount func(childComplexity int) int
-		SHMBytes    func(childComplexity int) int
-		WALBytes    func(childComplexity int) int
+		Bytes          func(childComplexity int) int
+		DBBytes        func(childComplexity int) int
+		Exists         func(childComplexity int) int
+		KindCount      func(childComplexity int) int
+		ObjectCount    func(childComplexity int) int
+		OverSizeLimit  func(childComplexity int) int
+		SHMBytes       func(childComplexity int) int
+		SizeLimitBytes func(childComplexity int) int
+		WALBytes       func(childComplexity int) int
 	}
 
 	ClusterCacheSyncStatus struct {
@@ -762,12 +764,24 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ClusterCacheStats.ObjectCount(childComplexity), true
+	case "ClusterCacheStats.overSizeLimit":
+		if e.ComplexityRoot.ClusterCacheStats.OverSizeLimit == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.OverSizeLimit(childComplexity), true
 	case "ClusterCacheStats.shmBytes":
 		if e.ComplexityRoot.ClusterCacheStats.SHMBytes == nil {
 			break
 		}
 
 		return e.ComplexityRoot.ClusterCacheStats.SHMBytes(childComplexity), true
+	case "ClusterCacheStats.sizeLimitBytes":
+		if e.ComplexityRoot.ClusterCacheStats.SizeLimitBytes == nil {
+			break
+		}
+
+		return e.ComplexityRoot.ClusterCacheStats.SizeLimitBytes(childComplexity), true
 	case "ClusterCacheStats.walBytes":
 		if e.ComplexityRoot.ClusterCacheStats.WALBytes == nil {
 			break
@@ -2081,6 +2095,10 @@ func (ec *executionContext) childFields_ClusterCacheStats(ctx context.Context, f
 		return ec.fieldContext_ClusterCacheStats_objectCount(ctx, field)
 	case "kindCount":
 		return ec.fieldContext_ClusterCacheStats_kindCount(ctx, field)
+	case "overSizeLimit":
+		return ec.fieldContext_ClusterCacheStats_overSizeLimit(ctx, field)
+	case "sizeLimitBytes":
+		return ec.fieldContext_ClusterCacheStats_sizeLimitBytes(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ClusterCacheStats", field.Name)
 }
@@ -4474,6 +4492,52 @@ func (ec *executionContext) _ClusterCacheStats_kindCount(ctx context.Context, fi
 	)
 }
 func (ec *executionContext) fieldContext_ClusterCacheStats_kindCount(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_overSizeLimit(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_overSizeLimit(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.OverSizeLimit, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_overSizeLimit(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _ClusterCacheStats_sizeLimitBytes(ctx context.Context, field graphql.CollectedField, obj *clustersvc.ClusterCacheStats) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_ClusterCacheStats_sizeLimitBytes(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.SizeLimitBytes, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v int64) graphql.Marshaler {
+			return ec.marshalNInt2int64(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_ClusterCacheStats_sizeLimitBytes(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ClusterCacheStats", field, false, false, errors.New("field of type Int does not have child fields"))
 }
 
@@ -10410,6 +10474,16 @@ func (ec *executionContext) _ClusterCacheStats(ctx context.Context, sel ast.Sele
 			}
 		case "kindCount":
 			out.Values[i] = ec._ClusterCacheStats_kindCount(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "overSizeLimit":
+			out.Values[i] = ec._ClusterCacheStats_overSizeLimit(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "sizeLimitBytes":
+			out.Values[i] = ec._ClusterCacheStats_sizeLimitBytes(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}

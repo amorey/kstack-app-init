@@ -194,6 +194,10 @@ type fakeKubestore struct {
 	// onRemove runs inside Remove, so a test can assert what had already happened by
 	// the time the file went.
 	onRemove func(cacheID int64)
+	// sizeLimitOnce/sizeLimitHub are the size-limit feed, built on demand so a fake declared
+	// as a zero-value literal still hands out a receiver a publish reaches.
+	sizeLimitOnce sync.Once
+	sizeLimitHub  *conflate.Hub[int64, struct{}]
 }
 
 // OpenExisting records the claim and hands back a real store, standing in for a cache
@@ -254,6 +258,21 @@ func (f *fakeKubestore) Stats(context.Context, int64) (kubestore.Stats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.stats, f.err
+}
+
+// WatchSizeLimitNews is the size-limit feed the trigger reads; publishSizeLimitNews is one
+// cache's verdict changing, as the janitor would report it.
+func (f *fakeKubestore) WatchSizeLimitNews() kubestore.SizeLimitNews {
+	return f.sizeLimits().Receiver()
+}
+
+func (f *fakeKubestore) publishSizeLimitNews(cacheID int64) {
+	_ = f.sizeLimits().Sender().Send(cacheID, struct{}{})
+}
+
+func (f *fakeKubestore) sizeLimits() *conflate.Hub[int64, struct{}] {
+	f.sizeLimitOnce.Do(func() { f.sizeLimitHub = conflate.New[int64, struct{}]() })
+	return f.sizeLimitHub
 }
 
 func (f *fakeKubestore) setStats(s kubestore.Stats) {

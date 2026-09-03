@@ -98,6 +98,8 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - **Scope, so nobody starts it by accident:** the table, a covering index and an age index, a horizon table and a retention sweep, a final row image on delete entries (a `Deleted` frame reports a whole object, and the row is gone by then), and a fall-back-to-snapshot path for a reader that has fallen below the horizon. Roughly what beehive carries for the same job. It lands in the file the janitor is already sweeping, so sequence the two.
   - **Not the events spec.** `clusterCachedDataEventsWatch` — k8s Events mirrored into the cache file — would ride the same log. Beehive's control-plane event timeline, which `clustersvc/events.go` serves, already has its own and is unaffected either way.
 
+- **One measurement per cache for the stats gauge, not one per subscriber.** `cachesAPI.WatchStats` builds its whole loop inside `NewStream`'s pump (`clustersvc/caches.go:347`, `stream.go:180`), so every subscriber gets its own: three windows on one cache means three 5-second tickers, three file measurements, and three sets of row-count queries against the same file. The counts are the expensive half — the file measurement is three `os.Stat` calls, the counts are SQL. Nothing is wrong with the answers; the work is just done N times. **Shape:** one measurement stream per cache, multicast to its subscribers, the way the delta watches already fan out — the pump moves off the subscription and onto the cache, and a subscriber joins the running one and gets the current value on arrival (the gauge is current-on-subscribe, so a joiner must not wait for the next tick). `WatchHealth` has the same per-subscriber shape over the records, so whatever carries the multicast should be able to serve both. **Not blocked on anything**, and independent of the cache size ceiling: the janitor's own measurement is a different caller with a different lifetime, and is not what this de-dupes.
+
 - **OAuth access-token refresh — background/proactive half.** On-demand refresh is done (`sidecar/internal/auth/grant.go` refreshes a lazily-expired token using the stored refresh token). What remains: a proactive/background refresh before expiry rather than only refreshing when a consumer hits an already-expired token.
 - **SSO failure didn't retry.** The async login tail (wait-for-redirect → exchange → verify → persist) is fire-and-forget; a tail failure is only logged and leaves the session signed-out (a known v1 limitation), with no retry. The user must manually re-initiate login.
 - **Check RBAC permissions?** The `ClusterPermissions`/`ResourceRule`/`NonResourceRule` types and schema exist, but the `Permissions` resolver is a stub that returns `not implemented: permissions`. Implement it via a `SelfSubjectRulesReview`. Distinct from the `SelfSubjectReview` *authentication* probe behind `ClusterPrincipal.username`, which is implemented.
@@ -145,14 +147,15 @@ The current picture — boundaries, and which protections a test actually pins �
 repeated here:
 
 8. [Updates say what they actually are](specs/8-updates-say-what-they-are.md)
-9. [Cached events age out](specs/9-bound-the-events-table.md)
 10. [A kubeconfig exec plugin waits for approval](specs/10-approve-exec-credential-plugins.md)
 11. [The host sends only the operations the app ships](specs/11-allowlist-graphql-operations.md)
-13. [A cache stops growing before the disk fills](specs/13-a-cache-size-ceiling.md)
-14. [A cache stops outliving the user's interest in its cluster](specs/14-cache-retention.md)
+14. [A cache over its ceiling stops growing](specs/14-stop-a-cache-over-its-size-ceiling.md)
+15. [A cache stops outliving the user's interest in its cluster](specs/15-cache-retention.md)
 
 An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
-distinguishable from an unnoticed one.
+distinguishable from an unnoticed one. **Decided against:** aging out cached events by their own
+TTL — 13 and 14 bound the whole file instead, and between relists events still accumulate without
+a bound of their own. → [bound the cache by total size](adr/2026-09-03-bound-the-cache-by-total-size.md)
 
 **Without a spec yet:** the threat model's H-3. `src-tauri/entitlements.plist` sets
 `com.apple.security.cs.disable-library-validation` so the hardened runtime will exec the sidecar,

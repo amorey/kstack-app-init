@@ -526,6 +526,10 @@ type ClusterCacheStats {
   objectCount: Int!
   "Number of distinct kinds with at least one cached object. 0 when not cached."
   kindCount: Int!
+  "True when the cache's footprint is over its configured ceiling. Soft by one sweep interval, so a cache can read over before anything acts on it; false for a cache nobody has open, which cannot grow."
+  overSizeLimit: Boolean!
+  "The ceiling in bytes, 0 when unbounded. Sent so a client can render how close a cache is without hardcoding the sidecar's default."
+  sizeLimitBytes: Int!
 }
 
 "One frame on the `clusterCachesWatch` stream: a change and the cache it affected, or the `Bookmark` closing the snapshot."

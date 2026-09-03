@@ -61,9 +61,10 @@ links the ADR that accepted it. **Not built** links the work.
 | Every non-watch Kubernetes request carries an idle-read bound | `kubeconn/idletimeout.go` | **Held by review** |
 | No authority granted ahead of a consumer | `src-tauri/capabilities/default.json`, `sidecar/graph/schema.graphqls` | **Held by review** — a capability file and a schema are reviewed, not tested |
 | Cache contents left unencrypted, protected by file mode and the OS's disk encryption | `kubestore/manager.go`, `sqlitemigrate` | **By decision** — [the cache is ordinary application data](adr/2026-09-02-the-cache-is-ordinary-application-data.md) |
-| A retention policy, so a cache stops outliving the user's interest in its cluster | — | **Not built** — [spec 14](specs/14-cache-retention.md) |
+| A retention policy, so a cache stops outliving the user's interest in its cluster | — | **Not built** — [spec 15](specs/15-cache-retention.md) |
 | A gesture before a kubeconfig `exec` plugin runs | — | **Not built** — [spec 10](specs/10-approve-exec-credential-plugins.md) |
-| Retention on cached Kubernetes events, and a size ceiling on a cache | — | **Not built** — [spec 9](specs/9-bound-the-events-table.md), [spec 13](specs/13-a-cache-size-ceiling.md) |
+| A size ceiling on a cache | `kubestore/janitor.go` | **Detected, not enforced** — the janitor judges each sweep and publishes the edge (`TestSweepMarksAFileOverItsLimit`, `TestSweepPublishesOnlyWhenTheVerdictChanges`, `TestStatsReportsTheJanitorsVerdict`); nothing pauses a sync yet — [spec 14](specs/14-stop-a-cache-over-its-size-ceiling.md) |
+| Retention on cached Kubernetes events, beyond the relist's prune | — | **By decision** — [bound the cache by total size](adr/2026-09-03-bound-the-cache-by-total-size.md); the ceiling above is what bounds them |
 | The host forwards only operations the app ships | — | **Not built** — [spec 11](specs/11-allowlist-graphql-operations.md) |
 | Signed in-app updates | — | **Not built** — [spec 8](specs/8-updates-say-what-they-are.md) |
 

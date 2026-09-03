@@ -19,8 +19,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/gobus/conflate"
@@ -86,7 +86,14 @@ type Counts struct {
 // swaps under the claims on it, and what the last Release closes. The writer pool is
 // capped at one connection.
 type file struct {
-	db *sql.DB
+	// path is the main database file; the -wal/-shm sidecars sit beside it. Held so the
+	// janitor can measure the file without going through the manager, whose lock it must
+	// never take.
+	path string
+	// cacheID is the key the size verdict is published under, and what the janitor's log
+	// lines name.
+	cacheID int64
+	db      *sql.DB
 	// readDB is the reader pool beside the writer: the watches re-read on every ping, and
 	// a read must not queue behind the one write connection. Distinct from the manager's
 	// openReadOnly, which opens a CLOSED cache's file per call to measure it; this serves
@@ -107,6 +114,20 @@ type file struct {
 	// clockMu guards lastStamp, which forces the write stamps strictly upward.
 	clockMu   sync.Mutex
 	lastStamp int64
+	// sizeVerdict is the last sweep's answer on this file's size (sizeUnknown, sizeUnder or
+	// sizeOver), so the next sweep can tell a change from a repeat. Atomic because the
+	// janitor writes it on its own goroutine while Stats reads it under the manager's
+	// lock, which the janitor never holds.
+	sizeVerdict atomic.Int32
+	// janitorWakeups asks the janitor for a sweep after a commit, so a cache filling fast is
+	// measured within seconds rather than at the next tick, and one that a clear shrank is
+	// released as soon. Capacity one, sent without blocking: a burst of writes owes one
+	// sweep, not one each.
+	janitorWakeups chan struct{}
+	// sizeLimitSender publishes a changed size verdict on the manager's sizeLimitHub, so a
+	// reader watches every cache through one subscription rather than binding to files as
+	// they open.
+	sizeLimitSender *conflate.Sender[int64, struct{}]
 }
 
 // Store is one holder's claim on one cache, and everything done through it — every Store
@@ -123,6 +144,15 @@ type Store struct {
 	// Deleted for every row it holds. Nil means "whatever the entry holds", which is what
 	// a writer wants: its next write belongs in the current file.
 	bound *file
+}
+
+// wakeJanitor asks for a sweep. Dropped when one is already owed, so a relist's every
+// write after the first costs nothing.
+func (f *file) wakeJanitor() {
+	select {
+	case f.janitorWakeups <- struct{}{}:
+	default:
+	}
 }
 
 // stamp is the updated_at every write records: the wall clock, forced strictly
@@ -163,9 +193,14 @@ func (f *file) writeStamp(ctx context.Context, st stmts) (writeStamp, error) {
 	return writeStamp{at: f.stamp(), seq: seq}, nil
 }
 
-// notify pings one key after a commit. Failure is a closed hub — a store shutting down,
-// which the subscriber learns from its own receiver.
-func (f *file) notify(key string) { _ = f.hub.Sender().Send(key, struct{}{}) }
+// notify announces a commit: readers of key re-read, and the janitor sweeps. Every write
+// path that commits calls it, so no commit grows or shrinks the file unmeasured. A failed
+// send is a closed hub — a store shutting down, which the subscriber learns from its own
+// receiver.
+func (f *file) notify(key string) {
+	_ = f.hub.Sender().Send(key, struct{}{})
+	f.wakeJanitor()
+}
 
 // close closes both pools and ends every subscriber, which is how a clear or a
 // shutdown reaches a live watch.
@@ -181,25 +216,32 @@ func (f *file) close() error {
 }
 
 // startJanitor spawns this file's sweeper, or nothing when no interval is set.
-func (f *file) startJanitor(cacheID int64, ret Retention) {
+func (f *file) startJanitor(ret Retention) {
 	if ret.Interval <= 0 {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	f.stopJanitor = cancel
-	go runJanitor(ctx, strconv.FormatInt(cacheID, 10), f, ret)
+	go runJanitor(ctx, f, ret)
 }
 
 // newFile wraps the open pools and their prepared sets. Nothing else builds one —
 // openFile is the only caller.
-func newFile(db, readDB *sql.DB, writeStmts, readStmts [numStmts]*sql.Stmt) *file {
+func newFile(
+	path string, cacheID int64, db, readDB *sql.DB,
+	writeStmts, readStmts [numStmts]*sql.Stmt, sizeLimitSender *conflate.Sender[int64, struct{}],
+) *file {
 	return &file{
-		db:         db,
-		readDB:     readDB,
-		writeStmts: writeStmts,
-		readStmts:  readStmts,
-		hub:        conflate.New[string, struct{}](),
-		now:        func() int64 { return time.Now().UnixMilli() },
+		path:            path,
+		cacheID:         cacheID,
+		db:              db,
+		readDB:          readDB,
+		writeStmts:      writeStmts,
+		readStmts:       readStmts,
+		hub:             conflate.New[string, struct{}](),
+		janitorWakeups:  make(chan struct{}, 1),
+		sizeLimitSender: sizeLimitSender,
+		now:             func() int64 { return time.Now().UnixMilli() },
 	}
 }
 
@@ -301,6 +343,8 @@ func (s *Store) SetCookie(ctx context.Context, apiVersion, resource, resourceVer
 	if err := setCookie(ctx, f.stmts(), apiVersion, resource, resourceVersion); err != nil {
 		return fmt.Errorf("set cookie: %w", err)
 	}
+	// No notify: a cookie is a position, not content, so no reader waits on it.
+	f.wakeJanitor()
 	return nil
 }
 
@@ -589,7 +633,8 @@ func (r *ReplaceSession) WritePage(ctx context.Context, items []*unstructured.Un
 		return nil
 	}
 	// Per committed page, not only at Commit: a relist that commits pages and then fails
-	// would otherwise leave durable rows unannounced until some later write.
+	// would otherwise leave durable rows unannounced, and unmeasured, until some later
+	// write — and a large relist grows the file page by page long before it commits.
 	r.f.notify(busKey(r.kind))
 	return nil
 }
