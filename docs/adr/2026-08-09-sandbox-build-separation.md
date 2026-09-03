@@ -2,7 +2,7 @@
 title: Isolate Linux sandbox build outputs under .sandbox-linux via a setup script
 date: 2026-08-09
 scope: repo
-status: Accepted
+status: Superseded by [sandbox-build-output-locations](2026-09-03-sandbox-build-output-locations.md)
 ---
 
 # Isolate Linux sandbox build outputs under .sandbox-linux via a setup script

@@ -249,32 +249,4 @@ distinguishable from an unnoticed one. **Decided against:**
 
 ## Testing
 
-- **`make test-rust` does not run in the Linux sandbox — check whether it still doesn't before
-  trusting this.** Two separate faults, seen 2026-09-03 on a sandbox whose `target/` had been in use
-  since August; a rebuilt sandbox may clear either or both, so **re-run the two commands below
-  first and delete this item if they pass**.
-
-  1. **The crate does not compile.** `cargo build --lib` fails in `schemars 0.8.22` with
-     `E0107: struct takes 3 generic arguments but 2 generic arguments were supplied` — its
-     `Map<K, V>` alias wants the three-parameter `IndexMap` of indexmap 2.x, and `Cargo.lock` pins
-     that crate (a `tauri-build` build-dependency) to `indexmap 1.9.3`. **The lock is not the
-     problem and must not be "fixed":** the same commit builds and tests clean on the macOS host,
-     so this is Linux-only feature unification — some Linux-only crate in the GTK/WebKit chain
-     enables a different `indexmap` on `schemars`. `cargo tree -e features -i schemars@0.8.22` runs
-     without compiling and is where to start.
-  2. **The bind-mounted `target/` is not coherent.** `mkdir` returns `EEXIST` for directories cargo
-     has just created (the directory is there, freshly stamped, when you look), and
-     `.fingerprint/*/invoked.timestamp` files read back missing right after being written. Each
-     retry gets one directory further, so a loop makes progress — which is how to tell this fault
-     from the one above, and why a stuck build is worth retrying a few times before believing its
-     error. `CARGO_TARGET_DIR` is set to `.sandbox-linux/target` by `scripts/sandbox-dev-setup.sh`
-     ([ADR: sandbox build-output isolation](adr/2026-08-09-sandbox-build-separation.md)); the host's
-     own `src-tauri/target` is untouched and unaffected.
-
-  **Until it is fixed, a Rust change made in the sandbox is unverified there.** Go and JS suites are
-  unaffected. What worked meanwhile: compiling the test body verbatim in a throwaway crate against
-  the real input (`cargo new`, one `serde_json` dependency, `include_str!` repointed at a copy of
-  `tauri.conf.json`) — enough to prove the assertions and their failure modes, not enough to prove
-  it compiles in place, so the host still has to run it.
-
 - **Keep the no-wall-clock rule.** Both `CLAUDE.md` files state it, and the tree is currently clean: the frontend suites use `vi.useFakeTimers()` + `advanceTimersByTimeAsync`, `waitFor`, or the `flush()` helper with no `setTimeout` waits; Go's three `time.Sleep` calls are all the permitted kind and each says so — a widened truncate window in `kubeconfig_test.go`, a writer racing a gauge in `caches_test.go`, and `kubesync`'s deliberate exit latency; and `src-tauri/.../sidecar/ipc.rs`'s retry test — `#[tokio::test(start_paused = true)]`, letting tokio auto-advance virtual time between parked timers — is the shape to match. **What to watch for:** not `time.Sleep` but *thin real-timer margins* — tests that never sleep yet still fail on a loaded machine because they race short real durations. The fix shape is an injectable clock/timer seam so the test advances virtual time. The ~30 `time.After(...)` uses in sidecar tests are almost all *deadlines* guarding a channel receive, which the rule explicitly permits; keep those separate from any load-bearing wait. A `-count=20` soak on a loaded machine is the cheapest way to find regressions.
