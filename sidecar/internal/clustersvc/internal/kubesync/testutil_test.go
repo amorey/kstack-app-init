@@ -933,7 +933,10 @@ const reasonWithdrawnWrite = "WithdrawnRunWrote"
 // admittedRun is what a substituted worker reports about one run: the kind it was admitted with,
 // and the way to publish an answer for it.
 type admittedRun struct {
-	Kind   kubestore.Kind
+	Kind kubestore.Kind
+	// Report publishes for this run. The run answers Watching of its own just after firing
+	// this, so a caller writing a different reason must wait on established first — writing
+	// on the run alone leaves the two answers racing, and the later one is what a read sees.
 	Report func(reason string)
 }
 
