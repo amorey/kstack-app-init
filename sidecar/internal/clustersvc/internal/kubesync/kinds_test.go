@@ -83,12 +83,13 @@ func TestADeltaLandsInTheCacheAndProvesTheStreamLive(t *testing.T) {
 	before, _ := svc.GetKindState(1, podKind)
 	stream.opened.Await(t, "the watch to open").Add(object("v1", "Pod", "three", "11"))
 
-	require.Eventually(t, func() bool {
-		return len(objectNames(t, svc, 1, podKind)) == 1
-	}, testutil.Timeout, time.Millisecond, "the delta to land")
+	// The row reaches the store before the stamp beside it, so the wait is on the stamp:
+	// gating on the row would read the verdict that was current a moment before it.
+	after := awaitKindState(t, svc, 1, podKind, "data arriving to be stamped", func(state KindState) bool {
+		return state.LastUpdateAt.After(before.LastUpdateAt)
+	})
 
-	after, _ := svc.GetKindState(1, podKind)
-	assert.True(t, after.LastUpdateAt.After(before.LastUpdateAt), "data arriving is stamped")
+	assert.Equal(t, []string{"three"}, objectNames(t, svc, 1, podKind), "the delta is in the cache")
 	assert.True(t, after.LastLiveAt.After(before.LastLiveAt), "and proves the stream live")
 }
 
@@ -107,13 +108,14 @@ func TestABookmarkProvesTheStreamLiveWithoutData(t *testing.T) {
 	// does, so a restart resumes from it rather than cold-listing again.
 	stream.opened.Await(t, "the watch to open").Action(watch.Bookmark, object("v1", "Pod", "", "42"))
 
-	require.Eventually(t, func() bool {
-		cookie, ok := cookieOf(t, svc, 1, podKind)
-		return ok && cookie == "42"
-	}, testutil.Timeout, time.Millisecond, "the bookmark to move the position")
+	// The position is written before the stamp beside it, so the wait is on the stamp.
+	after := awaitKindState(t, svc, 1, podKind, "the bookmark to be stamped", func(state KindState) bool {
+		return state.LastLiveAt.After(before.LastLiveAt)
+	})
 
-	after, _ := svc.GetKindState(1, podKind)
-	assert.True(t, after.LastLiveAt.After(before.LastLiveAt), "a bookmark proves the stream live")
+	cookie, ok := cookieOf(t, svc, 1, podKind)
+	require.True(t, ok)
+	assert.Equal(t, "42", cookie, "a bookmark moves the position")
 	assert.Equal(t, before.LastUpdateAt, after.LastUpdateAt, "and is not data")
 }
 

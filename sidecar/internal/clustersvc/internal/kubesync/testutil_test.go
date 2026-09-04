@@ -712,10 +712,11 @@ func awaitKindReason(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind
 	})
 }
 
-// awaitKindState waits for one kind's answer to match. Everything a test asserts about a
-// verdict belongs in match rather than in a read after it: a run that is down is a state the
-// next attempt replaces, so a later read is a different answer rather than the same one again.
-func awaitKindState(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind, what string, match func(KindState) bool) {
+// awaitKindState waits for one kind's answer to match and returns the state that matched.
+// Everything a test asserts about a verdict belongs in match, or in the state handed back,
+// rather than in a read after it: a run that is down is a state the next attempt replaces, so
+// a later read is a different answer rather than the same one again.
+func awaitKindState(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind, what string, match func(KindState) bool) KindState {
 	t.Helper()
 	news := svc.WatchKindNews()
 	defer news.Close()
@@ -729,6 +730,7 @@ func awaitKindState(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind,
 	if !settled {
 		t.Fatalf("the kind stands on %q: %s", last.Reason, last.Message)
 	}
+	return last
 }
 
 func objectNames(t *testing.T, svc *Service, cacheID int64, k kubestore.Kind) []string {
