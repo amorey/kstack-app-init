@@ -5,7 +5,7 @@ go 1.26.8
 require (
 	github.com/99designs/gqlgen v0.17.95
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/amorey/beehive v0.31.0
+	github.com/amorey/beehive v0.32.0
 	github.com/amorey/gobus v0.7.0
 	github.com/amorey/gochan v0.2.0
 	github.com/coreos/go-oidc/v3 v3.21.0
