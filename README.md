@@ -1,7 +1,3 @@
-# Kstack
-
-Kstack is an AI-native monitoring and troubleshooting app for Kubernetes.
-
 ## Architecture
 
 - **`src/`** — the React webview (React 19, TanStack Router, urql, Tailwind v4).
