@@ -89,7 +89,7 @@ func (c *clusterSourceController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterSourceStatus],
 	obj *beehive.Object[ClusterSourceSpec, ClusterSourceStatus],
-) beehive.ReconcileResult {
+) beehive.Result {
 	// An anchor on its way out has no set to maintain, and beehive collects it either
 	// way. Nothing deletes one today.
 	if obj.DeletionRequestedAt != nil {

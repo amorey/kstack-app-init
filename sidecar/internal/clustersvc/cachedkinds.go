@@ -360,7 +360,7 @@ func (c *clusterCachedKindController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCachedKindStatus],
 	obj *beehive.Object[ClusterCachedKindSpec, ClusterCachedKindStatus],
-) beehive.ReconcileResult {
+) beehive.Result {
 	cacheID, hasCache, err := c.ownerCacheID(ctx, obj)
 	if err != nil {
 		return beehive.Fail(err)

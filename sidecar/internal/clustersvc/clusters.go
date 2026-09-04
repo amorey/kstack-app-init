@@ -548,7 +548,7 @@ func (c *clusterController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterStatus],
 	obj *beehive.Object[ClusterSpec, ClusterStatus],
-) beehive.ReconcileResult {
+) beehive.Result {
 	// Nothing to observe for a record on its way out, and no finalizer to clear:
 	// beehive collects it either way. The claim is dropped rather than left for the
 	// collection, so a cluster stops being probed the moment its deletion is asked for.

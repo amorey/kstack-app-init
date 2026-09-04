@@ -877,7 +877,7 @@ func (c *clusterCacheController) Reconcile(
 	ctx context.Context,
 	client beehive.ControllerClient[ClusterCacheStatus],
 	obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus],
-) beehive.ReconcileResult {
+) beehive.Result {
 	cacheID := int64(obj.ID)
 
 	// A cache on its way out is about to be collected with the subtree it owns, and
