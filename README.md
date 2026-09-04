@@ -17,7 +17,9 @@ per-area `CLAUDE.md` files.
 
 ## Toolchain
 
-Rust (rustup), Go, Node + `pnpm`. On Linux, Tauri needs the usual native deps:
+Rust (rustup), Go, Node + `pnpm`. `rust-toolchain.toml` pins the Rust compiler, so rustup
+installs and selects it for you on the first `cargo` call — don't override it with `+stable`.
+On Linux, Tauri needs the usual native deps:
 
 ```
 sudo apt-get install -y build-essential pkg-config libssl-dev \

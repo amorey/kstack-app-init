@@ -58,10 +58,19 @@ runs:
           libsoup-3.0-dev \
           libjavascriptcoregtk-4.1-dev
 
+    - name: Read pinned Rust toolchain
+      if: inputs.setup-rust == 'true'
+      id: rust-toolchain
+      shell: bash
+      run: sed -n 's/^channel = "\(.*\)"/channel=\1/p' src-tauri/rust-toolchain.toml >> "$GITHUB_OUTPUT"
+
+    # `@master` is the ref that accepts an explicit toolchain; `components`
+    # mirrors rust-toolchain.toml, which is the pin devs get.
     - name: Set up Rust
       if: inputs.setup-rust == 'true'
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
         components: rustfmt, clippy
 
     - name: Set up Rust cache

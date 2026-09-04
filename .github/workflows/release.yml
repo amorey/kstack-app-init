@@ -204,7 +204,9 @@ jobs:
           setup-rust: "true"
           setup-node: "true"
 
+      # In src-tauri so the target lands on the pinned toolchain, not rustup's default.
       - name: Add x86_64 Rust target (darwin universal)
+        working-directory: ./src-tauri
         run: rustup target add x86_64-apple-darwin
 
       - name: Download sidecar artifacts
@@ -306,7 +308,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # In src-tauri so the target lands on the pinned toolchain, not rustup's default.
       - name: Add Rust target
+        working-directory: ./src-tauri
         run: rustup target add ${{ matrix.triple }}
 
       - name: Build bundle
