@@ -13,7 +13,7 @@
 #      untouched, while the sandbox sees the Linux one.
 #
 # BUILD_ROOT lives *inside* the repo (on the host's disk) so artifacts survive
-# sandbox restarts and aren't capped by the 15G overlay. Set
+# sandbox restarts and aren't capped by the 20G overlay. Set
 # KSTACK_SANDBOX_BUILD_ROOT=/home/agent/kstack-build to use the overlay instead
 # (faster I/O, smaller, wiped on sandbox recreate).
 #
@@ -67,17 +67,22 @@ done
 # Written to the persistent env file, which is sourced before every command.
 # Every line this script owns is dropped first, so a re-run rewrites the values
 # rather than leaving an older copy above them.
+#
+# pnpm takes settings from PNPM_CONFIG_* or pnpm-workspace.yaml, and the yaml is
+# committed — shared with the host, so it cannot hold a Linux path. Unset, the
+# store defaults to the root of node_modules' filesystem: $REPO/.pnpm-store, the
+# same path the host's macOS pnpm picks, mixing both platforms' native builds.
 sudo touch "$PERSIST"
 sudo sed -i \
   -e '/KSTACK_SANDBOX_ENV/d' \
   -e '/^export CARGO_TARGET_DIR=/d' \
-  -e '/^export npm_config_store_dir=/d' \
+  -e '/^export PNPM_CONFIG_STORE_DIR=/d' \
   -e '/^export PATH=.*\.cargo\/bin/d' \
   "$PERSIST"
 sudo tee -a "$PERSIST" >/dev/null <<EOF
 # KSTACK_SANDBOX_ENV — Linux build outputs, kept out of the macOS host's paths.
 export CARGO_TARGET_DIR="$CARGO_ROOT/target"
-export npm_config_store_dir="$BUILD_ROOT/pnpm-store"
+export PNPM_CONFIG_STORE_DIR="$BUILD_ROOT/pnpm-store"
 export PATH="\$HOME/.cargo/bin:\$HOME/.local/share/pnpm:\$PATH"
 EOF
 echo "✓ env vars written to $PERSIST"
