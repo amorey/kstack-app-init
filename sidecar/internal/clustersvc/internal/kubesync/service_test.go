@@ -202,7 +202,10 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	kind := testKind("apps/v1", "Deployment", "deployments")
 	svc.TrackDiscovery(1, testParams)
 	svc.TrackKind(1, kind)
-	runs.Await(t, "the sync runs").Report(ReasonWatching)
+	// The substitute answers Watching of its own as it comes up, so the run being admitted is
+	// not enough: a verdict written before that answer lands is the one it overwrites.
+	runs.Await(t, "the sync runs")
+	fake.established.Await(t, "the sync to be up")
 
 	// The plural is unchanged, so this is the same collection under a new Kind name. The
 	// worker that answered Watching is stopped, and the one replacing it may still be
@@ -212,7 +215,9 @@ func TestReplacingAKindDropsTheStoppedWorkersVerdict(t *testing.T) {
 	_, ok := svc.GetKindState(1, renamed)
 	assert.False(t, ok, "a replacement starts with no answer")
 
-	runs.Await(t, "the replacement runs").Report(ReasonSyncing)
+	r := runs.Await(t, "the replacement runs")
+	fake.established.Await(t, "the replacement to be up")
+	r.Report(ReasonSyncing)
 	got, ok := svc.GetKindState(1, renamed)
 	require.True(t, ok)
 	assert.Equal(t, ReasonSyncing, got.Reason)
