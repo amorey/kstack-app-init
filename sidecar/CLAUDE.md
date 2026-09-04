@@ -196,6 +196,8 @@ An edit applies to a local JSON file immediately and queues durably for the clou
 
 `RESTConfig(contextName)` resolves one context to credentials and the pool's cache key. Three rules: one snapshot per call; only a config the loading rules produced (a hand-built `api.Config` yields CA paths that cannot open); the key excludes the context name, covers the static exec/auth-provider config and `proxy-url`, and length-prefixes every value. Two sentinels acted on, not logged: `ErrContextNotFound` (also for an empty name) and `ErrNotRead`. Resolution is not memoized.
 
+A zero-length kubeconfig loads as a valid config with no contexts, so it is never published while the merge has no contexts at all: `clientcmd` truncates before it writes, and a reload landing in that window would read downstream as every cluster vanishing.
+
 Watches are pull-first: a 30-minute backstop tick under fsnotify and a poke subscription. **Keep the tick under any new push layer.** The service watches directories and follows symlinks; use `resolvePaths` and keep every path in one namespace (no `filepath.EvalSymlinks`, which rewrites every component and matches nothing on macOS).
 
 ## Resync broadcaster (`internal/poke`)

@@ -468,6 +468,23 @@ func TestTruncateWindowIsNotPublished(t *testing.T) {
 	assert.Contains(t, cfg.Contexts, "staging", "the truncate window must not reach subscribers")
 }
 
+// The settle timer keeps notifications out of the writer's truncate window, but a
+// tick or a poke can land in it too — and the file loads there as a valid config with
+// no contexts. Pinned on poll directly: the window is one syscall wide, so reaching it
+// through the loop would be a race the test could only lose quietly.
+func TestATruncatedFileIsNotPublished(t *testing.T) {
+	w, path := newTestService(t, time.Hour)
+	writeKubeconfig(t, path, "prod")
+	start(t, w)
+
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+	w.poll()
+
+	cfg, read := w.Get()
+	assert.True(t, read)
+	assert.Contains(t, cfg.Contexts, "prod", "the truncate window must not replace the last good config")
+}
+
 // Re-pointing a symlink adds the new target's directory; the old one has to go, or
 // it stays watched for the life of the process — waking the loop on every unrelated
 // write in it, and on macOS holding an fd per file it contains.
