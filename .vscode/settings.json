@@ -1,0 +1,19 @@
+{
+  // Format on save with oxfmt, which the extension resolves from node_modules — so the editor
+  // formats with the version the lockfile pins and `pnpm lint` checks against.
+  "editor.formatOnSave": true,
+  // oxfmt formats whole files; the default mode can ask for modified lines only, which it
+  // cannot answer.
+  "editor.formatOnSaveMode": "file",
+  // Per language, not globally: Rust and Go in this repo keep their own formatters. These are
+  // exactly the languages the `lint`/`format` scripts cover, so the editor and CI agree.
+  "[typescript]": { "editor.defaultFormatter": "oxc.oxc-vscode" },
+  "[typescriptreact]": { "editor.defaultFormatter": "oxc.oxc-vscode" },
+  "[css]": { "editor.defaultFormatter": "oxc.oxc-vscode" },
+  // Linting is ESLint's; there is no .oxlintrc.json for the extension's linter half to read.
+  "oxc.enable.oxlint": false,
+  // There is no .prettierrc — the options moved to .oxfmtrc.json. Anyone still running the
+  // Prettier extension would format at its defaults (80 columns, double quotes) and churn
+  // every file it touched.
+  "prettier.enable": false
+}

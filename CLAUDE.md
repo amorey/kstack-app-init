@@ -139,7 +139,16 @@ Vitest + `@testing-library/react` (jsdom), co-located (`*.test.ts[x]`). Mock the
 
 ### Lint / build
 
-- `pnpm lint` (ESLint: airbnb-extended + prettier) → `make lint-js`. Run before committing.
+- `pnpm lint` (ESLint: airbnb-extended, then `oxfmt --check`) → `make lint-js`. Run before
+  committing. Formatting is part of `lint` here, matching `lint-go`'s `gofmt -l` and `lint-rust`'s
+  `cargo fmt --check`. `pnpm format` writes.
+- **Formatting is oxfmt, configured in `.oxfmtrc.json`.** Its output matches prettier's, so
+  `eslint-config-prettier` stays — it is the list of stylistic rules airbnb would otherwise use to
+  argue with the formatter. Scope is set by the globs in the `lint`/`format` scripts, and a
+  **directory argument mixed with a glob silently narrows to the glob's extensions** — the reason
+  both scripts pass globs only. `.vscode/settings.json` runs the same binary on save through the
+  `oxc.oxc-vscode` extension, which resolves it from `node_modules`, so the editor and CI agree on
+  the version.
 - The **React compiler** is on in two places that must stay in step: the Vite/babel transform
   (`vite.config.ts`) and its lint rules, which ship inside `eslint-plugin-react-hooks` — there is no
   separate compiler plugin to install. `eslint.config.ts` applies the plugin's `recommended-latest`

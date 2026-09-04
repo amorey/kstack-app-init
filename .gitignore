@@ -17,9 +17,11 @@ target
 
 # Sidecar build output (produced by `make sidecar`).
 src-tauri/binaries/
-# Editor directories and files
+# Editor directories and files. The shared team config is re-included; anything
+# else under .vscode/ is personal.
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea
 .DS_Store
 *.suo

@@ -4,7 +4,6 @@ import { includeIgnoreFile } from '@eslint/compat';
 import js from '@eslint/js';
 import { configs, plugins } from 'eslint-config-airbnb-extended';
 import { rules as prettierConfigRules } from 'eslint-config-prettier';
-import prettierPlugin from 'eslint-plugin-prettier';
 import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
 
@@ -47,19 +46,15 @@ const typescriptConfig = [
   },
 ];
 
-const prettierConfig = [
+// The way airbnb's formatting rules are turned off: 358 entries, every one `off`, with no
+// dependency on prettier itself. oxfmt's output is prettier's, so the same rules conflict —
+// without this, 810 errors land on correctly formatted code, `@stylistic/max-len` at 100
+// against `printWidth` 120 among them. Not all of them are `@stylistic`, so the set cannot be
+// narrowed by dropping a plugin.
+const formattingOffConfig = [
   {
-    name: 'prettier/plugin/config',
-    plugins: {
-      prettier: prettierPlugin,
-    },
-  },
-  {
-    name: 'prettier/config',
-    rules: {
-      ...prettierConfigRules,
-      'prettier/prettier': 'error',
-    },
+    name: 'formatting/off',
+    rules: prettierConfigRules,
   },
 ];
 
@@ -79,7 +74,6 @@ const customRulesConfig = [
       'max-classes-per-file': 'off',
       'no-console': 'off',
       'no-underscore-dangle': 'off',
-      'prettier/prettier': ['error', { singleQuote: true, printWidth: 120 }],
       'react/function-component-definition': 'off',
       'react/jsx-no-target-blank': 'off',
       'react/prop-types': 'off',
@@ -176,7 +170,7 @@ export default [
   ...jsConfig,
   ...reactConfig,
   ...typescriptConfig,
-  ...prettierConfig,
+  ...formattingOffConfig,
   ...reactRefreshConfig,
   ...customRulesConfig,
   ...clusterDataIsTextConfig,
