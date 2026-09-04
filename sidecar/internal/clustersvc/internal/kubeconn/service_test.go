@@ -828,11 +828,21 @@ func TestRetryAndWaitIsNotSatisfiedByARunAlreadyInFlight(t *testing.T) {
 	lease := s.Acquire("prod")
 	defer lease.Release()
 	testutil.Recv(t, dialing.Chan(), "the first dial")
+	gate <- struct{}{}
+	settled(t, lease)
+
+	// The run that must not answer, put in flight from the test's own goroutine: its dial is
+	// observed here, so it began before the ask below however the two goroutines interleave.
+	s.supervisor.Wake("prod", nameConnection)
+	testutil.Recv(t, dialing.Chan(), "the dial already out")
 
 	done := make(chan error, 1)
 	go func() { done <- s.RetryAndWait(within(t), "prod") }()
+	// The ask's own claim, which it takes just before the wake: releasing the run already out
+	// before that would leave the wake with nothing to be redelivered past.
+	awaitHolders(t, s, "prod", 2)
 	gate <- struct{}{}
-	// The second dial having landed proves the first committed and published.
+	// The next dial having landed proves the run already out committed and published.
 	testutil.Recv(t, dialing.Chan(), "the dial the ask bought")
 
 	// A negative assertion has no event to wait for, so it needs a bounded window: this
@@ -841,6 +851,17 @@ func TestRetryAndWaitIsNotSatisfiedByARunAlreadyInFlight(t *testing.T) {
 
 	gate <- struct{}{}
 	require.NoError(t, testutil.Recv(t, done, "the call to return"))
+}
+
+// awaitHolders waits until contextName is claimed by n holders.
+func awaitHolders(t *testing.T, s *Service, contextName string, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		e := s.claimed[contextName]
+		return e != nil && e.holders == n
+	}, testutil.Timeout, time.Millisecond, "the claim the ask takes")
 }
 
 // The wait is the caller's; the run is the supervisor's. A caller that goes away leaves the probe
