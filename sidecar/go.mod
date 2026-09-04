@@ -1,6 +1,6 @@
 module github.com/kubetail-org/kstack-app/sidecar
 
-go 1.26.4
+go 1.26.8
 
 require (
 	github.com/99designs/gqlgen v0.17.95
