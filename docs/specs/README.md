@@ -39,7 +39,6 @@ code.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [1 — Logout's revocation is best-effort, and the model says so](1-logout-revocation-is-best-effort.md) | sidecar, docs | Planned |
 | [2 — The native webview refuses to navigate](2-native-navigation-policy.md) | src-tauri | Planned |
 | [3 — The app says when it is out of date](3-update-notification.md) | sidecar, src-tauri | Planned |
 | [4 — Diagnostics are redacted and bounded](4-diagnostics-and-malformed-credential-fields.md) | sidecar | Planned |

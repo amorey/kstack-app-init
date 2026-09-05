@@ -199,9 +199,6 @@ distinguishable from an unnoticed one. **Decided against:**
 **Specced.** Each links a spec in [`docs/specs/`](specs/) self-contained enough to build straight
 through; the numbers are the build order.
 
-- **R-10 — logout's revocation is best-effort, and unsaid (low; auth owner).** →
-  [spec 1](specs/1-logout-revocation-is-best-effort.md)
-
 - **R-02 — native navigation policy (medium; desktop owner).** →
   [spec 2](specs/2-native-navigation-policy.md)
 

@@ -44,7 +44,9 @@ Four boundaries, in the order an attacker meets them:
    over HTTPS with a bearer token. The implemented settings payload contains `theme` and `locale`;
    OAuth also transmits protocol credentials and identifiers, and services see normal connection
    metadata. There is no implemented cluster-to-cloud or chat data path. Cloud sign-out does not
-   revoke Kubernetes credentials, stop cluster access, or erase caches.
+   revoke Kubernetes credentials, stop cluster access, or erase caches, and revoking its own
+   grant is best-effort: the local credential is cleared first and the revoke is fired detached,
+   so an unreachable issuer or a quit leaves the grant live at the issuer.
 
 ## Protections
 
@@ -88,7 +90,7 @@ links the ADR that accepted it. **Not built** links the work.
 | The host forwards only operations the app ships | — | **By decision, not built** — [no GraphQL operation allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md); CSP reduces injection risk but does not restrict the authority of permitted bundled code. What the schema's breadth costs is S-9's other half, [spec 6](specs/6-resource-budgets.md) |
 | The app tells the user a newer release exists | — | **Not built** — [spec 3](specs/3-update-notification.md). Nothing checks, so a user can sit on a version with a known bug indefinitely |
 | Signed in-app updates | — | **Not built** — [spec 9](specs/9-signed-in-app-updates.md). The release workflow configures signed macOS/Windows downloads and GPG-signed checksums; Linux bundles are unsigned. Actual signatures and signing policy require release-artifact verification |
-| Sign-out clears the local credential | `sidecar/internal/auth/auth.go` | **Built**, and the server-side revoke beside it is fire-and-forget: a failed revoke, or a quit before it finishes, leaves the grant live while the app reports signed out. Stated here and pinned by test in [spec 1](specs/1-logout-revocation-is-best-effort.md) |
+| Sign-out clears the local credential, and nothing is revoked before it | `sidecar/internal/auth/auth.go` | **Enforced** — `TestLogoutRevokesAfterClearingAndIgnoresRevokeFailure` holds the clear open and fails on a revoke that arrives during it; `TestLogoutKeepsSessionWhenCredentialClearFails` pins the failed clear staying signed in. The server-side revoke beside it is **not a promise**: it is fire-and-forget, so a failed revoke, or a quit before it finishes, leaves the grant live while the app reports signed out |
 | Top-level navigation restricted to the app origin | — | **Not built** — [spec 2](specs/2-native-navigation-policy.md). `build_window` installs no navigation or new-window policy; CSP does not govern navigation |
 | Diagnostic errors redacted and bounded before logging or persistence | — | **Not built** — [spec 4](specs/4-diagnostics-and-malformed-credential-fields.md). The GraphQL row above covers one subsystem; the rest pass errors to `slog` whole. A credential field the redactor cannot parse is stored, not dropped |
 | The host refuses any IPC peer that is not the sidecar it spawned | — | **Not built** — [spec 5](specs/5-host-authenticates-the-sidecar.md). Authentication runs one way, and the endpoint sits in the shared temp directory |

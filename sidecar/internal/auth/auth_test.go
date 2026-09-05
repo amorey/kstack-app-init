@@ -19,14 +19,18 @@ import (
 // memStore is an in-memory CredentialsStore (host keychain stand-in).
 type memStore struct {
 	tok     Token
-	saveErr error      // when set, Save fails without mutating tok
-	saves   chan Token // when set, receives every Save attempt, for tests watching a detached one
+	saveErr error         // when set, Save fails without mutating tok
+	saves   chan Token    // when set, receives every Save attempt, for tests watching a detached one
+	gate    chan struct{} // when set, Save blocks until it is closed, holding the write open
 }
 
 func (m *memStore) Load() (Token, error) { return m.tok, nil }
 func (m *memStore) Save(t Token) error {
 	if m.saves != nil {
 		m.saves <- t
+	}
+	if m.gate != nil {
+		<-m.gate
 	}
 	if m.saveErr != nil {
 		return m.saveErr
@@ -259,6 +263,60 @@ func TestLogoutDoesNotBlockOnRevoke(t *testing.T) {
 	// Local teardown happened even though revocation is still blocked.
 	if saved, _ := store.Load(); saved.RefreshToken != "" {
 		t.Fatalf("credentials not cleared on sign-out: %+v", saved)
+	}
+}
+
+// Revocation is best-effort and strictly second: nothing is handed back to the
+// server until the local credential is gone, and a revoke the server rejects
+// leaves the user signed out all the same. The order is what makes sign-out
+// safe to report immediately — reversed, a failed clear would hand the token
+// back and still leave a durable copy behind.
+func TestLogoutRevokesAfterClearingAndIgnoresRevokeFailure(t *testing.T) {
+	revoked := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		revoked <- r.Form.Get("token")
+		w.WriteHeader(http.StatusBadRequest) // the revoke fails; sign-out must not care
+	}))
+	defer ts.Close()
+
+	// The clear blocks inside the store, holding open the window in which a
+	// revoke-first Logout would already have reached the server.
+	store := &memStore{
+		tok:   Token{AccessToken: "a", RefreshToken: "r", Expiry: time.Now().Add(time.Hour)},
+		saves: make(chan Token, 1),
+		gate:  make(chan struct{}),
+	}
+	svc, err := newWithOptions(Config{},
+		withCredentialsStore(store),
+		withOAuthConfig(oauth.Config{ClientID: "kstack-app", RevocationURL: ts.URL}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Logout(context.Background()) }()
+	testutil.Recv(t, store.saves, "sign-out to reach the credential clear")
+
+	// Negative assertion: no revoke while the clear is still in flight. There is
+	// no event to wait for, so it takes a window — undersizing it costs only
+	// sensitivity, since the release below still proves the revoke happens.
+	select {
+	case tok := <-revoked:
+		t.Fatalf("token %q revoked before the local credential was cleared", tok)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(store.gate)
+	if err := testutil.Recv(t, done, "Logout to return"); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if tok := testutil.Recv(t, revoked, "sign-out to revoke the token"); tok != "r" {
+		t.Fatalf("revoked token = %q, want the refresh token \"r\"", tok)
+	}
+	if cur, _ := svc.Current(context.Background()); cur.Authenticated {
+		t.Fatal("session still signed in after a rejected revoke")
 	}
 }
 
