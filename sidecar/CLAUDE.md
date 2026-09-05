@@ -25,7 +25,7 @@ Shutdown order from `main.go`: `app.NotifyShutdown()` → `srv.Shutdown` → `ap
 
 Full picture: [`docs/security-model.md`](../docs/security-model.md). The sidecar holds every credential in the system, so these are load-bearing:
 
-- **Every endpoint is an argument.** `configFromArgs` (`config.go`) parses the whole command line, including `--cloud-url`, `--oauth-issuer`, `--oauth-client-id` and `--keychain-service`; the host passes them. The environment reaches the config only through `applyEnvOverrides` (`config.go`), a no-op unless the binary is built with `-tags debug` (`make sidecar-dev`, for a standalone dev run with no host). `KSTACK_LOG_LEVEL` is the one variable a release build still reads — a log level redirects nothing. `config_test.go` pins the boundary; `go test` builds untagged.
+- **Every endpoint is an argument.** `configFromArgs` (`config.go`) parses the whole command line, including `--cloud-url`, `--oauth-issuer`, `--oauth-client-id` and `--keychain-service`; the host passes them. The environment reaches the config only through `applyEnvOverrides` (`config.go`), a no-op unless the binary is built with `-tags debug` (`make sidecar-dev`, for a standalone dev run with no host). `KSTACK_LOG_LEVEL` is the one variable a release build still reads — a log level redirects nothing. `config_test.go` pins the boundary; `go test` builds untagged, and the coverage gate runs both builds.
 
 - **Only the host process may connect.** `ipc.Authenticated` checks each accepted connection's peer pid against `--host-pid` (the kernel stamps it, so a client cannot claim another's) and closes anything else without ending the accept loop; zero, the standalone-run default, falls back to the uid alone. The file mode carries the rest: `ipc.Listen` tightens the umask *before* `net.Listen` so the socket is never briefly world-accessible, then chmods 0600; Windows binds the pipe owner-only (`D:P(A;;GA;;;OW)`). Both are pinned by tests. The endpoint is currently in the OS temp directory; private placement and server authentication remain open (R-01 in the latest review). Never widen access or add a TCP listener — the GET transport is registered alongside POST and SSE and is only harmless because the transport is local.
 - **Redaction happens at write time, keyed off the body's own group and kind,** so it cannot be bypassed by how an object was addressed (`kubestore/objects.go`). A new read path serves the stored body; it does not get to re-derive what to hide. The table is deliberately incomplete, so treat a cache file as holding cluster data in the clear — that is what makes its file mode and its lifetime security properties. Storing it in the clear is a decision, not an oversight. → [ADR: the cache is ordinary application data](../docs/adr/2026-09-02-the-cache-is-ordinary-application-data.md).
@@ -233,5 +233,18 @@ Implement the panicking stubs it appends to `schema.resolvers.go`. **Never hand-
 - Wait on channels through `internal/testutil` (`Wait`, `Recv`, `RecvClosed`, `WaitClosed`); the one failsafe is `testutil.Timeout`. A negative assertion gets its own short window.
 - A fake that notifies the test uses `testutil.Signal` (single-shot, idempotent `Fire`) or `testutil.Probe[T]` (repeating, non-blocking, drops oldest). Exception: a consumer doing edge detection needs a lossless fan-out (`internal/cloud`'s `fakeAuth`).
 - `make test-go`, `make lint-go` (gofmt), `make vet-go`. Run `gofmt -w` before committing.
+
+**Coverage is gated.** `make cover-go` (CI's `Go · Coverage` job) runs the suite twice —
+untagged and `-tags debug`, the only build that compiles `applyEnvOverrides` — merges the
+profiles with `-coverpkg=./...` so a helper exercised from another package counts, drops
+the generated files, and fails below `scripts/coverage-threshold`. `make cover-go
+ARGS=-report` lists every file with a gap. The gate is one number in one file: **raise it
+when a change lifts coverage, and never lower it without saying why in the commit body.**
+
+It measures what the platform builds, so run it on one OS — a `_windows.go` file is not
+compiled on Linux and never enters the denominator. What stays uncovered is deliberate:
+`main()` itself, the `serve returned` arm main can't provoke from a test, `testutil`'s
+own failsafe-timeout arms, and the I/O failures nothing can inject (a `Write` to a
+successfully-created temp file, a `BeginTx` on a healthy pool).
 
 When you change the sidecar's wiring or conventions, update this file in the same change. When you change *why*, write an ADR.

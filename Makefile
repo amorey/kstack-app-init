@@ -2,7 +2,7 @@
 # so it doesn't belong in package.json scripts; this Makefile is the
 # place where Go, Rust, and JS commands meet.
 
-.PHONY: sidecar sidecar-dev proto proto-go proto-rust test test-go test-rust test-js lint lint-go lint-rust lint-js vet vet-go vet-rust clean
+.PHONY: sidecar sidecar-dev proto proto-go proto-rust test test-go test-rust test-js cover-go lint lint-go lint-rust lint-js vet vet-go vet-rust clean
 
 # Build the Go sidecar into src-tauri/binaries/ with the Tauri-required
 # `<name>-<rust-host-triple>` filename. Tauri's externalBin picks it up.
@@ -48,6 +48,16 @@ test-rust: sidecar
 
 test-js:
 	pnpm test --run
+
+# Go coverage gate. Runs the suite untagged and with `-tags debug` (the only build
+# that compiles the environment overrides), merges the profiles, drops generated
+# files, and fails below sidecar/scripts/coverage-threshold. Add `-- -report` for
+# the per-file list of what is still uncovered.
+#
+# Measures what this platform builds: a `_windows.go` file is not compiled here, so
+# run it on one OS (CI uses Linux) rather than comparing numbers across a matrix.
+cover-go:
+	cd sidecar && go run scripts/coverage.go $(ARGS)
 
 # Run every linter in the repo.
 lint: lint-go lint-rust lint-js

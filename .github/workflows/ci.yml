@@ -202,6 +202,21 @@ jobs:
         working-directory: ./sidecar
         run: go test -race ./...
 
+  go-coverage:
+    name: Go · Coverage
+    needs:
+      - go-lint
+      - go-vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Check coverage against the threshold
+        working-directory: ./sidecar
+        run: go run scripts/coverage.go -report
+
   rust-test:
     name: Rust · Test
     needs:
