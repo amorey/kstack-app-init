@@ -183,20 +183,29 @@ func redactionsFor(u *unstructured.Unstructured) []redaction {
 	return redactions[[2]string{group, u.GetKind()}]
 }
 
-// redact applies one entry. A path that is missing, or whose value is not the shape the
-// schema promises, leaves the body alone rather than panicking on it — an unreadable shape
-// must not become a way to skip the redaction of a readable one.
+// redact applies one entry.
+//
+// A value we cannot read is a value we cannot prove is safe. Dropping it loses a
+// diagnostic; keeping it can store a credential. An err from a Nested* read means the
+// path is occupied by the wrong type — not that it is missing, which stays a no-op.
 func redact(u *unstructured.Unstructured, r redaction) {
 	switch r.mode {
 	case dropField:
 		unstructured.RemoveNestedField(u.Object, r.path...)
 	case redactValue:
-		if _, ok, _ := unstructured.NestedString(u.Object, r.path...); ok {
+		_, ok, err := unstructured.NestedString(u.Object, r.path...)
+		switch {
+		case ok:
 			_ = unstructured.SetNestedField(u.Object, redactedValue, r.path...)
+		case err != nil:
+			unstructured.RemoveNestedField(u.Object, r.path...)
 		}
 	case redactMapValues:
-		m, ok, _ := unstructured.NestedMap(u.Object, r.path...)
+		m, ok, err := unstructured.NestedMap(u.Object, r.path...)
 		if !ok {
+			if err != nil {
+				unstructured.RemoveNestedField(u.Object, r.path...)
+			}
 			return
 		}
 		for k := range m {

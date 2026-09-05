@@ -304,10 +304,9 @@ func TestProjectObjectRefusesABodyThatWillNotMarshal(t *testing.T) {
 	assert.ErrorIs(t, err, errUnprojectable)
 }
 
-// A Secret whose data is not the map the API says it is leaves the body alone rather than
-// panicking on it — an unreadable shape must not be a way to skip redaction of one that
-// is readable.
-func TestSanitizeLeavesASecretWhoseDataIsNotAMap(t *testing.T) {
+// A value we cannot read is a value we cannot prove is safe: the field goes, rather than
+// being stored because it did not parse.
+func TestSanitizeDropsASecretWhoseDataIsNotAMap(t *testing.T) {
 	u := obj(map[string]any{
 		"apiVersion": "v1", "kind": "Secret",
 		"metadata": map[string]any{"uid": "uid-1", "name": "creds"},
@@ -316,7 +315,57 @@ func TestSanitizeLeavesASecretWhoseDataIsNotAMap(t *testing.T) {
 
 	got := sanitize(u)
 
-	assert.Equal(t, "not-a-map", got.Object["data"])
+	assert.NotContains(t, got.Object, "data")
+}
+
+func TestSanitizeDropsAPasswordThatIsNotAString(t *testing.T) {
+	u := obj(map[string]any{
+		"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+		"metadata": map[string]any{"uid": "uid-1", "name": "tls"},
+		"spec": map[string]any{"keystores": map[string]any{
+			"jks": map[string]any{"password": map[string]any{"value": "hunter2"}},
+		}},
+	})
+
+	got := sanitize(u)
+
+	jks, _, err := unstructured.NestedMap(got.Object, "spec", "keystores", "jks")
+	require.NoError(t, err)
+	assert.NotContains(t, jks, "password")
+}
+
+// The discrimination is the err a Nested* read returns, not its found boolean: "absent"
+// and "there but unreadable" are the same boolean, and only one of them is safe to skip.
+// Collapse this back into !ok and the two cases above store the value again.
+func TestNestedReadsDistinguishAnAbsentPathFromAnUnreadableOne(t *testing.T) {
+	body := map[string]any{"data": "not-a-map"}
+
+	_, missing, missingErr := unstructured.NestedMap(body, "absent")
+	_, present, presentErr := unstructured.NestedMap(body, "data")
+
+	assert.False(t, missing)
+	assert.NoError(t, missingErr)
+	assert.False(t, present)
+	assert.Error(t, presentErr, "a wrong-typed value is reported by the error alone")
+}
+
+// Redaction reads the body's own group and kind, so a Secret mirrored under some other
+// kind's worker is still redacted, and a body that merely claims a redacted kind's name in
+// another group is not.
+func TestSanitizeRedactsByTheBodysOwnGroupAndKind(t *testing.T) {
+	secret := sanitize(obj(map[string]any{
+		"apiVersion": "v1", "kind": "Secret",
+		"metadata": map[string]any{"uid": "uid-1", "name": "creds"},
+		"data":     map[string]any{"password": "aHVudGVyMg=="},
+	}))
+	lookalike := sanitize(obj(map[string]any{
+		"apiVersion": "example.com/v1", "kind": "Secret",
+		"metadata": map[string]any{"uid": "uid-2", "name": "creds"},
+		"data":     map[string]any{"password": "aHVudGVyMg=="},
+	}))
+
+	assert.Equal(t, map[string]any{"password": redactedValue}, secret.Object["data"])
+	assert.Equal(t, map[string]any{"password": "aHVudGVyMg=="}, lookalike.Object["data"])
 }
 
 // writeSeq is one object's stamp, and 0 when the row is gone.

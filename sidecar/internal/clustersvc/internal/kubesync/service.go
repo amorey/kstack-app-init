@@ -41,6 +41,7 @@ import (
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubeconn"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/clustersvc/internal/kubestore"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/drain"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/safe"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/supervisor"
 )
 
@@ -683,7 +684,7 @@ func (s *Service) arm(cacheID int64, p Params) {
 		sess.cancel()
 		s.mu.Lock()
 		delete(s.sessions, cacheID)
-		s.storeFailures[cacheID] = capStoreFailure(err.Error())
+		s.storeFailures[cacheID] = capStoreFailure(safe.Safe(err))
 		s.mu.Unlock()
 		return
 	}
@@ -698,9 +699,9 @@ func (s *Service) arm(cacheID int64, p Params) {
 // that package imports this one, so the constant cannot be shared without a leaf to hold it.
 const maxStoreFailureMessage = 200
 
-// capStoreFailure bounds a message at birth. Both paths out of here — the gauge and the
-// event run clustersvc writes from it — carry it uncapped, so capping at either would fix
-// one and leave the other.
+// capStoreFailure bounds a message at birth, as safe.Safe renders it there. Both paths out
+// of here — the gauge and the event run clustersvc writes from it — carry the message
+// unchanged, so doing either at a boundary would fix one and leave the other.
 func capStoreFailure(msg string) string {
 	if len(msg) <= maxStoreFailureMessage {
 		return msg

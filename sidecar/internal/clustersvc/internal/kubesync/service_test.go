@@ -615,6 +615,18 @@ func TestArmCapsWhatADriverErrorCanSay(t *testing.T) {
 	assert.LessOrEqual(t, len(state.Message), maxStoreFailureMessage+len("…"))
 }
 
+// Bounded is not the same as safe: the same message is persisted and served to the UI, so
+// it is rendered where it is recorded, for the same reason it is bounded there.
+func TestArmRendersWhatADriverErrorCanSay(t *testing.T) {
+	svc, _ := newTestServiceOverStore(t, refusing(`open "https://cache.example/db?token=SEKRIT": denied`))
+
+	svc.TrackDiscovery(1, testParams)
+
+	state, _ := svc.GetDiscoveryState(1)
+	assert.NotContains(t, state.Message, "SEKRIT")
+	assert.Contains(t, state.Message, "denied")
+}
+
 // The retry path does not pass through tearDown — a failed arm deletes the session, so the
 // next TrackDiscovery finds none and arms again. Clearing on the way in is what keeps the
 // map holding exactly the caches whose MOST RECENT arm failed.

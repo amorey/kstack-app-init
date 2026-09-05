@@ -2243,3 +2243,20 @@ func TestClearingACacheReleasesItsSizeStop(t *testing.T) {
 		return err == nil && FindCondition(obj.Conditions, ConditionSynced) == nil
 	}, 5*time.Second, time.Millisecond, "the clear to release the cache's size stop")
 }
+
+// The sentinel for this subsystem: a client-go error carries the request URL it failed on,
+// and a URL can carry a token. What reaches the record must carry no part of it — the host
+// forwards every sidecar line into its own log sink, so the rendering has to happen here.
+func TestCachePassLogsAFailureWithoutTheCredential(t *testing.T) {
+	logs := testutil.CaptureLogs(t)
+	d, status := newClusterStatusDeps(t)
+	cluster := storedCluster(t, d, status, true, "uid-1")
+	cache := createCache(t, d.cacheClient, ClusterID(cluster.ID), "uid-1")
+	kubestoreFake(d).err = errors.New(
+		`Get "https://api.example.com/readyz?token=SEKRIT": context deadline exceeded`)
+
+	(&clusterCacheController{deps: d}).checkSizeLimit(context.Background(), cache)
+
+	assert.NotContains(t, logs.String(), "SEKRIT")
+	assert.Contains(t, logs.String(), "context deadline exceeded")
+}

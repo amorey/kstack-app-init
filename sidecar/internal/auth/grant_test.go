@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -439,5 +440,27 @@ func TestGrantSetRefusesWithoutAStore(t *testing.T) {
 	st, _ := g.state(context.Background())
 	if st.Authenticated {
 		t.Fatal("a storeless grant must stay signed out")
+	}
+}
+
+// The sentinel for this subsystem: a credential-store failure is logged, and an OS keyring
+// error commonly quotes the request that failed. What reaches the record must carry no part
+// of it that could be a credential — the host forwards every sidecar line into its own log
+// sink, so the rendering has to happen here.
+func TestStoreLoadErrorIsLoggedWithoutTheCredential(t *testing.T) {
+	logs := testutil.CaptureLogs(t)
+	store := &memCredStore{loadErr: errors.New(
+		`keyring: Get "https://vault.example/v1/creds?token=SEKRIT": 403 Forbidden`)}
+	m := newGrant(store, noRefresh, withNow(func() time.Time { return epoch }))
+
+	if _, err := m.state(context.Background()); err != nil {
+		t.Fatalf("state should degrade to signed-out, got err %v", err)
+	}
+
+	if strings.Contains(logs.String(), "SEKRIT") {
+		t.Fatalf("the credential reached the log: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "403 Forbidden") {
+		t.Fatalf("the diagnostic did not survive: %s", logs.String())
 	}
 }

@@ -71,6 +71,19 @@ func TestFailMessageDefaultsToTheError(t *testing.T) {
 	assert.Equal(t, "open ca.crt: no such file", r.message)
 }
 
+// The message outlives the log line: a caller folds it onto a record, which is persisted and
+// served to the UI. A probe's error is a client-go error, and that quotes the request URL.
+// Err keeps the original, since a caller matching on it must see what actually happened.
+func TestFailRendersTheMessageItStores(t *testing.T) {
+	err := errors.New(`Get "https://api.example.com/version?token=SEKRIT": 401 Unauthorized`)
+
+	r := Fail("ProbeFailed", err)
+
+	assert.NotContains(t, r.message, "SEKRIT")
+	assert.Contains(t, r.message, "401 Unauthorized")
+	assert.Equal(t, err, r.err)
+}
+
 func TestTheZeroResultIsInvalid(t *testing.T) {
 	assert.Equal(t, resultInvalid, Result{}.kind, "constructors are the only way to a valid Result")
 	assert.NotEqual(t, resultInvalid, Skip().kind)

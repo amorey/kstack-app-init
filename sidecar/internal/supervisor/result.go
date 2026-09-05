@@ -16,7 +16,11 @@
 // queues or the subjects.
 package supervisor
 
-import "time"
+import (
+	"time"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/safe"
+)
 
 // Reason classifies a run in the caller's vocabulary, opaque to the supervisor but for the two
 // constants below. A caller aliases this type and defines its own set.
@@ -91,11 +95,13 @@ func (r Result) RequeueAfter(d time.Duration) Result {
 }
 
 // Fail records a failure; the next run is up the backoff ladder. Message defaults to the
-// error's text.
+// error's text, rendered: a caller folds it onto a record, which is persisted and served to
+// the UI, and a client-go error quotes the request URL it failed on. Err keeps the original,
+// which is what a caller matching on it needs.
 func Fail(reason Reason, err error) Result {
 	r := Result{kind: resultRecord, verdict: VerdictFailed, reason: reason, err: err}
 	if err != nil {
-		r.message = err.Error()
+		r.message = safe.Safe(err)
 	}
 	return r
 }

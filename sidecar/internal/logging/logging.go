@@ -10,8 +10,9 @@ import (
 )
 
 // Init returns a logger emitting one JSON line per record to w, typically os.Stderr.
+// Everything it writes is rendered through internal/safe on the way out — see redact.go.
 func Init(w io.Writer, level slog.Level) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level}))
+	return slog.New(redactHandler{slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})})
 }
 
 // ParseLevel maps KSTACK_LOG_LEVEL to a slog.Level; an unknown value falls back to Info
