@@ -143,7 +143,8 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 The current picture — boundaries, and which protections a test actually pins — is
 [`security-model.md`](security-model.md); the findings behind these items are
-[`security/2026-09-02-threat-model.md`](security/2026-09-02-threat-model.md).
+[4 September review and disposition register](security/2026-09-04-security-review.md), which
+accounts for every finding from the [2 September threat model](security/2026-09-02-threat-model.md).
 
 An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
 distinguishable from an unnoticed one. **Decided against:**
@@ -164,14 +165,67 @@ distinguishable from an unnoticed one. **Decided against:**
 
 **Without a spec yet:**
 
+- **S-2 — kubeconfig trust and exec consent (high; cluster-service owner).** Newly imported enabled
+  contexts are probed automatically, including exec plugins; importing a file is a code-execution
+  trust decision. Gate the first probe/plugin run behind explicit approval of the resolved command,
+  args, environment and source; invalidate approval when these change. Include token/certificate
+  file references and server/proxy destinations in the trust design. Test startup, reload, previously
+  unused contexts and approval revocation. Until then use only trusted kubeconfigs.
+
+- **R-01 / H-5 — authenticate the sidecar to the host (medium; desktop/IPC owner).** Verify the
+  spawned child PID/account on every GraphQL, SSE and gRPC connection; use a private Unix runtime
+  directory with safe cleanup. Test replacement/reconnect and native Windows pipe precreation.
+  The sidecar's existing client PID check is only one direction.
+
+- **R-02 — native navigation policy (medium; desktop owner).** Reject remote origins and unexpected
+  schemes/popups in the native webview callbacks; keep intended external links host-owned. Verify
+  routing, reload, URL-based data egress and remote-origin IPC denial on all three webview engines.
+  CSP is not a top-level navigation allowlist.
+
+- **R-05 / S-9 — resource budgets (medium; sidecar/desktop owners).** Define GraphQL cost/depth and
+  concurrency limits, subscription/frame and Kubernetes object/decompression limits, worker fan-out
+  and a global disk budget including `app.db`. Test oversized inputs, repeated operations and
+  recovery. The 2 GiB per-cache janitor ceiling and query timeouts are partial protection only.
+
+- **R-06 — diagnostics and malformed credential fields (medium; sidecar owner).** Redact/bound
+  auth, probe and sync errors before logging/persistence; add sentinel tests through native log
+  forwarding. Fail closed on malformed shapes of known credential paths and test GVK mismatches.
+  The R-03 GraphQL logging fix is not a system-wide credential-redaction guarantee.
+
+- **R-08 — release assurance (medium; release owner).** Pin third-party actions to reviewed SHAs,
+  minimize per-job permissions, require checks for the exact release commit, schedule advisory
+  scans and triage warnings below failure thresholds. Verify signing policy/artifacts, publish
+  trusted signature verification instructions and confirm SBOM coverage. Review actual GitHub
+  environment/branch protections separately; this checkout cannot establish them.
+
+- **R-09 — Rust advisory triage (desktop/dependency owners).** Resolve `glib 0.18.5`
+  RUSTSEC-2024-0429 with an upstream-compatible fix/backport or scoped acceptance after reachability
+  analysis. Track the sixteen unmaintained dependency notices enumerated in the review. Do not
+  force an incompatible glib major/minor line into the GTK dependency graph or ignore all warnings.
+
+- **R-10 — OAuth callback bounds (low; auth owner).** Add read-header/idle limits and nonblocking
+  one-shot error delivery, with repeated-valid-callback and cancellation tests. Document and test
+  best-effort revocation separately from local logout success.
+
+- **R-11 — pending login after logout (medium; auth owner).** Cancel/invalidate old browser flows
+  on logout or replacement; check a session generation atomically with token persistence so a
+  racing completion cannot restore the session. Test logout-before-callback and out-of-order logins
+  with controlled channels, and revoke/discard superseded grants.
+
+- **Verification debt (security/release owners).** Rerun govulncheck with database access (review
+  received HTTP 403), canonical cargo-audit, native Rust tests, CGO race tests and signed
+  macOS/Windows IPC/navigation/entitlement tests. Inspect release settings and signature artifacts.
+  Unknown scan/platform results are not clean results.
+
+
 - **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
   `release.yml` ships is signed direct downloads — a notarized `.dmg` with the sidecar signed
   inside it, an `.msi` signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and
   `SHA256SUMS` with a detached GPG signature beside all of them — so a download is verifiable by
   hand everywhere and by the OS on two platforms. The in-app path is what is missing. **What it
   takes:** a keypair from `pnpm tauri signer generate` whose private half lives only in the
-  `production` environment's secrets (`TAURI_SIGNING_PRIVATE_KEY` and its password, which the three
-  bundle jobs already run under); `tauri-plugin-updater` in `Cargo.toml` and registered in
+  `production` environment's secrets (`TAURI_SIGNING_PRIVATE_KEY` and its password; macOS and Windows
+  bundle jobs already use that environment, while Linux would need to be added); `tauri-plugin-updater` in `Cargo.toml` and registered in
   `lib.rs`, with **nothing added to `src-tauri/capabilities/default.json`** — the host checks,
   prompts and installs, and granting `updater:default` to the webview would hand a compromised page
   the download-and-install path for no reason; `plugins.updater` in `tauri.conf.json` carrying the
@@ -204,11 +258,12 @@ distinguishable from an unnoticed one. **Decided against:**
   *"A retention policy…"* row in [`security-model.md`](security-model.md) to **Enforced**, naming
   the test, and fold the policy into `sidecar/CLAUDE.md`.
 
-- **The threat model's H-3.** `src-tauri/entitlements.plist` sets
-  `com.apple.security.cs.disable-library-validation` so the hardened runtime will exec the sidecar,
-  but `release.yml` now signs the sidecar inside the bundle under the same Team ID, which is the
-  condition that entitlement was working around. Try a release build without it; if the sidecar
-  still launches, drop the entitlement, since it is also what would let an injected dylib load.
+- **H-3 — macOS runtime exceptions (medium; desktop/release owners).**
+  `disable-library-validation` relaxes in-process library signature validation; it does not grant
+  permission to exec a separate sidecar. Test a signed/notarized build without it, and separately
+  evaluate `allow-unsigned-executable-memory` and `allow-jit`. Remove unnecessary exceptions only
+  after startup, sidecar, OAuth and webview smoke tests on both supported CPU architectures.
+  Source inspection alone cannot establish the minimum required entitlements.
 
 ## Testing
 

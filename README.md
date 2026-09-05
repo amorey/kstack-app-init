@@ -58,3 +58,13 @@ sbx exec -it claude-kstack-app bash     # shell inside
 ## Recommended IDE setup
 
 [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+
+## Security
+
+Read the [security model](docs/security-model.md) and the
+[latest review and open findings](docs/security/2026-09-04-security-review.md) before using sensitive
+clusters. Only load trusted kubeconfigs: enabled contexts are connected automatically, and their
+credential plugins can execute local programs. Cached cluster data may contain credentials outside
+the redaction table, remains on disk after cloud sign-out, and is not encrypted by the app. Use
+least-privilege Kubernetes credentials and protect the OS account and disk. Review open findings
+and verification gaps before distributing a release.

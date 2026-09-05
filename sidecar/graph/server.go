@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -47,21 +48,15 @@ func NewServer(r *Resolver) *Server {
 	// Lets a subscription report WHY it ended; see WatchFailureExtension.
 	srv.Use(WatchFailureExtension{})
 
-	// One seam for resolver/parse errors. Log the operation and path but NEVER
-	// `variables` — they can carry auth tokens or PII.
+	// Request text, names, aliases and error messages can all contain credentials.
+	// Log only server-selected metadata; return the detailed error over authenticated IPC.
 	srv.SetErrorPresenter(func(ctx context.Context, e error) *gqlerror.Error {
 		err := graphql.DefaultErrorPresenter(ctx, e)
-		op, opName := "", ""
-		if oc := graphql.GetOperationContext(ctx); oc != nil {
-			opName = oc.OperationName
-			op = oc.RawQuery
+		op := "unknown"
+		if oc := graphql.GetOperationContext(ctx); oc != nil && oc.Operation != nil {
+			op = string(oc.Operation.Operation)
 		}
-		slog.ErrorContext(ctx, "graphql error",
-			"op", opName,
-			"path", err.Path.String(),
-			"error", err.Message,
-			"raw", op,
-		)
+		slog.ErrorContext(ctx, "graphql error", "operation_type", op, "error", fmt.Sprintf("%T", e))
 		return err
 	})
 

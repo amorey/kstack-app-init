@@ -2,17 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- WKWebView JavaScriptCore needs a writable, executable JIT region. -->
+	<!-- JIT exceptions: the minimum required set must be verified in a signed
+	     macOS build; see H-3 in the current security review. -->
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
 	<true/>
 
-	<!--
-	  The Go sidecar is built separately and embedded via Tauri externalBin.
-	  Without this, the hardened runtime refuses to exec a binary it did not
-	  see signed under the same Team as part of the app.
-	-->
+	<!-- Permits third-party libraries regardless of Team ID. Necessity is unverified;
+	     see H-3 in docs/security/2026-09-04-security-review.md. -->
 	<key>com.apple.security.cs.disable-library-validation</key>
 	<true/>
 

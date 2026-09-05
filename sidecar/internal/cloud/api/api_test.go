@@ -352,3 +352,13 @@ func TestWatchSettingsContextCancelIsCleanError(t *testing.T) {
 		t.Fatalf("ctx cancel must be a clean close, got terminal error %v", e)
 	}
 }
+
+// A peer can bypass the scanner's line limit using many small data lines.
+func TestParseSSEBoundsAggregateFrame(t *testing.T) {
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	input := "event: next\n" + strings.Repeat(line, maxRespBody/1024+1)
+	err := parseSSE(context.Background(), strings.NewReader(input), "settingsWatch", make(chan Settings, 1))
+	if err == nil || !strings.Contains(err.Error(), "frame exceeds") {
+		t.Fatalf("expected frame size error, got %v", err)
+	}
+}

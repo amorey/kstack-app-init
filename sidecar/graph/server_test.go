@@ -93,46 +93,41 @@ func TestResolverErrorIsLogged(t *testing.T) {
 	}
 }
 
-// TestErrorLogOmitsVariables pins the other half of the presenter's rule: the
-// operation is logged, its variables never are — they can carry auth tokens or
-// PII. The sentinel rides $id because ObjectID is the only variable type the
-// query surface takes; what it stands for is any coerced variable value, which
-// reaches the request and must not reach the log.
-func TestErrorLogOmitsVariables(t *testing.T) {
-	// A valid ObjectID no fixture defines. Valid matters: a malformed one is
-	// echoed by the scalar's own parse error, which would fail this test for a
-	// reason that is not the presenter's.
-	const sentinel = "8675309000000001"
-
+// TestErrorLogOmitsRequestData exercises resolver and validation errors. Values may
+// arrive as variables, literals, names or aliases, and parsers may echo them in errors.
+func TestErrorLogOmitsRequestData(t *testing.T) {
+	const sentinel = "sensitive_8675309"
+	requests := []string{
+		`{"query":"mutation($id: ObjectID!) { clusterEnabledSet(id: $id, enabled: true) { id } }","variables":{"id":"8675309000000001"}}`,
+		`{"query":"mutation { clusterEnabledSet(id: \"8675309000000001\", enabled: true) { id } }"}`,
+		`{"query":"mutation($id: ObjectID!) { clusterEnabledSet(id: $id, enabled: true) { id } }","variables":{"id":"sensitive_8675309"}}`,
+		`{"query":"mutation { clusterEnabledSet(id: \"sensitive_8675309\", enabled: true) { id } }"}`,
+		`{"query":"mutation sensitive_8675309 { sensitive_8675309: clusterEnabledSet(id: \"8675309000000001\", enabled: true) { id } }"}`,
+		`{"query":"{ sensitive_8675309 }"}`,
+	}
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	var buf bytes.Buffer
-	slog.SetDefault(logging.Init(&buf, slog.LevelInfo))
-
-	h := graph.NewServer(&graph.Resolver{ClusterSvc: newFakeClusterService(nil)})
-	ts := httptest.NewServer(h)
-	defer ts.Close()
-
-	// clusterEnabledSet returns a non-null Cluster, so an unknown id is an error
-	// rather than a null — the presenter is guaranteed to run.
-	body := fmt.Sprintf(
-		`{"query":"mutation($id: ObjectID!, $enabled: Boolean!) { clusterEnabledSet(id: $id, enabled: $enabled) { id } }","variables":{"id":%q,"enabled":true}}`,
-		sentinel,
-	)
-	resp, err := http.Post(ts.URL+"/graphql", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatalf("POST /graphql: %v", err)
-	}
-	resp.Body.Close()
-
-	// Without this the absence below proves nothing: a request that never errored
-	// logs nothing at all, and the sentinel is missing for the wrong reason.
-	if !bytes.Contains(buf.Bytes(), []byte(`"level":"ERROR"`)) {
-		t.Fatalf("expected the presenter to log an error, got: %s", buf.String())
-	}
-	if bytes.Contains(buf.Bytes(), []byte(sentinel)) {
-		t.Errorf("variable value reached the log: %s", buf.String())
+	for _, body := range requests {
+		t.Run(body, func(t *testing.T) {
+			var buf bytes.Buffer
+			slog.SetDefault(logging.Init(&buf, slog.LevelInfo))
+			h := graph.NewServer(&graph.Resolver{ClusterSvc: newFakeClusterService(nil)})
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/graphql", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			h.ServeHTTP(rr, req)
+			if !bytes.Contains(rr.Body.Bytes(), []byte(`"errors"`)) {
+				t.Fatalf("expected an error response: %s", rr.Body.String())
+			}
+			if !bytes.Contains(buf.Bytes(), []byte(`"level":"ERROR"`)) {
+				t.Fatalf("expected an error log: %s", buf.String())
+			}
+			for _, secret := range []string{sentinel, "8675309000000001"} {
+				if strings.Contains(buf.String(), secret) {
+					t.Errorf("request data reached log: %s", buf.String())
+				}
+			}
+		})
 	}
 }
 

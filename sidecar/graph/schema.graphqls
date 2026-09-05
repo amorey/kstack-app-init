@@ -878,17 +878,17 @@ type ClusterCachedDataObjectWatchFrame {
 }
 
 # --- Cloud account ---
-# The sidecar-owned sign-in and the state it publishes. Tokens never appear here: the projection carries only the sign-in bit and the verified
-# claims.
+# The sidecar-owned sign-in and display identity. Tokens never appear here.
+# Login verifies claims; startup restores display claims without re-verification.
 
-"The verified identity of the signed-in user, from the OIDC ID-token claims."
+"Display identity from OIDC ID-token claims. Verified at login, restored without verification at startup; never an authorization input."
 type Identity {
   sub: String!
   email: String!
   name: String!
 }
 
-"The user's authentication state. `authenticated` is the sign-in signal; `identity` carries the verified claims and is non-null only when authenticated."
+"Local session state. `authenticated` means a refresh token is stored, not that the server has just validated it. `identity` is display-only and non-null only when authenticated."
 type AuthState {
   authenticated: Boolean!
   identity: Identity

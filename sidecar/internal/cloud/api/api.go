@@ -297,6 +297,11 @@ func parseSSE(ctx context.Context, r io.Reader, dataField string, out chan<- Set
 		case "event":
 			eventType = value
 		case "data":
+			// The scanner bounds a line, but a frame may contain arbitrarily many
+			// data lines without a blank terminator. Bound their aggregate too.
+			if len(value) > maxRespBody-dataBuf.Len() {
+				return fmt.Errorf("cloud SSE frame exceeds %d bytes", maxRespBody)
+			}
 			dataBuf.WriteString(value)
 		}
 	}
