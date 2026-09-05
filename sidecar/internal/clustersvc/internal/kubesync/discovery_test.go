@@ -121,7 +121,8 @@ func TestAnUnchangedCatalogIsWrittenOnceAndAnnouncedOnce(t *testing.T) {
 	awaitDiscovered(t, svc, 1)
 	cluster.reads.Drain()
 
-	// Subscribed after the cache settled, so what arrives is the second sweep's alone.
+	// Subscribed after the first sweep's news, so what arrives is the second sweep's alone.
+	awaitNewsQuiet(t, svc)
 	news := svc.WatchDiscoveryNews()
 	t.Cleanup(news.Close)
 
@@ -143,7 +144,8 @@ func TestACatalogThatMovedIsAnnouncedWithItsReasonUnmoved(t *testing.T) {
 	svc.TrackDiscovery(1, testParams)
 	awaitDiscovered(t, svc, 1)
 
-	// Subscribed after the cache settled, so what arrives is the second sweep's alone.
+	// Subscribed after the first sweep's news, so what arrives is the second sweep's alone.
+	awaitNewsQuiet(t, svc)
 	news := svc.WatchDiscoveryNews()
 	t.Cleanup(news.Close)
 

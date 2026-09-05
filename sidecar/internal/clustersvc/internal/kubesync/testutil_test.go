@@ -838,9 +838,9 @@ func start(t *testing.T, svc *Service) {
 // awaitDiscovered settles on a sweep that answered; awaitReason on whichever verdict a test
 // is waiting for. News is not a status, so both answer it the way a consumer does: re-read.
 //
-// Each subscribes for itself and gives the subscription back, so a test asserting on news
-// opens its own AFTER settling and never has to tell what the settling consumed from what
-// its own sweep published.
+// Each subscribes for itself and gives the subscription back. The state is published before
+// the news the settling belongs to, so a test that goes on to assert on news follows these
+// with awaitNewsQuiet rather than subscribing on the reason alone.
 func awaitDiscovered(t *testing.T, svc *Service, cacheID int64) {
 	t.Helper()
 	awaitReason(t, svc, cacheID, ReasonDiscovered)
@@ -855,6 +855,29 @@ func awaitReason(t *testing.T, svc *Service, cacheID int64, reason string) {
 			return
 		}
 		testutil.Recv(t, news.Chan(), "a sweep settling on "+reason)
+	}
+}
+
+// awaitNewsQuiet waits until the discovery feed has stopped, which is the point a test can
+// open a subscription carrying only what it goes on to cause. A sweep publishes its state
+// before its news, so a subscription opened the moment the reason lands can still catch the
+// frame that settling published.
+//
+// The window is bounded because quiet has no event to wait for; each frame restarts it, so a
+// cache that never settles fails on the deadline rather than mid-burst.
+func awaitNewsQuiet(t *testing.T, svc *Service) {
+	t.Helper()
+	news := svc.WatchDiscoveryNews()
+	defer news.Close()
+	deadline := time.After(testutil.Timeout)
+	for {
+		select {
+		case <-news.Chan():
+		case <-time.After(quietWindow):
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for the discovery feed to go quiet")
+		}
 	}
 }
 
