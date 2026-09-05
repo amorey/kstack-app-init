@@ -19,14 +19,14 @@ import (
 // memStore is an in-memory CredentialsStore (host keychain stand-in).
 type memStore struct {
 	tok     Token
-	saveErr error            // when set, Save fails without mutating tok
-	saved   *testutil.Signal // fired on each Save attempt, for tests watching a detached one
+	saveErr error      // when set, Save fails without mutating tok
+	saves   chan Token // when set, receives every Save attempt, for tests watching a detached one
 }
 
 func (m *memStore) Load() (Token, error) { return m.tok, nil }
 func (m *memStore) Save(t Token) error {
-	if m.saved != nil {
-		m.saved.Fire()
+	if m.saves != nil {
+		m.saves <- t
 	}
 	if m.saveErr != nil {
 		return m.saveErr
@@ -414,7 +414,7 @@ func TestLoginTailFailureStaysSignedOut(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			done := testutil.NewSignal()
-			store := &memStore{saveErr: tc.saveErr, saved: testutil.NewSignal()}
+			store := &memStore{saveErr: tc.saveErr, saves: make(chan Token, 4)}
 			svc, err := newWithOptions(Config{},
 				withCredentialsStore(store),
 				withLoginStarter(func(context.Context) (pendingLogin, error) {
@@ -437,7 +437,7 @@ func TestLoginTailFailureStaysSignedOut(t *testing.T) {
 			}
 			done.Wait(t, "the login tail to run")
 			if tc.waitSave {
-				store.saved.Wait(t, "the persist attempt")
+				testutil.Recv(t, store.saves, "the persist attempt")
 			}
 
 			st, err := svc.Current(context.Background())
@@ -470,5 +470,146 @@ func TestNewUsesTheKeychainServiceWhenNoStoreIsInjected(t *testing.T) {
 	}
 	if st.Authenticated {
 		t.Fatal("an empty keyring should read as signed out")
+	}
+}
+
+// blockedLogin is a login whose browser round-trip hangs until the test releases it,
+// standing in for a user who leaves the tab open.
+func blockedLogin(release <-chan struct{}, tok Token, id Identity) loginStarter {
+	return func(context.Context) (pendingLogin, error) {
+		return func(context.Context) (Token, Identity, error) {
+			<-release
+			return tok, id, nil
+		}, nil
+	}
+}
+
+// Signing out while a login is still in the browser must win: the flow completes against
+// a session that no longer exists, so its token is nobody's and must not be persisted or
+// republished as signed in.
+func TestLogoutBeatsAPendingLogin(t *testing.T) {
+	release := make(chan struct{})
+	store := &memStore{saves: make(chan Token, 4)}
+	svc, err := newWithOptions(Config{},
+		withCredentialsStore(store),
+		withLoginStarter(blockedLogin(release,
+			Token{AccessToken: "a", RefreshToken: "r-late", Expiry: time.Now().Add(time.Hour)},
+			Identity{UserID: "late"})),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := svc.StartLogin(context.Background()); err != nil {
+		t.Fatalf("StartLogin: %v", err)
+	}
+	if err := svc.Logout(context.Background()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if cleared := testutil.Recv(t, store.saves, "sign-out to clear the store"); cleared != (Token{}) {
+		t.Fatalf("sign-out saved %+v, want the zero Token", cleared)
+	}
+
+	close(release)
+
+	// The tail has returned by the time anything could be written, so the only work left
+	// is one mutex acquisition and a store call. A write arriving at all is the bug.
+	testutil.NoRecv(t, store.saves, 200*time.Millisecond, "a persist from the superseded login")
+	st, err := svc.Current(context.Background())
+	if err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if st.Authenticated {
+		t.Fatal("a login that completed after sign-out must not restore the session")
+	}
+}
+
+// A discarded login still minted a live credential at the issuer, so dropping it locally
+// is not enough: it is revoked, the same as the token a sign-out hands back.
+func TestSupersededLoginRevokesItsToken(t *testing.T) {
+	revoked := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		revoked <- r.Form.Get("token")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	release := make(chan struct{})
+	svc, err := newWithOptions(Config{},
+		// Signed out to begin with, so the only token there is to revoke is the one the
+		// abandoned login goes on to mint.
+		withCredentialsStore(&memStore{}),
+		withOAuthConfig(oauth.Config{ClientID: "kstack-app", RevocationURL: ts.URL}),
+		withLoginStarter(blockedLogin(release,
+			Token{AccessToken: "a", RefreshToken: "r-late", Expiry: time.Now().Add(time.Hour)},
+			Identity{UserID: "late"})),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := svc.StartLogin(context.Background()); err != nil {
+		t.Fatalf("StartLogin: %v", err)
+	}
+	if err := svc.Logout(context.Background()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	close(release)
+
+	if tok := testutil.Recv(t, revoked, "the superseded login's token to be revoked"); tok != "r-late" {
+		t.Fatalf("revoked token = %q, want r-late", tok)
+	}
+}
+
+// Two logins can be open at once — the user retries in a second tab — and they can finish
+// in either order. The newest one owns the session, so a straggler must not overwrite the
+// identity the user actually signed in as.
+func TestASecondLoginSupersedesTheFirst(t *testing.T) {
+	release := make(chan struct{})
+	starts := []loginStarter{
+		blockedLogin(release,
+			Token{AccessToken: "a1", RefreshToken: "r-first", Expiry: time.Now().Add(time.Hour)},
+			Identity{UserID: "first"}),
+		func(context.Context) (pendingLogin, error) {
+			return func(context.Context) (Token, Identity, error) {
+				return Token{AccessToken: "a2", RefreshToken: "r-second", Expiry: time.Now().Add(time.Hour)},
+					Identity{UserID: "second"}, nil
+			}, nil
+		},
+	}
+	var n int
+	store := &memStore{saves: make(chan Token, 4)}
+	svc, err := newWithOptions(Config{},
+		withCredentialsStore(store),
+		withLoginStarter(func(ctx context.Context) (pendingLogin, error) {
+			p, err := starts[n](ctx)
+			n++
+			return p, err
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := svc.StartLogin(context.Background()); err != nil {
+		t.Fatalf("first StartLogin: %v", err)
+	}
+	if err := svc.StartLogin(context.Background()); err != nil {
+		t.Fatalf("second StartLogin: %v", err)
+	}
+	if saved := testutil.Recv(t, store.saves, "the second login to persist"); saved.RefreshToken != "r-second" {
+		t.Fatalf("persisted %q, want r-second", saved.RefreshToken)
+	}
+
+	close(release)
+
+	testutil.NoRecv(t, store.saves, 200*time.Millisecond, "a persist from the superseded first login")
+	st, err := svc.Current(context.Background())
+	if err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if st.Identity == nil || st.Identity.UserID != "second" {
+		t.Fatalf("identity = %+v, want the second login's", st.Identity)
 	}
 }

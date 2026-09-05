@@ -52,6 +52,7 @@ type grant struct {
 	tok      Token
 	identity Identity
 	loaded   bool
+	gen      uint64 // session epoch; a login completing against a stale one is refused
 }
 
 // newGrant builds the aggregate and RESTORES persisted state: a stored refresh token
@@ -151,6 +152,34 @@ func (s *grant) current() (Token, error) {
 func (s *grant) set(tok Token, id Identity) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.setLocked(tok, id)
+}
+
+// supersede opens a new session epoch and returns it. A login captures its epoch before
+// detaching, so its completion can be told apart from the session it was started for —
+// and so a second login retires the first rather than racing it.
+func (s *grant) supersede() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gen++
+	return s.gen
+}
+
+// setIfGen records the credential only while gen is still the current epoch, reporting
+// false once a sign-out has moved past it. The comparison shares set's lock with the
+// write it guards: cancelling a flow cannot help here, because the race is decided at
+// the moment of persistence.
+func (s *grant) setIfGen(gen uint64, tok Token, id Identity) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen != s.gen {
+		return false, nil
+	}
+	return true, s.setLocked(tok, id)
+}
+
+// setLocked is set's body (s.mu held).
+func (s *grant) setLocked(tok Token, id Identity) error {
 	if s.store == nil {
 		return ErrSignedOut
 	}
@@ -178,6 +207,7 @@ func (s *grant) clear() error {
 	s.tok = Token{}
 	s.identity = Identity{}
 	s.loaded = true
+	s.gen++
 	s.publishLocked()
 	return nil
 }

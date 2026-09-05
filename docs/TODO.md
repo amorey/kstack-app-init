@@ -212,13 +212,6 @@ distinguishable from an unnoticed one. **Decided against:**
   [`security-model.md`](security-model.md) and test the two halves apart. The callback's read
   bounds and one-shot error delivery have landed.
 
-- **R-11 — pending login after logout (medium; auth owner).** Cancel/invalidate old browser flows
-  on logout or replacement; check a session generation atomically with token persistence so a
-  racing completion cannot restore the session. The generation belongs on `grant`, which already
-  holds the mutex the check has to share with the write — `service` cannot make it atomic. Test
-  logout-before-callback and out-of-order logins with controlled channels, and revoke/discard
-  superseded grants.
-
 - **Verification debt (security/release owners).** What the 4 September review could not run, it
   recorded as owed; most of it was already running in CI, which the review did not check.
   `govulncheck`, `cargo audit`, `cargo test` and `go test -race` all run per pull request across

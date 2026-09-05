@@ -61,6 +61,7 @@ links the ADR that accepted it. **Not built** links the work.
 | Secret values redacted at write time, keyed off the body's own group and kind | `kubestore/objects.go` | **Enforced** — `TestProjectRedactsSecretValues`, `TestProjectRedactsOnlyCoreSecrets` |
 | `managedFields` and the last-applied annotation stripped before storage | `kubestore/objects.go` | **Enforced** — `TestProjectStripsServerNoise` |
 | Loopback callback checks `state` before consuming a code or an error | `sidecar/internal/auth/login.go` | **Enforced** — `TestLoopbackRejectsInvalidCallbackWithoutConsuming` |
+| A login completing after sign-out cannot restore the session, and its token is revoked | `sidecar/internal/auth/grant.go`, `auth.go` | **Enforced** — `TestLogoutBeatsAPendingLogin`, `TestSupersededLoginRevokesItsToken`, `TestASecondLoginSupersedesTheFirst`; the epoch check shares `set`'s lock with the write it guards |
 | The loopback callback bounds its reads, and a repeated error cannot park its handler | `sidecar/internal/auth/login.go` | **Enforced** — `TestLoopbackServerBoundsItsReads`, `TestLoopbackSurvivesRepeatedAuthorizationErrors` |
 | A webview's subscriptions are torn down by the host on reload and close | `src-tauri/src/lib.rs` | **Enforced** — `cancel_webview_drops_only_that_webviews_subscriptions` |
 | Sidecar-reported log fields ride under `sidecar.fields`, never as host fields | `src-tauri/src/services/sidecar/logs.rs` | **Enforced** — `forwarded_fields_are_namespaced` |

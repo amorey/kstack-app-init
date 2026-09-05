@@ -230,6 +230,7 @@ func (s *service) StartLogin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	gen := s.grant.supersede()
 
 	// The grant persists BEFORE broadcasting signed-in, so a keychain write failure
 	// leaves us signed-out rather than reporting a credential that never landed.
@@ -247,8 +248,16 @@ func (s *service) StartLogin(ctx context.Context) error {
 			}
 			return
 		}
-		if err := s.grant.set(tok, id); err != nil {
+		ok, err := s.grant.setIfGen(gen, tok, id)
+		if err != nil {
 			slog.Error("cloud sign-in: persist failed", "err", err)
+			return
+		}
+		if !ok {
+			// The credential is live at the issuer even though nothing here will use it,
+			// so hand it back rather than leave it standing until it expires.
+			slog.Info("cloud sign-in completed against a session that has since ended; discarding it")
+			s.revokeAsync(tok.RefreshToken)
 		}
 	}()
 
