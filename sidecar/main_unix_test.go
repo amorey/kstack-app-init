@@ -16,10 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// socketPath returns a bindable AF_UNIX path inside the test's temp dir.
+// socketPath returns a bindable AF_UNIX path for one test.
+//
+// Not t.TempDir(): it embeds the test's name, and a socket path over sun_path —
+// 104 bytes on macOS — fails to bind with EINVAL.
 func socketPath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "sidecar.sock")
+	dir, err := os.MkdirTemp("", "sidecar")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "s.sock")
 }
 
 // unbindableEndpoint names a socket under a directory that does not exist.
