@@ -199,19 +199,25 @@ distinguishable from an unnoticed one. **Decided against:**
   The R-03 GraphQL logging fix is not a system-wide credential-redaction guarantee.
 
 - **R-08 — release assurance (medium; release owner).** Pin third-party actions to reviewed SHAs,
-  minimize per-job permissions, require checks for the exact release commit, schedule advisory
-  scans and triage warnings below failure thresholds. Verify signing policy/artifacts, publish
-  trusted signature verification instructions and confirm SBOM coverage. Review actual GitHub
-  environment/branch protections separately; this checkout cannot establish them.
+  minimize per-job permissions and require checks for the exact release commit. Verify signing
+  policy/artifacts, publish trusted signature verification instructions and confirm SBOM coverage.
+  Review actual GitHub environment/branch protections separately; this checkout cannot establish
+  them. The advisory jobs now fail on unsound and unmaintained findings, so what is left of the
+  scanning half is running them on a schedule — deliberately not done yet, so an idle branch still
+  learns nothing about a new advisory until someone opens a pull request.
 
 - **R-10 — OAuth callback bounds (low; auth owner).** Add read-header/idle limits and nonblocking
-  one-shot error delivery, with repeated-valid-callback and cancellation tests. Document and test
-  best-effort revocation separately from local logout success.
+  one-shot error delivery, with repeated-valid-callback and cancellation tests. `loopbackServer`
+  sends on its error channel from two places — the callback handler and the `Serve` goroutine — and
+  both block; fixing only the handler leaves the bug. Document and test best-effort revocation
+  separately from local logout success.
 
 - **R-11 — pending login after logout (medium; auth owner).** Cancel/invalidate old browser flows
   on logout or replacement; check a session generation atomically with token persistence so a
-  racing completion cannot restore the session. Test logout-before-callback and out-of-order logins
-  with controlled channels, and revoke/discard superseded grants.
+  racing completion cannot restore the session. The generation belongs on `grant`, which already
+  holds the mutex the check has to share with the write — `service` cannot make it atomic. Test
+  logout-before-callback and out-of-order logins with controlled channels, and revoke/discard
+  superseded grants.
 
 - **Verification debt (security/release owners).** What the 4 September review could not run, it
   recorded as owed; most of it was already running in CI, which the review did not check.
