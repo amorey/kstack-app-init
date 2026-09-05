@@ -303,8 +303,11 @@ func TestDependentsRecordDependencyFailedWhileTheServerIsUnreachable(t *testing.
 	watched := lease.WatchState()
 	defer watched.Close()
 
+	// Not any recorded frame: the connection committing wakes the probes that read
+	// it, so one can show a fresh run in flight over the last record. The settled
+	// one is what the suspension is asserted on.
 	st := awaitState(t, watched, func(st State) bool {
-		return st.ServerUID.LastAttempt.Done()
+		return st.ServerUID.LastAttempt.Done() && !st.ServerUID.InFlight()
 	})
 
 	assert.Equal(t, ReasonDependencyFailed, st.ServerUID.LastAttempt.Reason)
