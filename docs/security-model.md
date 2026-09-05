@@ -5,8 +5,8 @@ rather than by remembering. Present tense, like a `CLAUDE.md`: this file states 
 
 Dated findings live in [`docs/security/`](security/) and are never rewritten. Gaps live in
 [`TODO.md`](TODO.md#security), each carrying the shape of the work; one settled enough to build
-straight through gets a spec in [`docs/specs/`](specs/). A risk we decide to accept becomes an ADR,
-so it can be told apart from one nobody has noticed.
+straight through gets a spec in [`docs/specs/`](specs/). A risk we decide to accept becomes an ADR
+and a **By decision** row below, so it can be told apart from one nobody has noticed.
 
 Latest review and complete disposition register: [4 September 2026](security/2026-09-04-security-review.md).
 Open findings are recorded work, not accepted risks unless an ADR explicitly says so. Tests pin
@@ -73,6 +73,7 @@ links the ADR that accepted it. **Not built** links the work.
 | Data directories created 0700; `host.json` and the sync files written 0600 | `src-tauri/src/services/sidecar/service.rs`, `atomicjson`, `clustersvc/service.go`, `sqlitemigrate`, `appdb`, `kubestore/manager.go` | **Enforced** on Unix — `ensure_data_dir_creates_and_tightens_to_0700`, `TestSaveIsOwnerOnly`, `TestOpenPoolFilesAreOwnerOnly`, `TestCacheFileIsOwnerOnly`, `TestSetOwnerOnlyUmask`; on Windows the inherited profile ACL, [by decision](adr/2026-09-02-windows-cache-files-rely-on-the-profile-acl.md) |
 | Cloud and OAuth endpoints come from the host's arguments, not from inherited environment | `src-tauri/src/services/sidecar/service.rs`, `sidecar/config.go` | **Enforced** — `cmd_args_passes_socket_data_dir_host_pid_and_endpoints`, `TestConfigFromArgsIgnoresEnvironment`, plus the untagged-build assertion in `release.yml` |
 | Go, Rust and npm advisory jobs configured on every pull request | `.github/workflows/ci.yml`, `src-tauri/.cargo/audit.toml` | **Enforced** — the `Go · Audit`, `Rust · Audit` and `TypeScript · Audit` jobs; npm fails at moderate, Rust denies unsound and unmaintained against a reasoned ignore list ([the advisories Tauri's dependency graph pins](adr/2026-09-05-tauri-pinned-transitive-advisories.md)). Advisories run per pull request, not on a schedule, and releases do not depend on these jobs (R-08) |
+| The seventeen advisories Tauri's Linux stack and `urlpattern` pin, left unresolved | `src-tauri/.cargo/audit.toml` | **By decision** — [the advisories Tauri's dependency graph pins](adr/2026-09-05-tauri-pinned-transitive-advisories.md); `glib`'s unsoundness is unreachable and the patched line belongs to gtk4, so the sixteen unmaintained notices have no upgrade either. Each is ignored with a reason, and the deny flags above fail a new one |
 | Production CSP admits no remote script, no `eval`, no frames, no form posts | `src-tauri/tauri.conf.json` | **Enforced** — `production_csp_admits_no_remote_code` reads the shipped config: `script-src` is `'self'` alone, the four `'none'` directives hold, and no directive admits `unsafe-eval` or an origin off this machine |
 | The webview renders no HTML from cluster data — no `innerHTML`, no `dangerouslySetInnerHTML` | `src/` | **Enforced** — the `custom/cluster-data-is-text` config object in `eslint.config.ts` |
 | Printer columns evaluated by a restricted reader, not a template engine | `src/lib/jsonpath.ts` | **Enforced** — `src/lib/jsonpath.test.ts` pins the reader; the `custom/cluster-data-is-text` config object refuses a template engine, by import and by call |
@@ -127,5 +128,6 @@ execution, or assistant egress require a new boundary review.
   believed on the day. A later review is a new file, not an edit.
 - **[`TODO.md`](TODO.md#security)** — the gaps. They stay out of the table above except as *Not
   built* rows, so nothing here reads as a protection that exists.
-- **`docs/adr/`** — a risk we decide to accept. An accepted risk is a decision with a cost, and
-  writing it down is what stops the next review re-litigating it.
+- **`docs/adr/`** — a risk we decide to accept, carried into the table above as a *By decision*
+  row. An accepted risk is a decision with a cost, and writing it down is what stops the next
+  review re-litigating it.

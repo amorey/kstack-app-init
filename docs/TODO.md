@@ -146,28 +146,9 @@ The current picture — boundaries, and which protections a test actually pins �
 [4 September review and disposition register](security/2026-09-04-security-review.md), which
 accounts for every finding from the [2 September threat model](security/2026-09-02-threat-model.md).
 
-An item we decide **not** to do becomes an ADR rather than a deletion, so an accepted risk stays
-distinguishable from an unnoticed one. **Decided against:**
-
-- Aging out cached events by their own TTL — the whole-file ceiling bounds them instead, and between
-  relists events still accumulate without a bound of their own. → [bound the cache by total
-  size](adr/2026-09-03-bound-the-cache-by-total-size.md)
-- Allowlisting the operations the host forwards (the threat model's **S-9**, which would have blunted
-  **H-1**) — the set of operations the app ships converges on the whole schema, so the cap would not
-  hold a line the app is not already crossing. H-1 stands: the CSP and the absence of an HTML sink
-  are the containment. → [no GraphQL operation
-  allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md)
-- Resolving the seventeen advisories Tauri's Linux stack and `urlpattern` pin (the review's
-  **R-09**) — `glib`'s unsoundness is unreachable (nothing in the graph calls `array_iter_str`) and
-  the patched line belongs to gtk4, so the sixteen unmaintained notices have no upgrade either.
-  They are listed in `src-tauri/.cargo/audit.toml` with a reason each, and CI now runs `cargo audit
-  --deny unsound --deny unmaintained` so a new one fails. → [the advisories Tauri's dependency
-  graph pins](adr/2026-09-05-tauri-pinned-transitive-advisories.md)
-- Pinning the GraphQL schema against a field served ahead of its consumer — it changes with nearly
-  every feature, so the pin would be re-blessed by habit. `src-tauri/capabilities/default.json` is
-  pinned instead, the auth projection's fields are pinned by type, and a mutation with no caller is
-  what review is for. → [the schema's breadth is held by
-  review](adr/2026-09-03-schema-breadth-is-held-by-review.md)
+A risk we decide to accept is recorded as a **By decision** row in
+[`security-model.md`](security-model.md), each linking the ADR that accepted it — so an accepted
+risk stays distinguishable from an unnoticed one, and is not repeated here.
 
 **Without a spec yet:**
 
