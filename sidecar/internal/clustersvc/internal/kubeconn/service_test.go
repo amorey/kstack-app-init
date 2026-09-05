@@ -447,6 +447,10 @@ func TestDepartureReachesTheHolder(t *testing.T) {
 	settled(t, lease)
 	news := s.Subscribe()
 	defer news.Close()
+	// `settled` waits for the connection probe alone, so a signal still landing from startup
+	// would be read below as the departure — and read that early, the state it asserts on is
+	// one the departure has not reached yet.
+	settleNews(t, news)
 
 	cfg.rotate("prod", "")
 	cfg.changed()
