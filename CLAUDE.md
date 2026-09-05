@@ -67,6 +67,29 @@ Two shapes are *not* magic sleeps, and both must say so in a comment:
 - **A negative assertion** ("must NOT happen") has no event to wait for, so it needs a bounded window. Write it as a `select` on the tripwire channel versus `time.After` — it fails the instant the thing happens rather than at the end — and size the window as a multiple of the (shrunk) cadence, never a bare guess. Sample the baseline off the same channel, not by polling a counter, or the baseline read races the bug and swallows it.
 - **Latency injected into the code under test** — a fake that takes a moment on purpose so a join-vs-no-join race has a determinate answer. The test's own assertion path stays immediate.
 
+## Commits and pull requests
+
+How a change is landed, whatever it touched. Applies to every commit and pull request in
+this repo, all three languages.
+
+- **Commits are terse conventional commits, written for a human reader.**
+  `type(scope): subject` —
+  `feat`/`fix`/`perf`/`refactor`/`test`/`docs`/`chore`, scope only when it adds
+  information (`sqlite`, `edges`, `watch`), `!` for a breaking change. Subject
+  is imperative, lower-case, no period, ≤72 chars, and says what the change
+  does, not how (`feat(edges): enqueue an edge's source when the declaration
+  commits`). No body unless the why isn't obvious from the diff — then 1–3
+  plain sentences, no bullet lists; rationale longer than that is an ADR the
+  body links. Optimise for someone reading `git log`: the subject is the whole
+  message for most commits, so spend its budget on what changed, never on
+  restating the diff or padding the format.
+- **Pull requests follow
+  [`.github/pull_request_template.md`](.github/pull_request_template.md)**: keep
+  its sections (`Summary` for the why, `Key Changes` for the what, `Checklist`),
+  and lead the title with the template's emoji for the change type — 🎣 bug fix,
+  🐋 new feature, 📜 documentation, ✨ general improvement. Titles must be natural
+  titles with first letter capitalized, not conventional commit headings.
+
 ## Security invariants
 
 The whole picture is [`docs/security-model.md`](docs/security-model.md). What an ordinary frontend change can break:
