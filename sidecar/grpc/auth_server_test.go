@@ -2,6 +2,7 @@ package grpcserver_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -35,7 +36,8 @@ type fakeAuthSvc struct {
 	identity auth.Identity
 	loginAs  auth.Identity
 
-	loginErr error // when set, StartLogin returns this error without signing in
+	loginErr  error // when set, StartLogin returns this error without signing in
+	logoutErr error // when set, Logout returns this error without signing out
 
 	hub *watch.Hub[auth.State]
 	tx  *watch.Sender[auth.State]
@@ -77,6 +79,9 @@ func (f *fakeAuthSvc) StartLogin(context.Context) error {
 func (f *fakeAuthSvc) Logout(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.logoutErr != nil {
+		return f.logoutErr
+	}
 	f.signedIn = false
 	f.identity = auth.Identity{}
 	f.publishLocked()
@@ -237,4 +242,28 @@ func TestAuthStateWatchDrainsOnShutdown(t *testing.T) {
 	require.ErrorIs(t, testutil.Recv(t, recvErr, "the AuthStateWatch stream to drain after NotifyShutdown"), io.EOF)
 
 	grpcSrv.Stop()
+}
+
+// An auth service that fails reports Internal, not a silent success: the tray
+// menu drives these RPCs, and a swallowed error would leave it showing the
+// wrong session.
+func TestAuthUnaryRPCsSurfaceServiceFailures(t *testing.T) {
+	svc := newFakeAuthSvc(auth.Identity{})
+	svc.loginErr = errors.New("loopback bind failed")
+	svc.logoutErr = errors.New("keyring locked")
+	grpcSrv := grpcserver.NewServer(svc, nil)
+	conn := newGRPCTestConn(t, grpcSrv)
+	t.Cleanup(grpcSrv.Stop)
+
+	client := authpb.NewAuthServiceClient(conn)
+
+	_, err := client.StartLogin(context.Background(), &authpb.StartLoginRequest{})
+	st, _ := status.FromError(err)
+	require.Equal(t, codes.Internal, st.Code())
+	require.Contains(t, st.Message(), "loopback bind failed")
+
+	_, err = client.Logout(context.Background(), &authpb.LogoutRequest{})
+	st, _ = status.FromError(err)
+	require.Equal(t, codes.Internal, st.Code())
+	require.Contains(t, st.Message(), "keyring locked")
 }

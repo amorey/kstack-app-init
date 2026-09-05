@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -337,5 +338,74 @@ func TestVerifyBadSignature(t *testing.T) {
 	raw := its.sign(t, its.otherKey, "kstack-app", nil) // wrong key
 	if _, err := c.Verify(context.Background(), raw); err == nil {
 		t.Fatal("expected verification to fail for a bad signature")
+	}
+}
+
+// A payload that isn't base64, and one that isn't the claims JSON, are both
+// rejected — the unverified path still has to be a real parse.
+func TestParseIdentityUnverifiedRejectsBadPayloads(t *testing.T) {
+	for name, raw := range map[string]string{
+		"payload is not base64": "header.!!!.sig",
+		"claims are not JSON":   "header." + base64.RawURLEncoding.EncodeToString([]byte("nope")) + ".sig",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseIdentityUnverified(raw); err == nil {
+				t.Fatal("want an error")
+			}
+		})
+	}
+}
+
+// Verify without a JWKS URL has no keys to check against, so it refuses rather
+// than accepting the token unverified.
+func TestVerifyWithoutAVerifierRefuses(t *testing.T) {
+	c := NewClient(Config{ClientID: "x"})
+	if _, err := c.Verify(context.Background(), "any.token.here"); err == nil {
+		t.Fatal("want an error when no verifier is configured")
+	}
+}
+
+// A token endpoint that rejects the grant fails both exchanges; neither returns
+// a half-built Token.
+func TestTokenEndpointFailuresSurface(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	c := NewClient(Config{ClientID: "kstack-app", TokenURL: ts.URL})
+	if tok, err := c.Exchange(context.Background(), "code", testVerifier, ""); err == nil {
+		t.Errorf("Exchange returned %+v, want an error", tok)
+	}
+	if tok, err := c.Refresh(context.Background(), "refresh-123"); err == nil {
+		t.Errorf("Refresh returned %+v, want an error", tok)
+	}
+}
+
+// A refresh response that carries no new refresh token keeps the one we sent:
+// Hydra omits it when the grant's token is static, and losing it would sign the
+// user out at the next refresh.
+func TestRefreshKeepsAStaticRefreshToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"access-456","token_type":"bearer","expires_in":3600}`)
+	}))
+	defer ts.Close()
+
+	c := NewClient(Config{ClientID: "kstack-app", TokenURL: ts.URL})
+	tok, err := c.Refresh(context.Background(), "refresh-123")
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if tok.RefreshToken != "refresh-123" {
+		t.Errorf("RefreshToken = %q, want the one we sent back", tok.RefreshToken)
+	}
+}
+
+// A revocation URL that cannot become a request fails before any network call.
+func TestRevokeRejectsAnUnusableEndpoint(t *testing.T) {
+	c := NewClient(Config{ClientID: "x", RevocationURL: "://bad"})
+	if err := c.Revoke(context.Background(), "t"); err == nil {
+		t.Fatal("want an error for an unusable revocation endpoint")
 	}
 }

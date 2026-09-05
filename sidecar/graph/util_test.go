@@ -52,15 +52,16 @@ func TestMapStreamStopsOnContextCancel(t *testing.T) {
 // the goroutine past cancellation.
 func TestMapStreamStopsOnContextCancelDuringSend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	sub := make(chan int, 1)
+	sub := make(chan int)
 	unsubbed := make(chan struct{})
 
-	sub <- 1 // pump picks this up and blocks sending "1" to the unread output
 	out := mapStream(ctx, sub, func() { close(unsubbed) }, strconv.Itoa)
 
+	// The source is unbuffered, so this returns only once the pump has taken the
+	// value — which leaves it blocked sending "1" to the unread output.
+	sub <- 1
 	cancel()
 
-	// Drain whatever arrives; the stream must end (channel close) either way.
-	testutil.WaitClosed(t, out, "the output channel")
+	testutil.RecvClosed(t, out, "the output channel")
 	testutil.RecvClosed(t, unsubbed, "the unsub channel")
 }

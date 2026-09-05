@@ -15,9 +15,12 @@
 package graph_test
 
 import (
+	"context"
 	"errors"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/99designs/gqlgen/graphql"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -104,5 +107,26 @@ func TestHealthyWatchFramesCarryNoError(t *testing.T) {
 	// read exactly that many rather than draining to a close that never comes.
 	for range clusterFixtures() {
 		assert.NotContains(t, nextSSE(t, events).data, "errors")
+	}
+}
+
+// The extension names itself for gqlgen's registry; the name is part of the
+// server wiring, not decoration.
+func TestWatchFailureExtensionName(t *testing.T) {
+	if got := (graph.WatchFailureExtension{}).ExtensionName(); got != "WatchFailure" {
+		t.Errorf("ExtensionName() = %q, want %q", got, "WatchFailure")
+	}
+}
+
+// A response reaching the interceptor without the operation context it installs
+// falls straight through. Nothing in production skips InterceptOperation, so
+// this is the arm that keeps a misconfigured server serving rather than panicking.
+func TestWatchFailureInterceptResponseIgnoresAnUninstrumentedContext(t *testing.T) {
+	got := (graph.WatchFailureExtension{}).InterceptResponse(
+		context.Background(),
+		func(context.Context) *graphql.Response { return nil },
+	)
+	if got != nil {
+		t.Errorf("InterceptResponse = %+v, want nil", got)
 	}
 }

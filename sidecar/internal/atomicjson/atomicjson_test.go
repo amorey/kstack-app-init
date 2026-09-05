@@ -101,3 +101,24 @@ func TestSaveCreatesMissingDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A read that fails for anything other than "missing" is an error, not a zero
+// value: only absence is a legitimate empty document.
+func TestLoadUnreadablePathReturnsError(t *testing.T) {
+	dir := t.TempDir() // a directory is readable-as-a-file nowhere
+	if _, err := atomicjson.Load[doc](dir); err == nil {
+		t.Fatal("Load on a directory returned no error")
+	}
+}
+
+// A value JSON cannot represent fails before anything is written, so the
+// document on disk is untouched.
+func TestSaveRejectsUnmarshalableValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "doc.json")
+	if err := atomicjson.Save(path, make(chan int)); err == nil {
+		t.Fatal("Save of a channel returned no error")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("Save wrote %s despite failing to marshal", path)
+	}
+}

@@ -154,3 +154,13 @@ func TestAppShutdownDrainsBothTransports(t *testing.T) {
 	// The gRPC stream ended cleanly (OK trailers → EOF), not cut mid-flight.
 	assert.ErrorIs(t, testutil.Recv(t, grpcRecvErr, "the gRPC Watch to drain"), io.EOF)
 }
+
+// A data dir that is not a directory fails at the first subsystem that needs
+// one: New reports it rather than returning a half-built App.
+func TestAppRejectsAnUnusableDataDir(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(notADir, []byte("x"), 0o600))
+
+	_, err := New(Config{DataDir: notADir})
+	require.Error(t, err)
+}

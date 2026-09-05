@@ -15,7 +15,9 @@
 package testutil
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -75,4 +77,51 @@ func TestWaitClosedDrains(t *testing.T) {
 	ch <- 2
 	close(ch)
 	WaitClosed(t, ch, "a stream")
+}
+
+// fakeTB stands in for *testing.T so a helper's failure arm can be asserted
+// instead of failing the run. Embedding testing.TB (nil) satisfies the
+// interface's unexported method; only what the helpers call is implemented, so
+// anything else is a nil-call panic naming it.
+type fakeTB struct {
+	testing.TB
+	failed string
+}
+
+func (f *fakeTB) Helper() {}
+
+// Fatalf records instead of aborting: without runtime.Goexit the helper runs on
+// to its return, which is exactly the path under test.
+func (f *fakeTB) Fatalf(format string, args ...any) {
+	f.failed = fmt.Sprintf(format, args...)
+}
+
+// Every helper's promise is the failure, not the happy path — a helper that
+// quietly accepted the wrong outcome would pass tests that should fail. Each
+// case here fails on the spot, with no failsafe timeout to wait out.
+func TestHelpersFailOnTheWrongOutcome(t *testing.T) {
+	closed := make(chan int)
+	close(closed)
+
+	t.Run("Recv on a closed channel", func(t *testing.T) {
+		f := &fakeTB{}
+		assert.Zero(t, Recv(f, closed, "a value"))
+		assert.Contains(t, f.failed, "closed while waiting")
+	})
+
+	t.Run("NoRecv on a delivered value", func(t *testing.T) {
+		ch := make(chan int, 1)
+		ch <- 7
+		f := &fakeTB{}
+		NoRecv(f, ch, time.Millisecond, "nothing")
+		assert.Contains(t, f.failed, "received 7")
+	})
+
+	t.Run("RecvClosed on a delivered value", func(t *testing.T) {
+		ch := make(chan int, 1)
+		ch <- 7
+		f := &fakeTB{}
+		RecvClosed(f, ch, "a close")
+		assert.Contains(t, f.failed, "delivered 7")
+	})
 }

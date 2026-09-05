@@ -1,6 +1,7 @@
 package appdb
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -30,4 +31,20 @@ func TestOpenCreatesMigratesAndPersists(t *testing.T) {
 	t.Cleanup(func() { _ = db2.Close() })
 	require.NoError(t, db2.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v))
 	require.Equal(t, 1, v)
+}
+
+// A data dir that cannot hold app.db fails the open — both when the parent path
+// cannot be created and when the file itself cannot be an SQLite database.
+func TestOpenFailsOnAnUnusablePath(t *testing.T) {
+	dir := t.TempDir()
+
+	notADir := filepath.Join(dir, "file")
+	require.NoError(t, os.WriteFile(notADir, []byte("x"), 0o600))
+	_, err := Open(filepath.Join(notADir, "app.db"))
+	require.ErrorContains(t, err, "mkdir")
+
+	// A directory where the database file belongs: the dir already exists, so the
+	// failure comes from the pool's first connection.
+	_, err = Open(dir)
+	require.Error(t, err)
 }

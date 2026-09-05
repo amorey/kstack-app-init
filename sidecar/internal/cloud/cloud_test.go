@@ -2,12 +2,18 @@ package cloud
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"golang.org/x/oauth2"
 
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth"
+	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/api"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/cloud/prefs"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -268,4 +274,97 @@ func TestConfiguredStartStop(t *testing.T) {
 	if err := stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
+}
+
+// A data dir that cannot hold the settings file is a construction failure, not
+// a degrade: degrading is for "no cloud configured", and silently dropping the
+// user's prefs on the floor is a different thing entirely.
+func TestNewFailsOnAnUnusableDataDir(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := newWithOptions(notADir, "https://api.example.test", nil, nil, withUpstream(newSignalUpstream())); err == nil {
+		t.Fatal("New with an unusable data dir returned no error")
+	}
+}
+
+// Without an auth service there is no session to watch, so Start runs the
+// engine alone and stop still unwinds cleanly.
+func TestStartWithoutAuthStopsCleanly(t *testing.T) {
+	up := newSignalUpstream()
+	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", nil, nil, withUpstream(up))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	stop, err := svc.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	up.started.Wait(t, "the engine to start")
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
+// stop is bounded by its own context: a caller that has run out of shutdown
+// budget gets the deadline error rather than blocking on a goroutine that is
+// taking too long.
+func TestStopIsBoundedByItsContext(t *testing.T) {
+	up := newSignalUpstream()
+	svc, err := newWithOptions(t.TempDir(), "https://api.example.test", signedInFakeAuth(), nil, withUpstream(up))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	stop, err := svc.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	up.started.Wait(t, "the engine to start")
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := stop(expired); err == nil {
+		t.Fatal("stop with an expired context returned nil")
+	}
+	// The goroutines still unwind; give them an unbounded stop so the test leaves
+	// nothing running.
+	_ = stop(context.Background())
+}
+
+// The api-backed upstream is a pass-through to the client; the adapter is what
+// the engine actually calls, so both directions are exercised against a server.
+func TestAPIUpstreamPassesThroughToTheClient(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"updateSettings":{"theme":"dark"}}}`)
+	}))
+	defer ts.Close()
+
+	up := apiUpstream{c: api.New(ts.URL, func(context.Context) oauth2.TokenSource {
+		return staticSource{}
+	})}
+
+	got, err := up.Update(context.Background(), prefs.Settings{})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got.Theme == nil || *got.Theme != "dark" {
+		t.Errorf("Update returned %+v, want the server's settings", got)
+	}
+	ch, _, err := up.Watch(context.Background())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	// The body is one JSON document, not an event stream: no frame is published and
+	// the stream ends — the adapter forwarding the client's channel is the point.
+	testutil.RecvClosed(t, ch, "the watch stream")
+}
+
+// staticSource is a token source for the api-client pass-through test.
+type staticSource struct{}
+
+func (staticSource) Token() (*oauth2.Token, error) {
+	return &oauth2.Token{AccessToken: "tok"}, nil
 }

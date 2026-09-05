@@ -794,3 +794,84 @@ func TestEngine_NotifierSignalPokes(t *testing.T) {
 	// Engine should re-enter Snapshot promptly (proving the poke propagated).
 	up.entered.Await(t, "the notifier poke to trigger a reconnect")
 }
+
+// The state names ride the GraphQL sync-status field, so they are wire values,
+// not debug output. An unnamed state reads as "unknown" rather than a number.
+func TestStateStrings(t *testing.T) {
+	for state, want := range map[State]string{
+		StateConnecting: "connecting",
+		StateLive:       "live",
+		StateBackoff:    "backoff",
+		StateOffline:    "offline",
+		State(99):       "unknown",
+	} {
+		if got := state.String(); got != want {
+			t.Errorf("State(%d).String() = %q, want %q", state, got, want)
+		}
+	}
+}
+
+// The delay doubles per attempt and then holds at the cap — including once the
+// shift has overflowed to a negative duration, which no cap comparison alone
+// would catch.
+func TestBackoffDelayCapsAtMax(t *testing.T) {
+	store, q := newStoreQueue(t)
+	e := newWithOptions(&fakeUpstream{}, store, q, nil, testOpts()...)
+
+	if got := e.backoffDelay(0); got != time.Second {
+		t.Errorf("backoffDelay(0) = %v, want 1s", got)
+	}
+	if got := e.backoffDelay(2); got != 4*time.Second {
+		t.Errorf("backoffDelay(2) = %v, want 4s", got)
+	}
+	for _, attempt := range []int{10, 62, 64} {
+		if got := e.backoffDelay(attempt); got != time.Minute {
+			t.Errorf("backoffDelay(%d) = %v, want the 1m cap", attempt, got)
+		}
+	}
+}
+
+// The production seams, which every other test replaces: jitter picks a point in
+// [d/2, d] and refuses to feed a non-positive duration to the RNG, and sleep
+// returns once the delay is up.
+func TestDefaultBackoffSeams(t *testing.T) {
+	var o engineOpts
+	o.applyDefaults()
+
+	if got := o.jitter(0); got != 0 {
+		t.Errorf("jitter(0) = %v, want 0", got)
+	}
+	for range 100 {
+		got := o.jitter(time.Second)
+		if got < time.Second/2 || got > time.Second {
+			t.Fatalf("jitter(1s) = %v, want a point in [500ms, 1s]", got)
+		}
+	}
+	if err := o.sleep(context.Background(), 0); err != nil {
+		t.Errorf("sleep(0) = %v, want nil once the timer fires", err)
+	}
+}
+
+// A watch that cannot be opened is a connect failure like any other: the engine
+// backs off rather than treating the missing stream as a live one.
+func TestWatchOpenFailureBacksOff(t *testing.T) {
+	store, q := newStoreQueue(t)
+	up := &fakeUpstream{watchErr: errors.New("stream refused")}
+
+	sleeps := make(chan time.Duration)
+	opts := append(testOpts(), withSleep(func(ctx context.Context, d time.Duration) error {
+		select {
+		case sleeps <- d:
+		case <-ctx.Done():
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	e := newWithOptions(up, store, q, nil, opts...)
+	runEngine(t, e)
+
+	testutil.Recv(t, sleeps, "the backoff after a refused watch")
+	if got := e.Status(); got.State != StateOffline || got.LastError != "stream refused" {
+		t.Fatalf("status = %+v, want Offline carrying the open error", got)
+	}
+}

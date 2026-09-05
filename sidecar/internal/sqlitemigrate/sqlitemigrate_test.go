@@ -205,3 +205,68 @@ func TestOpenPoolKeepsEveryConnectionItOpens(t *testing.T) {
 	require.Equal(t, n, db.Stats().Idle)
 	require.Zero(t, db.Stats().MaxIdleClosed)
 }
+
+// A migrations dir that isn't there is a build mistake, not an empty upgrade.
+func TestApplyRejectsAMissingDir(t *testing.T) {
+	_, err := Apply(context.Background(), openDB(t), fsWith(t, nil), "nowhere")
+	require.Error(t, err)
+}
+
+// Everything that isn't a `*.sql` file is ignored, so a dir carrying a README or
+// a subdirectory still migrates.
+func TestApplySkipsNonSQLEntries(t *testing.T) {
+	db := openDB(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "migrations")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "notes"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.md"), []byte("hi"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "0001_first.sql"),
+		[]byte(`CREATE TABLE alpha (id INTEGER PRIMARY KEY);`), 0o600))
+
+	v, err := Apply(context.Background(), db, os.DirFS(root), "migrations")
+	require.NoError(t, err)
+	require.Equal(t, 1, v)
+	require.True(t, tableExists(t, db, "alpha"))
+}
+
+// A leading segment that isn't a number names no version.
+func TestApplyRejectsANonNumericVersion(t *testing.T) {
+	fsys := fsWith(t, map[string]string{"init_first.sql": `SELECT 1;`})
+	_, err := Apply(context.Background(), openDB(t), fsys, "migrations")
+	require.ErrorContains(t, err, "non-numeric version")
+}
+
+// An empty set leaves the DB at its recorded version — the bookkeeping table is
+// still created, so the next release has somewhere to record.
+func TestApplyWithNoMigrationsIsANoOp(t *testing.T) {
+	db := openDB(t)
+	v, err := Apply(context.Background(), db, fsWith(t, nil), "migrations")
+	require.NoError(t, err)
+	require.Equal(t, 0, v)
+	require.True(t, tableExists(t, db, "schema_migrations"))
+}
+
+// A migration that fails leaves neither its own changes nor its version row: the
+// transaction rolls back whole, so the next run retries it from the same version.
+func TestApplyRollsBackAFailedMigration(t *testing.T) {
+	db := openDB(t)
+	fsys := fsWith(t, map[string]string{
+		"0001_first.sql":  `CREATE TABLE alpha (id INTEGER PRIMARY KEY);`,
+		"0002_broken.sql": `CREATE TABLE beta (id INTEGER PRIMARY KEY); NOT SQL;`,
+	})
+
+	v, err := Apply(context.Background(), db, fsys, "migrations")
+	require.ErrorContains(t, err, "0002_broken.sql")
+	require.Equal(t, 1, v)
+	require.True(t, tableExists(t, db, "alpha"))
+	require.False(t, tableExists(t, db, "beta"))
+}
+
+// A DB that cannot be written can't even record progress, so Apply stops at the
+// bookkeeping table rather than running a migration it could not record.
+func TestApplyFailsOnAClosedDB(t *testing.T) {
+	db := openDB(t)
+	require.NoError(t, db.Close())
+	_, err := Apply(context.Background(), db, fsWith(t, nil), "migrations")
+	require.ErrorContains(t, err, "create schema_migrations")
+}

@@ -552,11 +552,18 @@ func (f fakeCachedKinds) ListByCache(_ context.Context, cacheID clustersvc.Clust
 	return out, nil
 }
 
+// WatchSchedule is a gauge: one current value on subscribe, then open until ctx
+// ends, as a cluster with nothing newly scheduled behaves.
 func (f fakeClusters) WatchSchedule(ctx context.Context, _ clustersvc.ClusterID) (<-chan clustersvc.Schedule, error) {
 	ch := make(chan clustersvc.Schedule)
 	go func() {
+		defer close(ch)
+		select {
+		case ch <- clustersvc.Schedule{Probing: true}:
+		case <-ctx.Done():
+			return
+		}
 		<-ctx.Done()
-		close(ch)
 	}()
 	return ch, nil
 }
@@ -759,3 +766,150 @@ func firstCacheFrame(t *testing.T, srvURL string) map[string]any {
 		}
 	}
 }
+
+// --- Failing doubles ---
+//
+// Every resolver that returns (value, error) has an arm that only a failing
+// service reaches. These doubles embed the interfaces rather than implementing
+// them: the resolvers call a handful of methods, and anything else is a nil-call
+// panic naming exactly what a test reached without meaning to.
+
+// errClusterService fails every call the resolvers make with err.
+type errClusterService struct {
+	clustersvc.Service
+	err error
+}
+
+type (
+	errClusters struct {
+		clustersvc.Clusters
+		err error
+	}
+	errCaches struct {
+		clustersvc.Caches
+		err error
+	}
+	errCachedKinds struct {
+		clustersvc.CachedKinds
+		err error
+	}
+	errCachedData struct {
+		clustersvc.CachedData
+		err error
+	}
+)
+
+func (e errClusterService) Clusters() clustersvc.Clusters       { return errClusters{err: e.err} }
+func (e errClusterService) Caches() clustersvc.Caches           { return errCaches{err: e.err} }
+func (e errClusterService) CachedKinds() clustersvc.CachedKinds { return errCachedKinds{err: e.err} }
+func (e errClusterService) CachedData() clustersvc.CachedData   { return errCachedData{err: e.err} }
+
+func (e errClusterService) ListEvents(context.Context, clustersvc.ObjectID, *string, *int) ([]clustersvc.Event, error) {
+	return nil, e.err
+}
+
+func (e errClusterService) WatchEvents(context.Context, clustersvc.ObjectID, *string) (*clustersvc.Stream[clustersvc.EventWatchFrame], error) {
+	return nil, e.err
+}
+
+func (e errClusterService) RetryConnection(context.Context, clustersvc.ObjectID) error { return e.err }
+
+func (e errClusters) List(context.Context) ([]*clustersvc.Cluster, error) { return nil, e.err }
+
+func (e errClusters) Get(context.Context, clustersvc.ClusterID) (*clustersvc.Cluster, error) {
+	return nil, e.err
+}
+
+func (e errClusters) WatchList(context.Context) (*clustersvc.Stream[clustersvc.ClusterWatchFrame], error) {
+	return nil, e.err
+}
+
+func (e errClusters) WatchSchedule(context.Context, clustersvc.ClusterID) (<-chan clustersvc.Schedule, error) {
+	return nil, e.err
+}
+
+func (e errClusters) SetEnabled(context.Context, clustersvc.ClusterID, bool) (*clustersvc.Cluster, error) {
+	return nil, e.err
+}
+
+func (e errClusters) SetSyncEnabled(context.Context, clustersvc.ClusterID, bool) (*clustersvc.Cluster, error) {
+	return nil, e.err
+}
+
+func (e errClusters) Delete(context.Context, clustersvc.ClusterID) error { return e.err }
+
+func (e errCaches) Get(context.Context, clustersvc.ClusterCacheID) (*clustersvc.ClusterCache, error) {
+	return nil, e.err
+}
+
+func (e errCaches) List(context.Context) ([]*clustersvc.ClusterCache, error) { return nil, e.err }
+
+func (e errCaches) ListByCluster(context.Context, clustersvc.ClusterID) ([]*clustersvc.ClusterCache, error) {
+	return nil, e.err
+}
+
+func (e errCaches) Clear(context.Context, clustersvc.ClusterCacheID) (*clustersvc.ClusterCache, error) {
+	return nil, e.err
+}
+
+func (e errCaches) WatchList(context.Context) (*clustersvc.Stream[clustersvc.ClusterCacheWatchFrame], error) {
+	return nil, e.err
+}
+
+func (e errCaches) WatchHealth(context.Context) (*clustersvc.Stream[clustersvc.ClusterCacheHealth], error) {
+	return nil, e.err
+}
+
+func (e errCaches) WatchStats(context.Context, clustersvc.ClusterID, clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCacheStats], error) {
+	return nil, e.err
+}
+
+func (e errCaches) WatchSyncStatus(context.Context, clustersvc.ClusterID, clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCacheSyncStatus], error) {
+	return nil, e.err
+}
+
+func (e errCachedKinds) Get(context.Context, clustersvc.ClusterCachedKindID) (*clustersvc.ClusterCachedKind, error) {
+	return nil, e.err
+}
+
+func (e errCachedKinds) List(context.Context) ([]*clustersvc.ClusterCachedKind, error) {
+	return nil, e.err
+}
+
+func (e errCachedKinds) ListByCache(context.Context, clustersvc.ClusterCacheID) ([]*clustersvc.ClusterCachedKind, error) {
+	return nil, e.err
+}
+
+func (e errCachedKinds) SetSyncEnabled(context.Context, clustersvc.ClusterCachedKindID, bool) (*clustersvc.ClusterCachedKind, error) {
+	return nil, e.err
+}
+
+func (e errCachedKinds) WatchByCache(context.Context, clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedKindWatchFrame], error) {
+	return nil, e.err
+}
+
+func (e errCachedData) ListKinds(context.Context, clustersvc.ClusterID, clustersvc.ClusterCacheID) ([]clustersvc.ClusterCachedDataKind, error) {
+	return nil, e.err
+}
+
+func (e errCachedData) WatchKinds(context.Context, clustersvc.ClusterID, clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedDataKindWatchFrame], error) {
+	return nil, e.err
+}
+
+func (e errCachedData) WatchEvents(context.Context, clustersvc.ClusterID, clustersvc.ClusterCacheID) (*clustersvc.Stream[clustersvc.ClusterCachedDataEventWatchFrame], error) {
+	return nil, e.err
+}
+
+func (e errCachedData) WatchObjects(context.Context, clustersvc.ClusterID, clustersvc.ClusterCacheID, string, string) (*clustersvc.Stream[clustersvc.ClusterCachedDataObjectWatchFrame], error) {
+	return nil, e.err
+}
+
+// errAuth fails Current and Logout; the login flow's own failure arm is covered
+// by fakeAuth.loginErr.
+type errAuth struct {
+	auth.Service
+	err error
+}
+
+func (e errAuth) Current(context.Context) (auth.State, error) { return auth.State{}, e.err }
+func (e errAuth) Logout(context.Context) error                { return e.err }

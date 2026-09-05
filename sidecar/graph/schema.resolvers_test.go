@@ -1326,3 +1326,137 @@ func TestChatStreamIsNotOnTheSchema(t *testing.T) {
 
 	assert.Contains(t, raw, "Cannot query field \\\"chatStream\\\"")
 }
+
+// --- Error arms ---
+
+// Every resolver that can fail hands the service's error straight back, and none
+// of them swallows one into a zero value. Driven through the resolver interfaces
+// rather than the wire: the arm under test is the same one either way, and one
+// table keeps a newly added resolver visibly absent.
+func TestResolverErrorsReachTheCaller(t *testing.T) {
+	wantErr := errors.New("service unavailable")
+	r := &graph.Resolver{
+		ClusterSvc: errClusterService{err: wantErr},
+		Auth:       errAuth{err: wantErr},
+	}
+	ctx := context.Background()
+	cluster := &clustersvc.Cluster{RecordMeta: clustersvc.RecordMeta{ID: 1}}
+	cache := &clustersvc.ClusterCache{
+		RecordMeta: clustersvc.RecordMeta{ID: 101},
+		Owner:      clustersvc.ObjectRef{ID: 1, Kind: "Cluster"},
+	}
+	kind := &clustersvc.ClusterCachedKind{RecordMeta: clustersvc.RecordMeta{ID: 301}}
+	id := clustersvc.ObjectID(1)
+
+	// Each case calls one resolver and reports only its error; the values are
+	// asserted by the tests above, on a service that works.
+	calls := map[string]func() error{
+		"Cluster.caches":                     func() error { _, err := r.Cluster().Caches(ctx, cluster); return err },
+		"Cluster.events":                     func() error { _, err := r.Cluster().Events(ctx, cluster, nil, nil); return err },
+		"ClusterCache.kinds":                 func() error { _, err := r.ClusterCache().Kinds(ctx, cache); return err },
+		"ClusterCache.cachedKinds":           func() error { _, err := r.ClusterCache().CachedKinds(ctx, cache); return err },
+		"ClusterCache.events":                func() error { _, err := r.ClusterCache().Events(ctx, cache, nil, nil); return err },
+		"ClusterCachedKind.events":           func() error { _, err := r.ClusterCachedKind().Events(ctx, kind, nil, nil); return err },
+		"Query.cluster":                      func() error { _, err := r.Query().Cluster(ctx, id); return err },
+		"Query.clusters":                     func() error { _, err := r.Query().Clusters(ctx); return err },
+		"Query.clusterCache":                 func() error { _, err := r.Query().ClusterCache(ctx, id); return err },
+		"Query.clusterCaches":                func() error { _, err := r.Query().ClusterCaches(ctx, nil); return err },
+		"Query.clusterCaches(scoped)":        func() error { _, err := r.Query().ClusterCaches(ctx, &id); return err },
+		"Query.clusterCachedKind":            func() error { _, err := r.Query().ClusterCachedKind(ctx, id); return err },
+		"Query.clusterCachedKinds":           func() error { _, err := r.Query().ClusterCachedKinds(ctx, nil); return err },
+		"Query.clusterCachedKinds(scoped)":   func() error { _, err := r.Query().ClusterCachedKinds(ctx, &id); return err },
+		"Query.authState":                    func() error { _, err := r.Query().AuthState(ctx); return err },
+		"Mutation.clusterEnabledSet":         func() error { _, err := r.Mutation().ClusterEnabledSet(ctx, id, true); return err },
+		"Mutation.clusterSyncEnabledSet":     func() error { _, err := r.Mutation().ClusterSyncEnabledSet(ctx, id, true); return err },
+		"Mutation.clusterConnectionRetry":    func() error { _, err := r.Mutation().ClusterConnectionRetry(ctx, id); return err },
+		"Mutation.clusterDelete":             func() error { _, err := r.Mutation().ClusterDelete(ctx, id); return err },
+		"Mutation.clusterCacheClear":         func() error { _, err := r.Mutation().ClusterCacheClear(ctx, id); return err },
+		"Mutation.clusterCachedKindSyncSet":  func() error { _, err := r.Mutation().ClusterCachedKindSyncEnabledSet(ctx, id, true); return err },
+		"Mutation.authLogout":                func() error { _, err := r.Mutation().AuthLogout(ctx); return err },
+		"Subscription.eventsWatch":           func() error { _, err := r.Subscription().EventsWatch(ctx, id, nil); return err },
+		"Subscription.clustersWatch":         func() error { _, err := r.Subscription().ClustersWatch(ctx); return err },
+		"Subscription.clusterScheduleWatch":  func() error { _, err := r.Subscription().ClusterScheduleWatch(ctx, id); return err },
+		"Subscription.clusterCachesWatch":    func() error { _, err := r.Subscription().ClusterCachesWatch(ctx); return err },
+		"Subscription.cacheHealthWatch":      func() error { _, err := r.Subscription().ClusterCacheHealthWatch(ctx); return err },
+		"Subscription.cachedKindsWatch":      func() error { _, err := r.Subscription().ClusterCachedKindsWatch(ctx, id); return err },
+		"Subscription.cacheStatsWatch":       func() error { _, err := r.Subscription().ClusterCacheStatsWatch(ctx, id, id); return err },
+		"Subscription.cacheSyncStatusWatch":  func() error { _, err := r.Subscription().ClusterCacheSyncStatusWatch(ctx, id, id); return err },
+		"Subscription.cachedDataKindsWatch":  func() error { _, err := r.Subscription().ClusterCachedDataKindsWatch(ctx, id, id); return err },
+		"Subscription.cachedDataEventsWatch": func() error { _, err := r.Subscription().ClusterCachedDataEventsWatch(ctx, id, id); return err },
+		"Subscription.cachedDataObjectsWatch": func() error {
+			_, err := r.Subscription().ClusterCachedDataObjectsWatch(ctx, id, id, "apps/v1", "deployments")
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, wantErr) {
+				t.Errorf("err = %v, want %v", err, wantErr)
+			}
+		})
+	}
+}
+
+// authLoginStart's setup failure is the mutation's own arm, and the only one
+// fakeAuth models separately from the login flow it kicks off.
+func TestAuthLoginStartSurfacesSetupErrorToTheResolver(t *testing.T) {
+	wantErr := errors.New("loopback bind failed")
+	fake := newFakeAuth(auth.Identity{})
+	fake.loginErr = wantErr
+	r := &graph.Resolver{Auth: fake}
+
+	ok, err := r.Mutation().AuthLoginStart(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if ok {
+		t.Error("authLoginStart = true on a setup failure, want false")
+	}
+}
+
+// ClusterPrincipal.permissions is the one field with no implementation behind
+// it: selecting it errors rather than resolving to an empty grant, so a
+// consumer can't read "no permissions" out of "not built yet".
+func TestClusterPrincipalPermissionsIsNotImplemented(t *testing.T) {
+	r := &graph.Resolver{}
+	perms, err := r.ClusterPrincipal().Permissions(context.Background(), &clustersvc.ClusterPrincipal{}, "default")
+	if err == nil {
+		t.Fatalf("permissions resolved to %+v, want an error", perms)
+	}
+}
+
+// The three watches with no wire test of their own open against a working
+// service and carry their first value: eventsWatch's snapshot boundary, the
+// schedule gauge's current value, and one cache's health verdict. Each also
+// exercises the stream adapter behind it — watchStream for the frame types,
+// ptrStream for the bare gauge.
+func TestGaugeAndTimelineSubscriptionsCarryTheirFirstValue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &graph.Resolver{ClusterSvc: newFakeClusterService(clusterFixtures())}
+
+	events, err := r.Subscription().EventsWatch(ctx, 1, nil)
+	if err != nil {
+		t.Fatalf("eventsWatch: %v", err)
+	}
+	// The fixture logs no events, so the Bookmark alone closes the snapshot.
+	if frame := testutil.Recv(t, events, "eventsWatch frame"); frame.Type != clustersvc.EventFrameBookmark {
+		t.Errorf("first frame = %v, want Bookmark", frame.Type)
+	}
+
+	schedule, err := r.Subscription().ClusterScheduleWatch(ctx, 1)
+	if err != nil {
+		t.Fatalf("clusterScheduleWatch: %v", err)
+	}
+	if s := testutil.Recv(t, schedule, "schedule gauge"); !s.Probing {
+		t.Errorf("schedule = %+v, want the probing value the fake publishes", s)
+	}
+
+	health, err := r.Subscription().ClusterCacheHealthWatch(ctx)
+	if err != nil {
+		t.Fatalf("clusterCacheHealthWatch: %v", err)
+	}
+	if v := testutil.Recv(t, health, "cache health verdict"); v.CacheID == 0 {
+		t.Errorf("verdict = %+v, want one keyed to a cache", v)
+	}
+}

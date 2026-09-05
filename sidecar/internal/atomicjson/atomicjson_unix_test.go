@@ -36,3 +36,17 @@ func TestSaveIsOwnerOnly(t *testing.T) {
 		t.Fatalf("dir perm = %o, want 700", perm)
 	}
 }
+
+// The temp file lands beside the target, so a directory the process cannot
+// write to fails the Save rather than falling back somewhere writable.
+func TestSaveFailsWhenTheDirectoryIsNotWritable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if err := atomicjson.Save(filepath.Join(dir, "doc.json"), doc{A: "x"}); err == nil {
+		t.Fatal("Save into a read-only directory returned no error")
+	}
+}

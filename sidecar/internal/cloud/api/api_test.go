@@ -362,3 +362,104 @@ func TestParseSSEBoundsAggregateFrame(t *testing.T) {
 		t.Fatalf("expected frame size error, got %v", err)
 	}
 }
+
+// A GraphQL error in an otherwise-2xx response is a failed call: nothing is
+// decoded into the caller's value.
+func TestDoSurfacesGraphQLErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"errors":[{"message":"nope"}]}`)
+	}))
+	defer ts.Close()
+
+	_, err := New(ts.URL, srcFn(fakeSource{tok: "tok"})).GetSettings(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("want the GraphQL message, got %v", err)
+	}
+}
+
+// A body that isn't a GraphQL envelope, and an envelope whose data doesn't fit
+// the caller's shape, are both decode failures — the raw bytes ride along so a
+// misrouted response (a proxy's HTML error page) is identifiable.
+func TestDoSurfacesDecodeFailures(t *testing.T) {
+	for name, body := range map[string]string{
+		"envelope": `<html>not json</html>`,
+		"data":     `{"data":{"settings":"not-an-object"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, body)
+			}))
+			defer ts.Close()
+
+			_, err := New(ts.URL, srcFn(fakeSource{tok: "tok"})).GetSettings(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "decode "+name) {
+				t.Fatalf("want a decode %s error, got %v", name, err)
+			}
+		})
+	}
+}
+
+// A cloud that cannot be reached fails the call rather than returning empty
+// Settings, which the engine would otherwise persist over the user's prefs.
+func TestUpdateSettingsFailsWhenTheCloudIsUnreachable(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	ts.Close() // nothing is listening
+
+	got, err := New(ts.URL, srcFn(fakeSource{tok: "tok"})).UpdateSettings(context.Background(), Settings{})
+	if err == nil {
+		t.Fatalf("UpdateSettings against a closed server returned %+v", got)
+	}
+	if got != (Settings{}) {
+		t.Errorf("Settings = %+v on failure, want the zero value", got)
+	}
+}
+
+// A base URL that yields an unusable endpoint fails when the request is built,
+// before any connection is attempted — both call shapes go through newRequest.
+func TestRequestsFailOnAnUnusableEndpoint(t *testing.T) {
+	c := New("://bad", srcFn(fakeSource{tok: "tok"}))
+	if _, err := c.GetSettings(context.Background()); err == nil {
+		t.Error("GetSettings on an unusable endpoint returned no error")
+	}
+	if _, _, err := c.WatchSettings(context.Background()); err == nil {
+		t.Error("WatchSettings on an unusable endpoint returned no error")
+	}
+}
+
+// A watch cannot open without a bearer; the failure is synchronous, so the
+// engine backs off rather than waiting on a stream that never arrives.
+func TestWatchSettingsFailsWithoutAToken(t *testing.T) {
+	ts := sseServer(make(chan string))
+	defer ts.Close()
+
+	c := New(ts.URL, srcFn(fakeSource{err: fmt.Errorf("no refresh token")}))
+	if _, _, err := c.WatchSettings(context.Background()); err == nil {
+		t.Error("WatchSettings without a token returned no error")
+	}
+}
+
+// Frames the stream can't use are skipped, not fatal: a cloud that adds a field
+// or emits a keep-alive must not tear a working watch down. Only the frame that
+// carries the watched field publishes.
+func TestParseSSESkipsUnusableFrames(t *testing.T) {
+	// One frame per blank-line-terminated block, plus a bare line carrying no
+	// field at all.
+	input := "noise\n\n" +
+		"event: next\ndata: {not json}\n\n" +
+		`event: next` + "\n" + `data: {"data":[1,2]}` + "\n\n" +
+		`event: next` + "\n" + `data: {"data":{"other":{"theme":"light"}}}` + "\n\n" +
+		`event: next` + "\n" + `data: {"data":{"settingsWatch":{"theme":"dark"}}}` + "\n\n"
+
+	out := make(chan Settings, 4)
+	if err := parseSSE(context.Background(), strings.NewReader(input), "settingsWatch", out); err != nil {
+		t.Fatalf("parseSSE: %v", err)
+	}
+	close(out)
+	var got []Settings
+	for s := range out {
+		got = append(got, s)
+	}
+	if len(got) != 1 || got[0].Theme == nil || *got[0].Theme != "dark" {
+		t.Fatalf("published %+v, want only the settingsWatch frame", got)
+	}
+}
