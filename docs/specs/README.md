@@ -31,18 +31,7 @@ A security spec also has a line in [`TODO.md`](../TODO.md#security) and a row in
 Each spec is self-contained: read one and you can build it. Each header states what it needs and
 what it hands on.
 
-The numbered specs are the open security findings from the
-[4 September review](../security/2026-09-04-security-review.md), ordered cheapest first. Only the
-release chain has real dependencies: 7 makes a release verifiable, which 8 and 9 both rest on. 9
-also needs the manifest 3 builds, and is the one spec whose first deliverable is an ADR rather than
-code.
-
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [3 — The app says when it is out of date](3-update-notification.md) | sidecar, src-tauri | Planned |
-| [6 — Resource budgets](6-resource-budgets.md) | sidecar, src-tauri | Planned |
-| [7 — Release assurance](7-release-assurance.md) | ci | Planned |
-| [8 — The macOS bundle asks for the entitlements it needs](8-macos-entitlements.md) | src-tauri, ci | Planned |
-| [9 — Signed in-app updates](9-signed-in-app-updates.md) | src-tauri, sidecar, ci | Planned — design first |
 | [Connection throughput](connection-throughput.md) | sidecar | Planned |
 | [A burst of object frames reads its bodies in one statement](batched-body-reads.md) | sidecar | Planned |

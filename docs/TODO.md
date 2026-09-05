@@ -150,8 +150,6 @@ A risk we decide to accept is recorded as a **By decision** row in
 [`security-model.md`](security-model.md), each linking the ADR that accepted it — so an accepted
 risk stays distinguishable from an unnoticed one, and is not repeated here.
 
-**Without a spec yet:**
-
 - **S-2 — kubeconfig trust and exec consent (high; cluster-service owner).** Newly imported enabled
   contexts are probed automatically, including exec plugins; importing a file is a code-execution
   trust decision. Gate the first probe/plugin run behind explicit approval of the resolved command,
@@ -177,25 +175,78 @@ risk stays distinguishable from an unnoticed one, and is not repeated here.
   *"A retention policy…"* row in [`security-model.md`](security-model.md) to **Enforced**, naming
   the test, and fold the policy into `sidecar/CLAUDE.md`.
 
-**Specced.** Each links a spec in [`docs/specs/`](specs/) self-contained enough to build straight
-through; the numbers are the build order.
+- **R-05 / S-9 — nothing bounds what one request can cost (medium; sidecar/desktop owners).** The
+  bounds we have all measure the same thing: bytes and time on a single HTTP request. Four things
+  have no bound at all. **Query shape** — gqlgen runs with no complexity or depth limit, so a deeply
+  nested query costs whatever it costs. **Concurrency** — any number of operations and subscriptions
+  can be open at once; the host's registry is an uncapped `HashMap` and the sidecar counts nothing.
+  **Kind fan-out** — a cache arms one worker per discovered kind, and a cluster can have hundreds.
+  **Total disk** — the 2 GiB ceiling is per cache, so ten clusters is 20 GiB with nothing measuring
+  the sum. The four are independent and each is worth its own commit. **Two questions to settle
+  before writing any of it.** A fixed complexity limit only bounds a query's *shape*, because no
+  field declares a cost — if fan-out is the real worry, the work is writing per-field cost functions
+  and this stops being the cheap step. And a total disk budget needs a way back down: stopping a
+  cache does not shrink it ([a stopped cache is held by its
+  record](adr/2026-09-03-a-stopped-cache-is-held-by-its-record.md)), so a sweep that stops the
+  largest each time ends with every cache stopped. Either it stops one and asks the user to clear
+  it — a notice with a brake, and it should say so — or it evicts, which contradicts a standing ADR
+  and needs a new one first.
 
-- **R-05 / S-9 — resource budgets (medium; sidecar/desktop owners).** →
-  [spec 6](specs/6-resource-budgets.md)
+- **R-08 — a release cannot be verified, and the pipeline making it is loose (medium; release
+  owner).** Four gaps, all in `.github/`. Third-party actions float on tags, and
+  `dtolnay/rust-toolchain@master` floats on a *branch* in the job that builds what we ship — pin each
+  to a SHA with the version in a trailing comment, and add `.github/dependabot.yml` so the pins still
+  move. `release.yml` grants `contents: write` and `deployments: write` at the top, so every job runs
+  with the token that can publish; drop to `permissions: {}` and give only the final job what it
+  needs (nothing creates a deployment, so that grant just goes). Audits run only on pull requests, so
+  an advisory filed against a quiet `main` waits for whoever opens the next one — add a daily
+  schedule. And the release job is gated on nothing: add a step that checks the required checks
+  passed **for the commit the tag points at**, not `github.sha`, which on a manual run is whatever
+  ref it was dispatched from. Finally, write a short page on verifying a download — the GPG key,
+  `shasum -c`, `codesign`/`spctl`, `signtool`, and plainly that Linux bundles are unsigned — and run
+  it ourselves once before telling anyone else to.
 
-- **R-08 — release assurance (medium; release owner).** →
-  [spec 7](specs/7-release-assurance.md)
+- **H-3 — three macOS entitlements ship unjustified (medium; desktop owner).**
+  `src-tauri/entitlements.plist` grants `allow-jit`, `allow-unsigned-executable-memory` and
+  `disable-library-validation` beside the uncontroversial network client, and the file's own comments
+  admit nobody has checked whether they are needed. **This is an experiment, not a change.** Build
+  with network access only, then walk the app: launch and paint every window on both CPU
+  architectures, sync a cluster, scroll a table, sign in through the system browser, watch the
+  sidecar spawn and exit cleanly, open a second window, reload. Add a grant back only when a crash
+  report names the reason. **It must be a signed, notarized build** — ad-hoc local signing does not
+  enforce the hardened runtime, so a local pass proves nothing, which is why this waits on R-08.
+  Record what happened, including a clean pass, in a dated note under `docs/security/`, and give
+  every surviving key one line saying what broke without it and on which macOS version. **Clear this
+  blocker first:** every `release.yml` job checks out `refs/tags/desktop/v<version>`, so each variant
+  means pushing a real tag until an optional `ref` input exists.
 
-- **H-3 — macOS entitlements (medium; desktop owner).** →
-  [spec 8](specs/8-macos-entitlements.md)
+- **H-4a — the app never says it is out of date (medium; release owner).** There is no updater and no
+  notice, so someone who installs once stays on that version until they happen to visit the releases
+  page — including past a security fix. Saying so needs no signing key and no release work, so it
+  waits for nothing. Shape: the sidecar fetches the release's static `latest.json` on launch and
+  every 24 hours, jittered, compares versions, and publishes the answer on the GraphQL surface; the
+  webview shows a quiet notice whose link opens the release page in the system browser. The check
+  belongs in the sidecar because the webview has no network access. It sends the version and nothing
+  else — no identity, no machine id, no cluster data — and a failed check is silent, since not
+  knowing about an update is where the user already was. It is **on by default**, said plainly in the
+  settings dialog, with a toggle that persists in `host.json`: a notice nobody switches on is not a
+  notice. Version comparison is a pure function and earns its own table-driven test, because an
+  off-by-one here is a nag loop.
 
-- **H-4a — the app never says it is out of date (medium; release owner).** →
-  [spec 3](specs/3-update-notification.md). Split from H-4: it needs no signing key and no release
-  work, so it does not wait behind them.
-
-- **H-4b — no in-app updater (medium; release owner).** →
-  [spec 9](specs/9-signed-in-app-updates.md), whose first deliverable is an ADR settling the trust
-  root.
+- **H-4b — no in-app updater (medium; release owner).** The convenience half of H-4, and the half
+  that hands an attacker the install path if it is done wrong. `tauri-plugin-updater` is the
+  mechanism and most of the wiring is already obvious: a keypair from `pnpm tauri signer generate`
+  with the private half in the `production` environment's secrets and the public half in
+  `tauri.conf.json`, `bundle.createUpdaterArtifacts` so each bundle emits a `.sig`, and the manifest
+  H-4a already fetches. The host checks and installs; the webview is granted nothing. **What is not
+  decided is the trust root, and it comes first, as an ADR:** where the private key lives and who can
+  use it; what rotation means when the public key is compiled into apps already installed; whether
+  Linux applies updates at all (the updater's signature is independent of distro signing, so this is
+  a choice about touching packages the system believes it owns, not a limitation); and what the
+  plugin actually guarantees when an install is interrupted — read, not assumed. None of it is
+  unit-testable. The check is manual and done once: install an older build, publish a signed newer
+  one to a test release, confirm it updates, then publish one signed with a different key and confirm
+  it is refused.
 
 - **Verification debt (security/release owners).** What the 4 September review could not run, it
   recorded as owed; most of it was already running in CI, which the review did not check.
