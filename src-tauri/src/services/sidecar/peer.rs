@@ -36,6 +36,8 @@ pub fn peer_pid(stream: &Stream) -> Result<u32> {
             "peer credentials carry no process id",
         ))
     })?;
+    // `pid()` is `i32` on Linux and already `u32` on Windows.
+    #[allow(clippy::unnecessary_cast)]
     Ok(pid as u32)
 }
 
