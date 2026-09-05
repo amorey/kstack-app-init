@@ -23,8 +23,9 @@
 //     worker runs is still waiting when one arrives; a bus drops a send nobody is receiving.
 //   - A key waits once, however many times it is added, so a burst of adds asks for one pass.
 //
-// A key added while a worker holds it is queued afresh when that worker reports Done, so work
-// arriving mid-pass is never folded into a pass that could not have seen it.
+// Add queues a held key afresh when the worker reports Done, so work arriving mid-pass is
+// never folded into a pass that could not have seen it. AddIfAbsent leaves queued and held
+// keys alone; callers deriving work from state must recheck that state after Done.
 package workqueue
 
 import (
@@ -87,6 +88,21 @@ func (q *Queue[K]) Add(k K) {
 	case held:
 		q.state[k] = heldDirty
 	default: // idle
+		q.enqueueLocked(k)
+	}
+}
+
+// AddIfAbsent asks for k only if it is neither queued nor held. Unlike Add, it does not
+// request a redelivery of held work. A caller deriving work from state must check that state
+// again after Done, since this call can be ignored while the previous work is finishing.
+func (q *Queue[K]) AddIfAbsent(k K) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.closed {
+		return
+	}
+	if _, exists := q.state[k]; !exists {
 		q.enqueueLocked(k)
 	}
 }

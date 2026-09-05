@@ -1923,6 +1923,54 @@ func TestADependencyThatFailsUnderARunningWorkerLeavesItAlone(t *testing.T) {
 	assert.True(t, att(t, e, "sync").Ready())
 }
 
+func TestARetryDueBeforeTheQueueKeyIsReleasedIsRescheduled(t *testing.T) {
+	now := time.Now()
+	e := New(withNow(func() time.Time { return now }))
+	t.Cleanup(func() { assert.NoError(t, e.Close()) })
+	p := &steered{res: Fail("Unreachable", assert.AnError)}
+	RegisterJob(e, "conn", p, WithBackoff(time.Second, 2, time.Minute), WithInterval(time.Hour))
+	e.Add(subj)
+	e.settle()
+	k, ok := e.runQ.Next(within(t))
+	require.True(t, ok)
+
+	e.runQueued(t.Context(), k, func() {
+		// A job releases its start slot after commit, while runQueued still holds its
+		// key. Run the pending pass here with the retry already due.
+		a := att(t, e, "conn")
+		require.Equal(t, VerdictFailed, a.LastAttempt.Verdict)
+		require.False(t, a.InFlight())
+		now = a.LastAttempt.FinishedAt.Add(time.Minute)
+		e.settle()
+		require.Nil(t, e.subjects[subj].timer, "an already due retry has no timer to wake it")
+	})
+
+	// Only runQueued's post-Done pass can recover the scheduling request dropped
+	// while the key was held. No external Wake or direct pass is supplied here.
+	e.settle()
+	p.set(Succeeded())
+	runNext(t, e)
+	assert.Equal(t, 2, p.count())
+	assert.Equal(t, VerdictSucceeded, att(t, e, "conn").LastAttempt.Verdict)
+}
+
+func TestAPassBeforeADispatchedJobStartsDoesNotQueueAnotherRun(t *testing.T) {
+	e, p, _ := single(t, Succeeded(), WithInterval(time.Hour))
+	e.Add(subj)
+	e.settle()
+	k, ok := e.runQ.Next(within(t))
+	require.True(t, ok)
+
+	// The dispatcher holds the key, but runOne has not marked it in flight yet.
+	e.pass(subj)
+	e.runOne(t.Context(), k, func() {})
+	e.runQ.Done(k)
+	e.settle()
+
+	assert.Equal(t, 1, p.count())
+	noRuns(t, e, "a scheduling pass queued a duplicate run before the first began")
+}
+
 // A job depending on a worker reads the worker's health rather than its last exit: Ready is OK,
 // and Ready asks for a pass so the dependent is scheduled the moment the worker comes up.
 func TestAJobDependingOnAWorkerRunsOnceItIsReady(t *testing.T) {

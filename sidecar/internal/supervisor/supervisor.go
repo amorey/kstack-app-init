@@ -282,10 +282,11 @@ type Supervisor struct {
 	onPass   func(subjectName string, snap Snapshot)
 
 	// runQ carries the runs that are due, one key per registration per subject, so one
-	// registration never runs twice at once and an ask arriving mid-run is redelivered on Done
-	// rather than folded into a run that could not have seen it. passQ carries the subjects
-	// whose schedule has to be re-derived; everything that changes a subject ends with an add
-	// there.
+	// registration never runs twice at once. Explicit Wake, Restart, and watcher requests
+	// arriving mid-run are redelivered on Done. Scheduling passes use AddIfAbsent instead;
+	// the dispatcher must request another pass after Done to re-derive any due work ignored
+	// while the key was held. passQ carries the subjects whose schedule has to be re-derived;
+	// everything that changes a subject ends with an add there.
 	runQ  *workqueue.Queue[key]
 	passQ *workqueue.Queue[string]
 	// clockMu guards lastTick alone, so tick never waits on the supervisor's own lock.
@@ -881,17 +882,26 @@ func (e *Supervisor) dispatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			// A dispatcher parked on a full semaphore is not parked on Next, so without this
 			// arm it would not see the stop until a run happened to finish.
+			// Shutdown needs no scheduling recheck: this dispatcher is stopping.
 			e.runQ.Done(k)
 			return
 		}
 		e.wg.Go(func() {
-			// **The key is held for the whole run**, for both kinds. That is what makes a
-			// wake mid-run a dirty mark and a redelivery rather than a second Run beside the
-			// live one, and it is why no separate restart path is needed.
-			defer e.runQ.Done(k)
-			e.runOne(ctx, k, sync.OnceFunc(func() { <-e.slots }))
+			e.runQueued(ctx, k, sync.OnceFunc(func() { <-e.slots }))
 		})
 	}
+}
+
+// runQueued holds the queue key for the whole run, for both kinds. A wake mid-run becomes
+// a dirty mark and a redelivery rather than a second Run beside the live one.
+func (e *Supervisor) runQueued(ctx context.Context, k key, release func()) {
+	defer func() {
+		e.runQ.Done(k)
+		// A pass may have found this run due again while its key was still held.
+		// Recheck after releasing it so that scheduled retries are not lost.
+		e.passQ.Add(k.subject)
+	}()
+	e.runOne(ctx, k, release)
 }
 
 // pass re-derives one subject's schedule and publishes: due runs go on runQ, the soonest future
@@ -928,7 +938,9 @@ func (e *Supervisor) pass(subjectName string) {
 				soonest = at
 			}
 		default:
-			e.runQ.Add(key{subject: subjectName, registration: registrationID(id)})
+			// A dispatcher may hold the key before runOne marks it in flight. This
+			// schedule still describes that run, so it must not request a redelivery.
+			e.runQ.AddIfAbsent(key{subject: subjectName, registration: registrationID(id)})
 		}
 	}
 

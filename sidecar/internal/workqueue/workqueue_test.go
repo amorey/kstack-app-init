@@ -67,6 +67,27 @@ func TestWorkAddedBeforeAnyWorkerExistsIsStillDelivered(t *testing.T) {
 	assert.Equal(t, "prod", mustNext(t, t.Context(), q))
 }
 
+func TestAddIfAbsentDoesNotRequestRedelivery(t *testing.T) {
+	q := New[string]()
+	q.AddIfAbsent("prod")
+	q.AddIfAbsent("prod")
+	require.Equal(t, "prod", mustNext(t, t.Context(), q))
+	q.AddIfAbsent("prod")
+	q.Done("prod")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, ok := q.Next(ctx)
+	require.False(t, ok, "a scheduled key was delivered twice")
+
+	q.AddIfAbsent("prod")
+	require.Equal(t, "prod", mustNext(t, t.Context(), q))
+	q.Add("prod")
+	q.AddIfAbsent("prod")
+	q.Done("prod")
+	require.Equal(t, "prod", mustNext(t, t.Context(), q), "an explicit add must still redeliver")
+}
+
 func TestNextWaitsForWork(t *testing.T) {
 	q := New[string]()
 
