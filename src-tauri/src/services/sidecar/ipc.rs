@@ -17,9 +17,10 @@
 //!      `\\.\pipe\` name (Windows), picked *before* spawn and passed via
 //!      `--socket`, so the sidecar never negotiates where to listen. Pure,
 //!      I/O-free value.
-//!   2. **Dialing.** [`connect`] / [`connect_with_budget`] — capped-backoff
-//!      retry, returning a [`Stream`] hyper consumes identically on both
-//!      platforms.
+//!   2. **Dialing.** [`Target::connect`] / [`Target::connect_with_budget`] —
+//!      capped-backoff retry, returning a [`Stream`] hyper consumes identically
+//!      on both platforms, and only after the peer answering it proves to be
+//!      the sidecar we spawned.
 //!
 //! "ipc", not "socket" — the latter would exclude Windows named pipes.
 
@@ -31,8 +32,10 @@ use std::time::Duration;
 
 // tokio's clock (virtual under tokio::time::pause) so the budget/backoff is
 // testable without real sleeps.
+use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::peer::peer_pid;
 use crate::error::{AppError, Result};
 
 /// Apple's `sun_path` cap (Linux allows 108); the tighter bound so a path that
@@ -110,62 +113,156 @@ impl Endpoint {
     }
 }
 
-/// Dials `endpoint` with the default budget. The sidecar takes a few ms to bind
-/// after spawn, so expect at least one retry (see [`connect_with_budget`]).
-pub async fn connect(endpoint: &Endpoint) -> Result<Stream> {
-    connect_with_budget(endpoint, DEFAULT_CONNECT_BUDGET).await
+/// Where the sidecar listens, and which process has to be answering there. The
+/// two only ever travel together: an address without an expected pid is a dial
+/// nobody checked, which is the hole this whole module closes.
+#[derive(Clone, Debug)]
+pub struct Target {
+    endpoint: Endpoint,
+    /// The running sidecar's pid, published by `SidecarService::spawn` and
+    /// cleared when the child exits. Read live at each dial: the sidecar is
+    /// re-dialed after every gRPC loss and every subscription drop, so a value
+    /// captured once would go stale.
+    pid_rx: watch::Receiver<Option<u32>>,
 }
 
-/// Retries `Stream::connect` with capped exponential backoff until the
-/// endpoint accepts or `budget` is exhausted.
-///
-/// Retryable ("not ready yet"): `NotFound` (sidecar hasn't bound) and
-/// `WouldBlock`/`ERROR_PIPE_BUSY` (all pipe instances busy). Anything else
-/// (e.g. access denied) surfaces immediately — it won't self-correct. On
-/// budget exhaustion the most recent error is returned verbatim so logs show
-/// *why*.
-pub async fn connect_with_budget(endpoint: &Endpoint, budget: Duration) -> Result<Stream> {
-    /// Windows `ERROR_PIPE_BUSY` (see tokio's named-pipe docs).
-    const ERROR_PIPE_BUSY: i32 = 231;
+impl Target {
+    pub fn new(endpoint: Endpoint, pid_rx: watch::Receiver<Option<u32>>) -> Self {
+        Self { endpoint, pid_rx }
+    }
 
-    use interprocess::local_socket::{traits::tokio::Stream as _, GenericFilePath, ToFsName};
+    /// A target expecting a pid that never changes. Tests only — production
+    /// reads the channel `spawn` publishes on.
+    #[cfg(test)]
+    pub(super) fn expecting(endpoint: Endpoint, pid: Option<u32>) -> Self {
+        let (tx, rx) = watch::channel(pid);
+        // A receiver keeps serving the last value after its sender is gone.
+        drop(tx);
+        Self::new(endpoint, rx)
+    }
 
-    // `GenericFilePath` accepts both Unix paths and `\\.\pipe\…` strings —
-    // no cfg-branch.
-    let name = endpoint
-        .as_arg()
-        .to_fs_name::<GenericFilePath>()
-        .map_err(AppError::Io)?;
+    /// The pid the sidecar must be serving under, right now. `None` means no
+    /// sidecar is running: that refuses rather than skipping the check — there
+    /// is nothing legitimate to connect to, and a pid the OS has since handed
+    /// to someone else is precisely what must not pass.
+    fn expected_pid(&self) -> Result<u32> {
+        (*self.pid_rx.borrow()).ok_or_else(|| refused("no sidecar is running"))
+    }
 
-    let deadline = Instant::now() + budget;
-    let mut delay = INITIAL_RETRY_DELAY;
+    /// Dials with the default budget. The sidecar takes a few ms to bind after
+    /// spawn, so expect at least one retry (see [`Target::connect_with_budget`]).
+    pub async fn connect(&self) -> Result<Stream> {
+        self.connect_with_budget(DEFAULT_CONNECT_BUDGET).await
+    }
 
-    let last_err = loop {
-        match Stream::connect(name.clone()).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) => {
-                let retryable = matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock,
-                ) || err.raw_os_error() == Some(ERROR_PIPE_BUSY);
-                if !retryable || Instant::now() >= deadline {
-                    break err;
+    /// Retries `Stream::connect` with capped exponential backoff until the
+    /// endpoint accepts or `budget` is exhausted, then refuses any peer that is
+    /// not the expected process.
+    ///
+    /// Retryable ("not ready yet"): `NotFound` (sidecar hasn't bound) and
+    /// `WouldBlock`/`ERROR_PIPE_BUSY` (all pipe instances busy). Anything else
+    /// (e.g. access denied) surfaces immediately — it won't self-correct. On
+    /// budget exhaustion the most recent error is returned verbatim so logs
+    /// show *why*.
+    ///
+    /// A wrong peer is refused rather than retried: the address is taken, so
+    /// retrying would only spend the budget waiting for a squatter to leave.
+    pub async fn connect_with_budget(&self, budget: Duration) -> Result<Stream> {
+        /// Windows `ERROR_PIPE_BUSY` (see tokio's named-pipe docs).
+        const ERROR_PIPE_BUSY: i32 = 231;
+
+        use interprocess::local_socket::{traits::tokio::Stream as _, GenericFilePath, ToFsName};
+
+        // Checked before dialing: with no sidecar there is nothing to wait for.
+        self.expected_pid()?;
+
+        // `GenericFilePath` accepts both Unix paths and `\\.\pipe\…` strings —
+        // no cfg-branch.
+        let name = self
+            .endpoint
+            .as_arg()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(AppError::Io)?;
+
+        let deadline = Instant::now() + budget;
+        let mut delay = INITIAL_RETRY_DELAY;
+
+        let last_err = loop {
+            match Stream::connect(name.clone()).await {
+                Ok(stream) => return self.verify_peer(stream),
+                Err(err) => {
+                    let retryable = matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock,
+                    ) || err.raw_os_error() == Some(ERROR_PIPE_BUSY);
+                    if !retryable || Instant::now() >= deadline {
+                        break err;
+                    }
+                    // Cap each sleep at the remaining budget so we never overshoot.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let sleep_for = delay.min(remaining);
+                    tokio::time::sleep(sleep_for).await;
+                    delay = (delay * 2).min(MAX_RETRY_DELAY);
                 }
-                // Cap each sleep at the remaining budget so we never overshoot.
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let sleep_for = delay.min(remaining);
-                tokio::time::sleep(sleep_for).await;
-                delay = (delay * 2).min(MAX_RETRY_DELAY);
             }
-        }
-    };
+        };
 
-    Err(AppError::Io(last_err))
+        Err(AppError::Io(last_err))
+    }
+
+    /// Refuses `stream` unless the process serving it is the expected pid,
+    /// re-read now — the sidecar may have exited during the dial.
+    ///
+    /// Fails closed. A peer whose identity we cannot read is not an
+    /// unusual-but-fine case; it is the case an attacker would arrange.
+    fn verify_peer(&self, stream: Stream) -> Result<Stream> {
+        let want = self.expected_pid()?;
+        let got = peer_pid(&stream)?;
+        if got != want {
+            return Err(refused(format!("served by pid {got}, expected {want}")));
+        }
+        Ok(stream)
+    }
+}
+
+fn refused(detail: impl std::fmt::Display) -> AppError {
+    AppError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("refusing ipc peer: {detail}"),
+    ))
+}
+
+/// Binds an [`interprocess`] listener at `path`. Shared with `peer.rs`, whose
+/// tests need the same both-platforms-one-fixture shape (Unix UDS, Windows
+/// named pipe) without cfg branches.
+#[cfg(test)]
+pub(super) fn bind_listener(path: &str) -> interprocess::local_socket::tokio::Listener {
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
+    let name = path.to_fs_name::<GenericFilePath>().expect("to_fs_name");
+    ListenerOptions::new()
+        .name(name)
+        .create_tokio()
+        .expect("bind listener")
+}
+
+/// Removes a UDS socket file post-test. No-op on Windows where named pipes are
+/// kernel objects (not files) that vanish on handle close.
+#[cfg(test)]
+pub(super) fn cleanup_path(path: &str) {
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(path);
+    #[cfg(windows)]
+    let _ = path; // silence unused-arg warning
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Targets `path`, expecting the listener the test process binds itself.
+    fn ours(path: Endpoint) -> Target {
+        Target::expecting(path, Some(std::process::id()))
+    }
 
     /// On Unix, the picked path must live inside the directory we asked for —
     /// the host expects to be able to control runtime-directory placement
@@ -258,37 +355,57 @@ mod tests {
         assert_eq!(path.as_arg(), a);
     }
 
-    /// Binds an [`interprocess`] listener at `path`. Used by the connect
-    /// tests below so a single fixture works on both Unix (UDS) and
-    /// Windows (named pipe) without cfg branches.
-    fn bind_listener(path: &str) -> interprocess::local_socket::tokio::Listener {
-        use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
-        let name = path.to_fs_name::<GenericFilePath>().expect("to_fs_name");
-        ListenerOptions::new()
-            .name(name)
-            .create_tokio()
-            .expect("bind listener")
-    }
-
-    /// Removes a UDS socket file post-test. No-op on Windows where named
-    /// pipes are kernel objects (not files) that vanish on handle close.
-    fn cleanup_path(path: &str) {
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(path);
-        #[cfg(windows)]
-        let _ = path; // silence unused-arg warning
-    }
-
     /// Happy path: if the sidecar is already listening when the host
     /// dials, `connect` returns a usable stream on the first attempt.
     #[tokio::test]
     async fn connect_succeeds_against_a_listening_endpoint() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         let _listener = bind_listener(path.as_arg());
-        connect_with_budget(&path, Duration::from_secs(1))
+        ours(path.clone())
+            .connect_with_budget(Duration::from_secs(1))
             .await
             .expect("connect should succeed");
         cleanup_path(path.as_arg());
+    }
+
+    /// The point of the whole exercise: a listener holding the address the
+    /// host expects, but belonging to some other process, must be refused
+    /// rather than handed back as the sidecar.
+    #[tokio::test]
+    async fn connect_refuses_a_peer_that_is_not_the_expected_process() {
+        let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
+        let _listener = bind_listener(path.as_arg());
+        // Whatever process this is, it is not the one that bound the listener.
+        let impostor = Target::expecting(path.clone(), Some(std::process::id().wrapping_add(1)));
+
+        let err = impostor
+            .connect_with_budget(Duration::from_millis(300))
+            .await
+            .expect_err("a listener that is not the sidecar must be refused");
+
+        assert!(err.to_string().contains("refusing ipc peer"), "got: {err}");
+        cleanup_path(path.as_arg());
+    }
+
+    /// After the sidecar exits there is no pid worth comparing against — the
+    /// kernel may have handed the number to someone else. The dial is refused
+    /// outright, and does not sit out the budget first.
+    #[tokio::test(start_paused = true)]
+    async fn connect_refuses_when_no_sidecar_is_running() {
+        let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
+        let started = Instant::now();
+
+        let err = Target::expecting(path, None)
+            .connect_with_budget(Duration::from_secs(5))
+            .await
+            .expect_err("with no sidecar there is nothing to connect to");
+
+        assert!(err.to_string().contains("refusing ipc peer"), "got: {err}");
+        assert_eq!(
+            Instant::now(),
+            started,
+            "refusal must not wait out the budget"
+        );
     }
 
     /// The sidecar may not be ready the instant `connect` is first polled
@@ -300,7 +417,8 @@ mod tests {
     async fn connect_retries_until_endpoint_appears() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         let path_arg = path.as_arg().to_owned();
-        let dial = connect_with_budget(&path, Duration::from_secs(2));
+        let target = ours(path.clone());
+        let dial = target.connect_with_budget(Duration::from_secs(2));
 
         let bind_later = async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -321,7 +439,8 @@ mod tests {
     async fn connect_gives_up_after_budget() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         let started = std::time::Instant::now();
-        let err = connect_with_budget(&path, Duration::from_millis(300))
+        let err = ours(path.clone())
+            .connect_with_budget(Duration::from_millis(300))
             .await
             .expect_err("no listener: connect should fail");
         let elapsed = started.elapsed();

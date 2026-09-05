@@ -202,9 +202,6 @@ through; the numbers are the build order.
 - **R-02 — native navigation policy (medium; desktop owner).** →
   [spec 2](specs/2-native-navigation-policy.md)
 
-- **R-01 / H-5 — authenticate the sidecar to the host (medium; desktop/IPC owner).** →
-  [spec 5](specs/5-host-authenticates-the-sidecar.md)
-
 - **R-05 / S-9 — resource budgets (medium; sidecar/desktop owners).** →
   [spec 6](specs/6-resource-budgets.md)
 

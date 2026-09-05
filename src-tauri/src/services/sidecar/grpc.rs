@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint as TonicEndpoint, Uri};
 use tower::service_fn;
 
-use super::ipc::{self, Endpoint};
+use super::ipc::Target;
 use crate::error::{AppError, Result};
 
 // Generated bindings for proto/auth.proto (see build.rs); module name matches
@@ -54,15 +54,15 @@ pub type AuthStateStream = tonic::Streaming<AuthState>;
 /// Lazily-dialed, cached gRPC channel; re-dials if lost (sidecar restart).
 /// Reach the RPCs through [`SidecarService`](super::SidecarService).
 pub struct GrpcClient {
-    endpoint: Endpoint,
+    target: Target,
     // Guarded so concurrent callers share one channel.
     channel: Mutex<Option<Channel>>,
 }
 
 impl GrpcClient {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(target: Target) -> Self {
         Self {
-            endpoint,
+            target,
             channel: Mutex::new(None),
         }
     }
@@ -73,7 +73,7 @@ impl GrpcClient {
         if let Some(ch) = guard.as_ref() {
             return Ok(ch.clone());
         }
-        let ch = connect(self.endpoint.clone()).await?;
+        let ch = connect(self.target.clone()).await?;
         *guard = Some(ch.clone());
         Ok(ch)
     }
@@ -139,12 +139,13 @@ impl GrpcClient {
 /// Dials the IPC socket and completes the h2c handshake. The `http://` origin
 /// is a placeholder — tonic needs a valid URI for `:authority`, but the
 /// connector ignores it and dials via [`ipc::connect`].
-async fn connect(endpoint: Endpoint) -> Result<Channel> {
+async fn connect(target: Target) -> Result<Channel> {
     TonicEndpoint::from_static("http://kstack.local")
         .connect_with_connector(service_fn(move |_: Uri| {
-            let endpoint = endpoint.clone();
+            let target = target.clone();
             async move {
-                let stream = ipc::connect(&endpoint)
+                let stream = target
+                    .connect()
                     .await
                     .map_err(|err| std::io::Error::other(err.to_string()))?;
                 Ok::<_, std::io::Error>(TokioIo::new(stream))

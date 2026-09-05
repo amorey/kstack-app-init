@@ -23,7 +23,7 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use thiserror::Error;
 
-use super::super::ipc::{self, Endpoint};
+use super::super::ipc::Target;
 use crate::error::{AppError, Result};
 
 /// Failure phase of one host↔sidecar HTTP call (`Connect` = couldn't dial,
@@ -73,12 +73,12 @@ pub struct GraphqlResponse {
 
 /// Stateless GraphQL forwarder: one owned HTTP/1 connection per call.
 pub struct QueryClient {
-    path: Endpoint,
+    target: Target,
 }
 
 impl QueryClient {
-    pub fn new(path: Endpoint) -> Self {
-        Self { path }
+    pub fn new(target: Target) -> Self {
+        Self { target }
     }
 
     /// Forwards a query/mutation to `/graphql`. Transport errors →
@@ -108,7 +108,7 @@ impl QueryClient {
     ) -> std::result::Result<GraphqlResponse, TransportError> {
         // Hyper's connection-driver task ends when `sender` drops (after the
         // body collect).
-        let stream = ipc::connect(&self.path).await.map_err(|e| match e {
+        let stream = self.target.connect().await.map_err(|e| match e {
             AppError::Io(io) => TransportError::Connect(io),
             other => TransportError::Protocol(other.to_string()),
         })?;
@@ -157,12 +157,18 @@ impl QueryClient {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::ipc::Endpoint;
     use super::*;
     use interprocess::local_socket::{
         traits::tokio::Listener as _, GenericFilePath, ListenerOptions, ToFsName,
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Targets `path`, expecting the server the test process runs itself.
+    fn ours(path: Endpoint) -> Target {
+        Target::expecting(path, Some(std::process::id()))
+    }
 
     /// Spawns a tiny HTTP/1 server on `path` that reads one request, sends
     /// `response_body` back with `status_line`, and closes. Returns once
@@ -220,7 +226,7 @@ mod tests {
         let arg = path.as_arg().to_owned();
         spawn_oneshot_server(arg.clone(), r#"{"data":{"ok":true}}"#).await;
 
-        let client = QueryClient::new(path);
+        let client = QueryClient::new(ours(path));
         let resp = client
             .query("{\"query\":\"{ ping }\"}".to_string())
             .await
@@ -230,13 +236,36 @@ mod tests {
         let _ = std::fs::remove_file(arg);
     }
 
+    /// The dial-time peer check has to be wired into *this* client, not just
+    /// present in `ipc`: queries go through the unbudgeted `ipc::connect`, so
+    /// a signature that skipped it here would leave the whole hole open.
+    #[tokio::test]
+    async fn query_refuses_a_server_that_is_not_the_sidecar() {
+        let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
+        let arg = path.as_arg().to_owned();
+        spawn_oneshot_server(arg.clone(), r#"{"data":{"ok":true}}"#).await;
+
+        // The server is this process; the client is told to expect another.
+        let impostor = Target::expecting(path, Some(std::process::id().wrapping_add(1)));
+        let err = QueryClient::new(impostor)
+            .try_query("{}".to_string())
+            .await
+            .expect_err("a server that is not the sidecar must be refused");
+
+        assert!(
+            err.to_string().contains("refusing ipc peer"),
+            "expected a refusal, got {err:?}"
+        );
+        let _ = std::fs::remove_file(arg);
+    }
+
     /// Asserts the failure phase against `try_query` directly (it collapses to
     /// `AppError::Io` at the boundary). Connect is the arm users hit most (sidecar
     /// not running yet), so make sure it's tagged correctly.
     #[tokio::test]
     async fn try_query_categorizes_connect_failure() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
-        let client = QueryClient::new(path);
+        let client = QueryClient::new(ours(path));
         // No listener: the dial exhausts its budget and returns Connect.
         let err = client
             .try_query("{}".to_string())
@@ -294,7 +323,7 @@ mod tests {
             }
         });
 
-        let client = QueryClient::new(path);
+        let client = QueryClient::new(ours(path));
         let err = client
             .query("{}".to_string())
             .await
@@ -319,7 +348,7 @@ mod tests {
         )
         .await;
 
-        let client = QueryClient::new(path);
+        let client = QueryClient::new(ours(path));
         let resp = client
             .query("{}".to_string())
             .await
@@ -337,7 +366,7 @@ mod tests {
     async fn query_returns_transport_error_when_socket_unreachable() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
         // Rely on the default (capped) connect budget and assert the error type.
-        let client = QueryClient::new(path);
+        let client = QueryClient::new(ours(path));
 
         // Timeout so a failure to fail won't hang CI.
         let result = tokio::time::timeout(Duration::from_secs(10), client.query("{}".to_string()))
@@ -364,7 +393,7 @@ mod tests {
         let arg = path.as_arg().to_owned();
 
         spawn_oneshot_server(arg.clone(), r#"{"data":1}"#).await;
-        let client = QueryClient::new(path);
+        let client = QueryClient::new(ours(path));
 
         let first = client.query("{}".to_string()).await.expect("first");
         assert_eq!(first.body, r#"{"data":1}"#);

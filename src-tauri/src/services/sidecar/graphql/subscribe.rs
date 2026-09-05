@@ -55,7 +55,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::sync::oneshot;
 
-use super::super::ipc::{self, Endpoint, DEFAULT_CONNECT_BUDGET};
+use super::super::ipc::{Target, DEFAULT_CONNECT_BUDGET};
 use crate::error::{AppError, Result};
 
 /// Envelope delivery seam. Production wraps a Tauri `Channel<String>`; tests
@@ -95,7 +95,7 @@ fn lock(subs: &Subs) -> std::sync::MutexGuard<'_, HashMap<u64, Sub>> {
 /// Opens one SSE connection per subscription and tracks a cancel handle for
 /// each so [`SubscriptionClient::unsubscribe`] can tear it down.
 pub struct SubscriptionClient {
-    path: Endpoint,
+    target: Target,
     /// Live subscriptions by host-side op id; dropping an entry's sender ends
     /// its task.
     subs: Subs,
@@ -106,15 +106,15 @@ pub struct SubscriptionClient {
 }
 
 impl SubscriptionClient {
-    pub fn new(path: Endpoint) -> Self {
-        Self::new_with_budget(path, DEFAULT_CONNECT_BUDGET)
+    pub fn new(target: Target) -> Self {
+        Self::new_with_budget(target, DEFAULT_CONNECT_BUDGET)
     }
 
     /// [`SubscriptionClient::new`] with a caller-supplied connect budget
     /// (tests pass a short one).
-    fn new_with_budget(path: Endpoint, connect_budget: Duration) -> Self {
+    fn new_with_budget(target: Target, connect_budget: Duration) -> Self {
         Self {
-            path,
+            target,
             subs: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             connect_budget,
@@ -145,11 +145,11 @@ impl SubscriptionClient {
             },
         );
 
-        let path = self.path.clone();
+        let target = self.target.clone();
         let budget = self.connect_budget;
         let subs = Arc::clone(&self.subs);
         tokio::spawn(run_subscription(
-            path, budget, body, sink, cancel_rx, subs, id,
+            target, budget, body, sink, cancel_rx, subs, id,
         ));
         Ok(id)
     }
@@ -171,7 +171,7 @@ impl SubscriptionClient {
 /// Drives one subscription end-to-end. Always removes `id` from `subs` on the
 /// way out, so the table never leaks completed subscriptions.
 async fn run_subscription(
-    path: Endpoint,
+    target: Target,
     budget: Duration,
     body: String,
     sink: Arc<dyn FrameSink>,
@@ -183,7 +183,7 @@ async fn run_subscription(
     let opened = tokio::select! {
         biased;
         _ = &mut cancel_rx => { lock(&subs).remove(&id); return; }
-        r = open_stream(&path, budget, body) => r,
+        r = open_stream(&target, budget, body) => r,
     };
 
     match opened {
@@ -206,11 +206,11 @@ async fn run_subscription(
 /// Dials the sidecar and issues the SSE `POST /graphql`, returning the live
 /// streaming response.
 async fn open_stream(
-    path: &Endpoint,
+    target: &Target,
     budget: Duration,
     body: String,
 ) -> Result<Response<Incoming>> {
-    let stream = ipc::connect_with_budget(path, budget).await?;
+    let stream = target.connect_with_budget(budget).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -307,12 +307,18 @@ fn error_frame(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::ipc::Endpoint;
     use super::*;
     use interprocess::local_socket::{
         traits::tokio::Listener as _, GenericFilePath, ListenerOptions, ToFsName,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
+
+    /// Targets `path`, expecting the server the test process runs itself.
+    fn ours(path: Endpoint) -> Target {
+        Target::expecting(path, Some(std::process::id()))
+    }
 
     /// Test sink that forwards into an mpsc — the easy way to assert what the
     /// reader actually delivers without spinning up a Tauri runtime.
@@ -410,7 +416,7 @@ mod tests {
         )
         .await;
 
-        let client = SubscriptionClient::new(path);
+        let client = SubscriptionClient::new(ours(path));
         let (sink, mut rx) = sink_pair();
         let _id = client
             .subscribe(
@@ -451,7 +457,7 @@ mod tests {
         )
         .await;
 
-        let client = SubscriptionClient::new(path);
+        let client = SubscriptionClient::new(ours(path));
         let (sink, mut rx) = sink_pair();
         client
             .subscribe(
@@ -486,7 +492,7 @@ mod tests {
         )
         .await;
 
-        let client = SubscriptionClient::new(path);
+        let client = SubscriptionClient::new(ours(path));
         let (sink, mut rx) = sink_pair();
         client
             .subscribe(
@@ -526,7 +532,7 @@ mod tests {
         )
         .await;
 
-        let client = SubscriptionClient::new(path);
+        let client = SubscriptionClient::new(ours(path));
         let (sink, mut rx) = sink_pair();
         let id = client
             .subscribe(
@@ -569,7 +575,7 @@ mod tests {
         // the table is populated before that, so a dead socket exercises the
         // bookkeeping without a server.
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
-        let client = SubscriptionClient::new_with_budget(path, Duration::from_millis(150));
+        let client = SubscriptionClient::new_with_budget(ours(path), Duration::from_millis(150));
 
         let mut ids = Vec::new();
         for webview in ["main", "main", "logs"] {
@@ -601,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn connect_failure_emits_error_frame() {
         let path = Endpoint::pick(&std::env::temp_dir()).expect("pick");
-        let client = SubscriptionClient::new_with_budget(path, Duration::from_millis(150));
+        let client = SubscriptionClient::new_with_budget(ours(path), Duration::from_millis(150));
         let (sink, mut rx) = sink_pair();
         client
             .subscribe(

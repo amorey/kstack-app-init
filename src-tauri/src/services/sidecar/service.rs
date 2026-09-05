@@ -26,7 +26,7 @@ use crate::error::{AppError, Result};
 
 use super::graphql::{FrameSink, GraphqlResponse, QueryClient, SubscriptionClient};
 use super::grpc::{AuthStateStream, GrpcClient};
-use super::ipc::{Endpoint, DEFAULT_CONNECT_BUDGET};
+use super::ipc::{Endpoint, Target, DEFAULT_CONNECT_BUDGET};
 use super::logs::{forward_sidecar_line, Severity};
 
 /// First-token marker the sidecar prints on stdout once its listener is up
@@ -66,7 +66,7 @@ impl SidecarService {
     /// Spawns the `kstack-sidecar` binary; a background task drains its event
     /// stream (log forwarding + termination reporting).
     pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<Self> {
-        let endpoint = Endpoint::pick(&std::env::temp_dir())?;
+        let endpoint = Endpoint::pick(&runtime_dir()?)?;
 
         // Per-machine app data dir for the sidecar's SQLite cache and cloud
         // settings/queue. Human-readable leaf on `local_data_dir`, not Tauri's
@@ -96,6 +96,11 @@ impl SidecarService {
             exited: false,
         }));
 
+        // What the dialers check every peer against. `State.pid` cannot serve:
+        // it outlives the child so `kill` can still reach it, and the kernel
+        // may have reassigned the number by then.
+        let (expect_tx, expect_rx) = watch::channel(Some(pid));
+
         // Capacity 1 so the drain task never blocks delivering the exit.
         let (exit_tx, exit_rx) = sync_channel::<()>(1);
 
@@ -117,6 +122,9 @@ impl SidecarService {
                     CommandEvent::Terminated(payload) => {
                         tracing::info!(?payload, "sidecar exited");
 
+                        // No sidecar, so no peer is legitimate any more.
+                        let _ = expect_tx.send(None);
+
                         // `kill` must skip the pid fallback after this (pid may
                         // be reused).
                         drain_state
@@ -132,9 +140,10 @@ impl SidecarService {
             }
         });
 
-        let query_client = QueryClient::new(endpoint.clone());
-        let subscription_client = SubscriptionClient::new(endpoint.clone());
-        let grpc_client = GrpcClient::new(endpoint);
+        let target = Target::new(endpoint, expect_rx);
+        let query_client = QueryClient::new(target.clone());
+        let subscription_client = SubscriptionClient::new(target.clone());
+        let grpc_client = GrpcClient::new(target);
 
         Ok(Self {
             state,
@@ -373,6 +382,89 @@ fn force_kill_by_pid(pid: u32) {
     }
 }
 
+/// The directory the IPC endpoint is created in, owner-only.
+///
+/// The gain is on Linux, where the fallback would be the shared, sticky-bit
+/// `/tmp`: `$XDG_RUNTIME_DIR` is a per-user directory the session manager
+/// already creates `0700`. On macOS `$TMPDIR` is per-user and `0700` too, so
+/// there the subdirectory is tidiness rather than a fix. Windows never gets
+/// here — its pipe namespace is flat and has no directory to make private, so
+/// the DACL and the peer check are the whole policy.
+///
+/// A directory left behind by a crashed run is adopted, not refused. Nothing
+/// sweeps it, because a second window of a running app shares it and a
+/// concurrent copy owns its own.
+#[cfg(unix)]
+fn runtime_dir() -> Result<std::path::PathBuf> {
+    // SAFETY: `geteuid` reads process state and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir());
+    let dir = runtime_dir_path(xdg.as_deref(), uid);
+    ensure_private_dir(&dir, uid)?;
+    Ok(dir)
+}
+
+/// Creates `dir` `0700`, or adopts one an earlier run left behind — but only
+/// once this user is proved to own it, and never through a symlink.
+///
+/// The order is the whole protection: tightening first would let another user
+/// point `/tmp/kstack-<uid>` at a directory of ours and have the app chmod it
+/// on their behalf. Past the check there is no swap to lose to — `/tmp` is
+/// sticky, so only the owner can replace the entry.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &std::path::Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A name is not ownership, and `symlink_metadata` is what refuses a
+            // link: whoever planted it owns where it leads.
+            let meta = std::fs::symlink_metadata(dir).map_err(AppError::Io)?;
+            if !meta.is_dir() || meta.uid() != uid {
+                return Err(AppError::Io(std::io::Error::other(format!(
+                    "{} is not a directory owned by this user",
+                    dir.display()
+                ))));
+            }
+        }
+        Err(e) => return Err(AppError::Io(e)),
+    }
+    // mkdir's mode is masked by the umask, and an adopted directory carries
+    // whatever mode the earlier run left it with.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(AppError::Io)
+}
+
+#[cfg(not(unix))]
+fn runtime_dir() -> Result<std::path::PathBuf> {
+    Ok(std::env::temp_dir())
+}
+
+/// Where [`runtime_dir`] puts the directory: under `$XDG_RUNTIME_DIR` when the
+/// session manager gave us one, else under the temp dir.
+///
+/// The temp dir is shared between users on Linux, so the uid goes in the name:
+/// one directory for all of them means the first user to run owns it `0700` and
+/// every later user's chmod fails with EPERM.
+#[cfg(unix)]
+fn runtime_dir_path(xdg: Option<&std::path::Path>, uid: u32) -> std::path::PathBuf {
+    match xdg {
+        Some(base) => base.join(RUNTIME_DIR_NAME),
+        None => std::env::temp_dir().join(format!("{RUNTIME_DIR_NAME}-{uid}")),
+    }
+}
+
+/// Leaf for [`runtime_dir`]. A `-dev` sibling like [`APP_DIR_NAME`], so a dev
+/// run and an installed release never share a socket directory.
+#[cfg(unix)]
+const RUNTIME_DIR_NAME: &str = if cfg!(debug_assertions) {
+    "kstack-dev"
+} else {
+    "kstack"
+};
+
 /// Creates the sidecar's data directory owner-only, and tightens one an earlier build
 /// already created under the umask. On Windows the per-user `%LOCALAPPDATA%` ACL
 /// already restricts it, so the plain create is enough.
@@ -437,6 +529,71 @@ mod tests {
                 KEYCHAIN_SERVICE,
             ]
         );
+    }
+
+    /// The endpoint's directory is the wall around the socket. `/tmp` is shared
+    /// and sticky-bit only, so anything that can enter the directory can reach
+    /// the address the host is about to dial.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = runtime_dir().expect("runtime dir");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{} must be enterable only by this user",
+            dir.display()
+        );
+    }
+
+    /// Without `$XDG_RUNTIME_DIR` the fallback lands in a temp dir every user
+    /// shares, so two users must not name the same directory: the first to run
+    /// owns it `0700` and the second cannot chmod it.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_path_is_per_user_outside_xdg() {
+        let mine = runtime_dir_path(None, 1000);
+        let theirs = runtime_dir_path(None, 1001);
+        assert_ne!(mine, theirs);
+
+        // $XDG_RUNTIME_DIR is already per-user, so the uid stays out of the name.
+        let xdg = std::path::Path::new("/run/user/1000");
+        assert_eq!(
+            runtime_dir_path(Some(xdg), 1000),
+            xdg.join(RUNTIME_DIR_NAME)
+        );
+    }
+
+    /// Another user can plant the fallback name as a symlink into a directory of
+    /// ours. Refusing it is half the fix; the other half is refusing it *before*
+    /// the chmod, or the app tightens the target on the attacker's behalf.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_refuses_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("kstack-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("victim");
+        std::fs::create_dir_all(&target).expect("create victim");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen victim");
+
+        let planted = base.join("planted");
+        std::os::unix::fs::symlink(&target, &planted).expect("plant symlink");
+
+        // SAFETY: `geteuid` reads process state and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert!(ensure_private_dir(&planted, uid).is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the symlink's target must be left alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The data directory is the outer wall around the sidecar's caches, and the

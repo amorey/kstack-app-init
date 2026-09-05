@@ -35,9 +35,10 @@ Four boundaries, in the order an attacker meets them:
    also allow window creation, host preferences and app exit.
 2. **Host → sidecar.** One Unix socket (named pipe on Windows) carries GraphQL over HTTP/1.1 and
    gRPC over h2c. File mode/DACL restricts the account; the sidecar additionally checks the host PID
-   supplied by the host. Standalone `--host-pid=0` permits the same account. Authentication is
-   one-way: the host does not verify the server PID. The Unix endpoint is in the OS temp directory,
-   not necessarily a private directory. See R-01 in the latest review.
+   supplied by the host. Standalone `--host-pid=0` permits the same account. Authentication runs
+   both ways: the host reads the peer's PID from the kernel on every dial and refuses anything that
+   is not the child it spawned. On Unix the endpoint sits in an owner-only directory; the Windows
+   pipe namespace is flat, so there the DACL and the peer check are the whole policy.
 3. **Sidecar → clusters.** Credentials and TLS policy both come from the user's kubeconfig. Everything
    a watch returns is attacker-controlled if the cluster is.
 4. **Sidecar → cloud.** OIDC sign-in through the system browser and a loopback redirect; prefs sync
@@ -95,7 +96,7 @@ links the ADR that accepted it. **Not built** links the work.
 | Signed in-app updates | — | **Not built** — [spec 9](specs/9-signed-in-app-updates.md). The release workflow configures signed macOS/Windows downloads and GPG-signed checksums; Linux bundles are unsigned. Actual signatures and signing policy require release-artifact verification |
 | Sign-out clears the local credential, and nothing is revoked before it | `sidecar/internal/auth/auth.go` | **Enforced** — `TestLogoutRevokesAfterClearingAndIgnoresRevokeFailure` holds the clear open and fails on a revoke that arrives during it; `TestLogoutKeepsSessionWhenCredentialClearFails` pins the failed clear staying signed in. The server-side revoke beside it is **not a promise**: it is fire-and-forget, so a failed revoke, or a quit before it finishes, leaves the grant live while the app reports signed out |
 | Top-level navigation restricted to the app origin | — | **Not built** — [spec 2](specs/2-native-navigation-policy.md). `build_window` installs no navigation or new-window policy; CSP does not govern navigation |
-| The host refuses any IPC peer that is not the sidecar it spawned | — | **Not built** — [spec 5](specs/5-host-authenticates-the-sidecar.md). Authentication runs one way, and the endpoint sits in the shared temp directory |
+| The host refuses any IPC peer that is not the sidecar it spawned | `src-tauri/src/services/sidecar/{ipc,peer}.rs` | **Enforced** — `connect_refuses_a_peer_that_is_not_the_expected_process` binds a hostile listener in the test process and asserts the dial is refused; `query_refuses_a_server_that_is_not_the_sidecar` pins that the check is wired into the transport, not merely available. `connect_refuses_when_no_sidecar_is_running` covers the exited child, whose PID the OS may have reassigned. The Windows arm compiles from the same code but is exercised only by a native run |
 | Query cost, concurrency, fan-out and total-disk budgets | — | **Not built** — [spec 6](specs/6-resource-budgets.md). The outer request-size and timeout bounds above are not budgets on the work an operation causes |
 | Third-party actions pinned to SHAs, and a release gated on the checks for its own commit | — | **Not built** — [spec 7](specs/7-release-assurance.md). Actions float on tags (`dtolnay/rust-toolchain@master` on a branch), `release.yml` grants write permissions to every job, and audits run only per pull request |
 | The macOS bundle grants only the hardened-runtime exceptions it needs | `src-tauri/entitlements.plist` | **Not built** — [spec 8](specs/8-macos-entitlements.md). Three exceptions ship whose necessity has never been tested against a signed build |

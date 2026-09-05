@@ -16,6 +16,7 @@ mod graphql;
 mod grpc;
 mod ipc;
 mod logs;
+mod peer;
 mod service;
 
 pub use graphql::GraphqlResponse;
