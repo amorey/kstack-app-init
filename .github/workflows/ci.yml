@@ -163,7 +163,7 @@ jobs:
         run: cargo install --locked cargo-audit --version 0.22.2
       - name: Run cargo audit
         working-directory: ./src-tauri
-        run: cargo audit
+        run: cargo audit --deny unsound --deny unmaintained
 
   typescript-audit:
     name: TypeScript · Audit
@@ -174,7 +174,7 @@ jobs:
         with:
           setup-node: "true"
       - name: Run pnpm audit
-        run: pnpm audit --audit-level high
+        run: pnpm audit --audit-level moderate
 
   ###########################
   # Test jobs

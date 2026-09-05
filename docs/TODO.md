@@ -157,6 +157,12 @@ distinguishable from an unnoticed one. **Decided against:**
   hold a line the app is not already crossing. H-1 stands: the CSP and the absence of an HTML sink
   are the containment. → [no GraphQL operation
   allowlist](adr/2026-09-03-no-graphql-operation-allowlist.md)
+- Resolving the seventeen advisories Tauri's Linux stack and `urlpattern` pin (the review's
+  **R-09**) — `glib`'s unsoundness is unreachable (nothing in the graph calls `array_iter_str`) and
+  the patched line belongs to gtk4, so the sixteen unmaintained notices have no upgrade either.
+  They are listed in `src-tauri/.cargo/audit.toml` with a reason each, and CI now runs `cargo audit
+  --deny unsound --deny unmaintained` so a new one fails. → [the advisories Tauri's dependency
+  graph pins](adr/2026-09-05-tauri-pinned-transitive-advisories.md)
 - Pinning the GraphQL schema against a field served ahead of its consumer — it changes with nearly
   every feature, so the pin would be re-blessed by habit. `src-tauri/capabilities/default.json` is
   pinned instead, the auth projection's fields are pinned by type, and a mutation with no caller is
@@ -198,11 +204,6 @@ distinguishable from an unnoticed one. **Decided against:**
   trusted signature verification instructions and confirm SBOM coverage. Review actual GitHub
   environment/branch protections separately; this checkout cannot establish them.
 
-- **R-09 — Rust advisory triage (desktop/dependency owners).** Resolve `glib 0.18.5`
-  RUSTSEC-2024-0429 with an upstream-compatible fix/backport or scoped acceptance after reachability
-  analysis. Track the sixteen unmaintained dependency notices enumerated in the review. Do not
-  force an incompatible glib major/minor line into the GTK dependency graph or ignore all warnings.
-
 - **R-10 — OAuth callback bounds (low; auth owner).** Add read-header/idle limits and nonblocking
   one-shot error delivery, with repeated-valid-callback and cancellation tests. Document and test
   best-effort revocation separately from local logout success.
@@ -212,10 +213,14 @@ distinguishable from an unnoticed one. **Decided against:**
   racing completion cannot restore the session. Test logout-before-callback and out-of-order logins
   with controlled channels, and revoke/discard superseded grants.
 
-- **Verification debt (security/release owners).** Rerun govulncheck with database access (review
-  received HTTP 403), canonical cargo-audit, native Rust tests, CGO race tests and signed
-  macOS/Windows IPC/navigation/entitlement tests. Inspect release settings and signature artifacts.
-  Unknown scan/platform results are not clean results.
+- **Verification debt (security/release owners).** What the 4 September review could not run, it
+  recorded as owed; most of it was already running in CI, which the review did not check.
+  `govulncheck`, `cargo audit`, `cargo test` and `go test -race` all run per pull request across
+  the full OS/arch matrix (`ci.yml`), so the scanner half is closed. What remains needs a signed
+  build on real hardware and has no test written yet: signature and entitlement verification on
+  release artifacts, IPC peer authentication against a hostile listener, and navigation policy on
+  all three webview engines. Release settings and branch protections live outside this checkout
+  (R-08). Unknown platform results are not clean results.
 
 
 - **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
