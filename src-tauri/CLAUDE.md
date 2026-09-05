@@ -47,6 +47,13 @@ Quit cancels the app-wide `CancellationToken` before `SidecarService::graceful_s
 
 Full picture: [`docs/security-model.md`](../docs/security-model.md). What the host owns:
 
+- **The webview never navigates off the app origin.** `build_window` installs two default-deny
+  callbacks: `on_navigation(is_app_origin)` — an allowlist ending in `false`, admitting the bundle's
+  own origin, `about:blank`, and (behind `cfg(debug_assertions)`) the dev server — and
+  `on_new_window`, which always answers `Deny`. Client-side routing is `pushState` and never reaches
+  either. A feature that seems to need an external URL needs a host command instead: the opener
+  plugin, as the tray's account item does. Which engine fires which callback when is verified by
+  hand, not by a test.
 - **The webview is trusted by custom host commands.** `capabilities/default.json` grants core defaults and window controls, without shell or opener grants; custom commands also expose GraphQL, host preferences and app lifecycle, pinned by `default_capability_grants_only_window_chrome`; the opener and shell plugins are registered for Rust-side use and grant the page nothing. Add a permission only when a call site needs it, scoped as narrowly as the plugin allows — a grant with no consumer is standing authority for injected script.
 - **Every dial checks who answered.** An address and the pid that must be serving it travel together as one `ipc::Target`, so there is no way to dial without checking — which matters because gRPC re-dials on loss and every subscription reconnects. The pid is read from the kernel (`peer.rs`), published on a `watch` channel by `spawn`, and cleared when the child terminates; `None` refuses, since a pid the OS has reassigned is exactly what must not pass. An unreadable peer is refused too. macOS reads `LOCAL_PEERPID` itself — its `xucred` carries no pid, so `interprocess` reports `None` there. This stops another process of the same user impersonating the sidecar; it is no defence against code already inside the host process. Pinned by `connect_refuses_a_peer_that_is_not_the_expected_process` and `query_refuses_a_server_that_is_not_the_sidecar`.
 - **The sidecar inherits this process's environment, so nothing it needs may come from there.** Every endpoint — cloud URL, OAuth issuer, client id, keychain service — is passed by `cmd_args` from constants in `service.rs`, never read from our own environment (that would move the redirection risk, not close it). New configuration goes the same way. The sidecar honours `KSTACK_*` overrides only when built with `-tags debug` (`make sidecar-dev`), which is a standalone dev seam, not a dev-run one.

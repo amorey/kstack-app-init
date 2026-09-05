@@ -30,8 +30,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use tauri::webview::NewWindowResponse;
 use tauri::window::{Color, Monitor};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tracing::warn;
 
 use crate::error::Result;
 use crate::host_file::{self, ColorSchemePreference};
@@ -105,6 +107,41 @@ fn background_color_for(preference: Option<ColorSchemePreference>, os_prefers_da
     } else {
         LIGHT_BACKGROUND
     }
+}
+
+/// Whether the webview may navigate to `url`. The app is a local single-page
+/// bundle: every legitimate navigation is client-side routing (`pushState`,
+/// which never reaches this), so a document navigation is a page trying to
+/// leave — and a window that has left still holds every host command.
+///
+/// An allowlist that ends in `false`, never a denylist of bad schemes: a scheme
+/// nobody thought of is refused rather than admitted.
+fn is_app_origin(url: &Url) -> bool {
+    // Handed to the callback by some engines during startup.
+    if url.as_str() == "about:blank" {
+        return true;
+    }
+
+    // `pnpm tauri dev` serves the webview off localhost. Behind `cfg` so a
+    // release build cannot admit it, whatever port the dev server picked.
+    if cfg!(debug_assertions) && (url.scheme(), url.host_str()) == ("http", Some("localhost")) {
+        return true;
+    }
+
+    // A port would make it a different origin, and the bundle is served on none.
+    // `Url::origin` is no help: a non-special scheme like `tauri` is opaque, so
+    // every custom-protocol URL serializes to the same "null".
+    if url.port().is_some() {
+        return false;
+    }
+
+    // The bundle's own origin, per platform: macOS/Linux serve it over the
+    // `tauri` custom protocol, Windows over a virtual host. Both are admitted
+    // everywhere — a build only ever loads its own.
+    matches!(
+        (url.scheme(), url.host_str()),
+        ("tauri", Some("localhost")) | ("http", Some("tauri.localhost"))
+    )
 }
 
 /// Down-right step per cascade — about a title bar, so the window beneath
@@ -234,12 +271,23 @@ impl WindowManager {
     ///
     /// Positioned explicitly on every platform: AppKit auto-cascades an
     /// unpositioned window, Linux/Windows pile up.
+    ///
+    /// Every window it builds refuses to navigate off the app origin
+    /// ([`is_app_origin`]) and refuses `window.open` outright.
     fn build_window(&self, app: &AppHandle, label: &str) -> Result<WebviewWindow> {
         let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::default())
             .title(WINDOW_TITLE)
             .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
             // Floor the window so the layout never renders below its narrowest design.
-            .min_inner_size(600.0, 400.0);
+            .min_inner_size(600.0, 400.0)
+            .on_navigation(is_app_origin)
+            // Nothing in the app opens a window this way, and a popup is a
+            // webview the policy above does not govern. An external link stays
+            // host-owned — the opener plugin, as the tray's account item does.
+            .on_new_window(|url, _features| {
+                warn!(%url, "refused a new-window request from the webview");
+                NewWindowResponse::Deny
+            });
 
         // Anchor and its monitor resolve together — an anchor whose monitor
         // can't be read is no anchor at all. Anything unreadable degrades to a
@@ -330,11 +378,91 @@ impl WindowManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{background_color_for, cascade_position, WindowManager};
+    use super::{background_color_for, cascade_position, is_app_origin, WindowManager};
     use crate::host_file::ColorSchemePreference;
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;
+    use tauri::Url;
+
+    #[test]
+    fn the_bundled_app_origins_are_admitted() {
+        // What the window actually loads: `tauri://localhost` on macOS/Linux,
+        // `http://tauri.localhost` on Windows. `about:blank` is handed to the
+        // callback by some engines during startup.
+        for url in [
+            "tauri://localhost",
+            "tauri://localhost/dashboard",
+            "http://tauri.localhost",
+            "http://tauri.localhost/dashboard",
+            "about:blank",
+        ] {
+            let url = Url::parse(url).expect("test URL parses");
+            assert!(is_app_origin(&url), "{url} must be admitted");
+        }
+    }
+
+    #[test]
+    fn everything_that_is_not_the_app_is_refused() {
+        // The reason the policy exists — a remote origin — plus the schemes a
+        // script reaches for to carry data out or run code in, and a host that
+        // merely looks like the app's. The allowlist ends in `false`, so an
+        // exotic scheme nobody listed here is refused with them.
+        for url in [
+            "https://example.com",
+            "http://example.com",
+            "https://tauri.localhost.example.com",
+            "http://tauri.localhost:8080",
+            "https://tauri.localhost",
+            "file:///etc/passwd",
+            "data:text/html,<h1>x</h1>",
+            "javascript:alert(1)",
+            "about:srcdoc",
+            "kstack-app://localhost",
+        ] {
+            let url = Url::parse(url).expect("test URL parses");
+            assert!(!is_app_origin(&url), "{url} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_dev_server_is_admitted_only_by_a_debug_build() {
+        // `pnpm tauri dev` serves the webview from localhost, so a debug build
+        // must admit it — and a release build must not, which is what keeps the
+        // shipped app's allowlist to the bundle alone. One assertion, so
+        // whichever mode the suite is built in pins its own half.
+        for url in ["http://localhost:1420", "http://localhost:1420/dashboard"] {
+            let url = Url::parse(url).expect("test URL parses");
+            assert_eq!(is_app_origin(&url), cfg!(debug_assertions), "{url}");
+        }
+    }
+
+    #[test]
+    fn build_window_installs_the_navigation_policy() {
+        // Both callbacks are the containment for a page that tries to leave, and
+        // nothing else in the process reinstates them — an edit to the builder
+        // that drops one is silent at runtime and invisible to every other test
+        // here, because none of them can build a webview. So read the source, the
+        // way `config_declares_no_windows` reads the config.
+        let source = include_str!("window_manager.rs");
+        let (_, after) = source
+            .split_once("fn build_window")
+            .expect("window_manager defines build_window");
+        // Stop at the test module, whose own assertions quote the strings below.
+        let build_window = after
+            .split_once("#[cfg(test)]")
+            .expect("window_manager has a test module")
+            .0;
+
+        assert!(
+            build_window.contains(".on_navigation(is_app_origin)"),
+            "build_window must refuse navigation off the app origin"
+        );
+        assert!(
+            build_window.contains("NewWindowResponse::Deny"),
+            "build_window must refuse `window.open`"
+        );
+    }
 
     #[test]
     fn explicit_preference_ignores_the_os_scheme() {

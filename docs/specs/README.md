@@ -39,7 +39,6 @@ code.
 
 | Spec | Scope | Status |
 | --- | --- | --- |
-| [2 — The native webview refuses to navigate](2-native-navigation-policy.md) | src-tauri | Planned |
 | [3 — The app says when it is out of date](3-update-notification.md) | sidecar, src-tauri | Planned |
 | [6 — Resource budgets](6-resource-budgets.md) | sidecar, src-tauri | Planned |
 | [7 — Release assurance](7-release-assurance.md) | ci | Planned |

@@ -199,9 +199,6 @@ distinguishable from an unnoticed one. **Decided against:**
 **Specced.** Each links a spec in [`docs/specs/`](specs/) self-contained enough to build straight
 through; the numbers are the build order.
 
-- **R-02 — native navigation policy (medium; desktop owner).** →
-  [spec 2](specs/2-native-navigation-policy.md)
-
 - **R-05 / S-9 — resource budgets (medium; sidecar/desktop owners).** →
   [spec 6](specs/6-resource-budgets.md)
 

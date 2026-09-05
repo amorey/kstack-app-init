@@ -29,7 +29,8 @@ Four boundaries, in the order an attacker meets them:
 
 1. **Webview → host.** The host exposes Tauri commands; no filesystem or shell plugin permission
    is granted to the page. Production CSP restricts script loads and connection APIs to local
-   origins; it is not a general network or navigation sandbox. The host forwards GraphQL verbatim.
+   origins; it is not a general network sandbox. Navigation is restricted separately, by
+   `build_window`'s default-deny callbacks. The host forwards GraphQL verbatim.
    Script execution can read the mirror and invoke all current app/account/cache mutations. The
    current schema exposes no arbitrary Kubernetes write or pod-exec operation. Custom host commands
    also allow window creation, host preferences and app exit.
@@ -95,7 +96,7 @@ links the ADR that accepted it. **Not built** links the work.
 | The app tells the user a newer release exists | — | **Not built** — [spec 3](specs/3-update-notification.md). Nothing checks, so a user can sit on a version with a known bug indefinitely |
 | Signed in-app updates | — | **Not built** — [spec 9](specs/9-signed-in-app-updates.md). The release workflow configures signed macOS/Windows downloads and GPG-signed checksums; Linux bundles are unsigned. Actual signatures and signing policy require release-artifact verification |
 | Sign-out clears the local credential, and nothing is revoked before it | `sidecar/internal/auth/auth.go` | **Enforced** — `TestLogoutRevokesAfterClearingAndIgnoresRevokeFailure` holds the clear open and fails on a revoke that arrives during it; `TestLogoutKeepsSessionWhenCredentialClearFails` pins the failed clear staying signed in. The server-side revoke beside it is **not a promise**: it is fire-and-forget, so a failed revoke, or a quit before it finishes, leaves the grant live while the app reports signed out |
-| Top-level navigation restricted to the app origin | — | **Not built** — [spec 2](specs/2-native-navigation-policy.md). `build_window` installs no navigation or new-window policy; CSP does not govern navigation |
+| Top-level navigation restricted to the app origin | `src-tauri/src/window_manager.rs` | **Enforced** — `build_window` installs `on_navigation` and `on_new_window`, both default-deny, pinned by `build_window_installs_the_navigation_policy`; the allowlist is `is_app_origin` (`the_bundled_app_origins_are_admitted`, `everything_that_is_not_the_app_is_refused`, `the_dev_server_is_admitted_only_by_a_debug_build`). CSP does not govern navigation. Per-engine firing is verified by hand, not by a test |
 | The host refuses any IPC peer that is not the sidecar it spawned | `src-tauri/src/services/sidecar/{ipc,peer}.rs` | **Enforced** — `connect_refuses_a_peer_that_is_not_the_expected_process` binds a hostile listener in the test process and asserts the dial is refused; `query_refuses_a_server_that_is_not_the_sidecar` pins that the check is wired into the transport, not merely available. `connect_refuses_when_no_sidecar_is_running` covers the exited child, whose PID the OS may have reassigned. The Windows arm compiles from the same code but is exercised only by a native run |
 | Query cost, concurrency, fan-out and total-disk budgets | — | **Not built** — [spec 6](specs/6-resource-budgets.md). The outer request-size and timeout bounds above are not budgets on the work an operation causes |
 | Third-party actions pinned to SHAs, and a release gated on the checks for its own commit | — | **Not built** — [spec 7](specs/7-release-assurance.md). Actions float on tags (`dtolnay/rust-toolchain@master` on a branch), `release.yml` grants write permissions to every job, and audits run only per pull request |
@@ -106,7 +107,8 @@ links the ADR that accepted it. **Not built** links the work.
 **The webview is fully trusted by the host.** `graphql_query` forwards the operation string
 unexamined, so a script running in the page can read every mirrored object and call every mutation.
 CSP and text rendering reduce injection risk; bundled malicious JavaScript is already permitted
-by `script-src 'self'`. No native navigation restriction is configured (R-02).
+by `script-src 'self'`. Navigation off the app origin is refused, so the script stays in the app's
+own page — it does not stay out of the app's authority.
 
 **The sidecar authenticates a process, not a principal.** With a nonzero host PID, the endpoint serves that process only — the kernel supplies the peer's pid, so it cannot be claimed. But an attacker who can
 run code *inside* the host process, or debug it, inherits the whole surface, and the file mode still
