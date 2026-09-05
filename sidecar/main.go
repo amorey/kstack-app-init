@@ -36,15 +36,23 @@ func main() {
 
 	slog.SetDefault(logging.Init(os.Stderr, logging.ParseLevel(os.Getenv("KSTACK_LOG_LEVEL"))))
 
-	cfg, err := configFromArgs(os.Args[1:])
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout))
+}
+
+// run is main without the process: it takes the command line and the two
+// streams the host talks over, and returns the exit code instead of calling
+// os.Exit. Everything main does after logging setup lives here so the boot and
+// shutdown sequence is reachable from a test.
+func run(args []string, stdin io.Reader, stdout io.Writer) int {
+	cfg, err := configFromArgs(args)
 	if err != nil {
-		os.Exit(2)
+		return 2
 	}
 
 	ln, err := ipc.Listen(cfg.Socket)
 	if err != nil {
 		slog.Error("listen", "socket", cfg.Socket, "err", err)
-		os.Exit(1)
+		return 1
 	}
 	ln = ipc.Authenticated(ln, ipc.Policy{HostPID: cfg.HostPID})
 	// Named pipes vanish with their listener; only the UDS file needs cleanup.
@@ -62,7 +70,7 @@ func main() {
 	application, err := app.New(cfg.App)
 	if err != nil {
 		slog.Error("app init", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	const maxRequestBytes = 64 * 1024 * 1024
@@ -78,21 +86,21 @@ func main() {
 
 	// The host matches the `READY ` prefix; scheme+path are informational (the
 	// host picked the path and passed it via --socket).
-	fmt.Printf("READY %s:%s\n", ipc.Scheme, cfg.Socket)
+	fmt.Fprintf(stdout, "READY %s:%s\n", ipc.Scheme, cfg.Socket)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	// Watch stdin for EOF as a parent-died signal.
 	go func() {
-		_, _ = io.Copy(io.Discard, os.Stdin)
+		_, _ = io.Copy(io.Discard, stdin)
 		cancel()
 	}()
 
 	stop, err := application.Start(ctx)
 	if err != nil {
 		slog.Error("app start", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	errCh := make(chan error, 1)
@@ -104,7 +112,7 @@ func main() {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("serve", "err", err)
-			os.Exit(1)
+			return 1
 		}
 		reason = "serve returned"
 	}
@@ -126,4 +134,5 @@ func main() {
 		slog.Warn("stop did not complete cleanly", "err", err)
 	}
 	_ = application.Close()
+	return 0
 }
