@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zalando/go-keyring"
+
 	"github.com/kubetail-org/kstack-app/sidecar/internal/auth/oauth"
 	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
@@ -17,11 +19,15 @@ import (
 // memStore is an in-memory CredentialsStore (host keychain stand-in).
 type memStore struct {
 	tok     Token
-	saveErr error // when set, Save fails without mutating tok
+	saveErr error            // when set, Save fails without mutating tok
+	saved   *testutil.Signal // fired on each Save attempt, for tests watching a detached one
 }
 
 func (m *memStore) Load() (Token, error) { return m.tok, nil }
 func (m *memStore) Save(t Token) error {
+	if m.saved != nil {
+		m.saved.Fire()
+	}
 	if m.saveErr != nil {
 		return m.saveErr
 	}
@@ -389,5 +395,80 @@ func TestNewHydraOAuthConfig(t *testing.T) {
 	}
 	if len(withSlash.Scopes) != 1 || withSlash.Scopes[0] != "openid" {
 		t.Errorf("Scopes override = %v", withSlash.Scopes)
+	}
+}
+
+// StartLogin returns as soon as the browser is open and finishes the round-trip on its
+// own goroutine, so every tail failure has to leave the session signed out — an abandoned
+// flow that times out, a rejected exchange, and a keychain that will not take the token.
+func TestLoginTailFailureStaysSignedOut(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		tailErr  error
+		saveErr  error
+		waitSave bool // the tail succeeded, so the failure is the persist itself
+	}{
+		{name: "abandoned flow", tailErr: context.DeadlineExceeded},
+		{name: "rejected exchange", tailErr: errors.New("exchange rejected")},
+		{name: "keychain refuses", saveErr: errors.New("keychain locked"), waitSave: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			done := testutil.NewSignal()
+			store := &memStore{saveErr: tc.saveErr, saved: testutil.NewSignal()}
+			svc, err := newWithOptions(Config{},
+				withCredentialsStore(store),
+				withLoginStarter(func(context.Context) (pendingLogin, error) {
+					return func(context.Context) (Token, Identity, error) {
+						defer done.Fire()
+						if tc.tailErr != nil {
+							return Token{}, Identity{}, tc.tailErr
+						}
+						return Token{AccessToken: "a", RefreshToken: "r", Expiry: time.Now().Add(time.Hour)},
+							Identity{UserID: "u1"}, nil
+					}, nil
+				}),
+			)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			if err := svc.StartLogin(context.Background()); err != nil {
+				t.Fatalf("StartLogin: %v", err)
+			}
+			done.Wait(t, "the login tail to run")
+			if tc.waitSave {
+				store.saved.Wait(t, "the persist attempt")
+			}
+
+			st, err := svc.Current(context.Background())
+			if err != nil {
+				t.Fatalf("Current: %v", err)
+			}
+			if st.Authenticated {
+				t.Fatal("a failed login tail must leave the session signed out")
+			}
+			if saved, _ := store.Load(); saved.RefreshToken != "" {
+				t.Fatalf("nothing should have been persisted, got %+v", saved)
+			}
+		})
+	}
+}
+
+// With no store injected, a configured keychain service name is what the grant persists
+// through — the wiring the desktop app actually runs on.
+func TestNewUsesTheKeychainServiceWhenNoStoreIsInjected(t *testing.T) {
+	keyring.MockInit()
+
+	svc, err := newWithOptions(Config{KeychainService: "kstack-app-test"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	st, err := svc.Current(context.Background())
+	if err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if st.Authenticated {
+		t.Fatal("an empty keyring should read as signed out")
 	}
 }

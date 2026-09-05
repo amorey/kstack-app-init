@@ -413,3 +413,31 @@ func TestGrantTokenSourceSignedOut(t *testing.T) {
 		t.Fatalf("want ErrSignedOut, got %v", err)
 	}
 }
+
+// A refresh that fails leaves the cached token alone: validToken reports the failure
+// rather than serving the expired token it was asked to replace.
+func TestGrantValidTokenSurfacesARefreshFailure(t *testing.T) {
+	boom := errors.New("refresh rejected")
+	g := newGrant(
+		&memStore{tok: Token{RefreshToken: "r", Expiry: time.Now().Add(-time.Hour)}},
+		func(context.Context, string) (Token, error) { return Token{}, boom },
+	)
+
+	if _, err := g.validToken(context.Background()); !errors.Is(err, boom) {
+		t.Fatalf("validToken err = %v, want %v", err, boom)
+	}
+}
+
+// A grant built without a store is permanently signed out, so set has nowhere to persist
+// and must say so rather than caching a credential a restart would not find.
+func TestGrantSetRefusesWithoutAStore(t *testing.T) {
+	g := newGrant(nil, nil)
+
+	if err := g.set(Token{RefreshToken: "r"}, Identity{}); !errors.Is(err, ErrSignedOut) {
+		t.Fatalf("set err = %v, want ErrSignedOut", err)
+	}
+	st, _ := g.state(context.Background())
+	if st.Authenticated {
+		t.Fatal("a storeless grant must stay signed out")
+	}
+}

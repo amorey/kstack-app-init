@@ -64,7 +64,7 @@ func newGrant(store CredentialsStore, refresh RefreshFunc, opts ...grantOption) 
 	}
 	// ensureLoaded degrades an unreadable store (a headless box with no keyring) to
 	// signed-out rather than failing every later state read.
-	_ = s.ensureLoaded()
+	s.ensureLoaded()
 	// Seed the hub so current-on-subscribe hands the live session, not a zero value.
 	s.hub = watch.New(s.stateLocked())
 	s.tx = s.hub.Sender()
@@ -84,9 +84,7 @@ func (s *grant) subscribe() (<-chan State, func()) {
 func (s *grant) state(context.Context) (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureLoaded(); err != nil {
-		return State{}, err
-	}
+	s.ensureLoaded()
 	return s.stateLocked(), nil
 }
 
@@ -112,9 +110,7 @@ func (s *grant) validToken(ctx context.Context) (Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.ensureLoaded(); err != nil {
-		return Token{}, err
-	}
+	s.ensureLoaded()
 	if s.tok.Valid(s.now()) {
 		return s.tok, nil
 	}
@@ -145,9 +141,7 @@ func (s *grant) validToken(ctx context.Context) (Token, error) {
 func (s *grant) current() (Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureLoaded(); err != nil {
-		return Token{}, err
-	}
+	s.ensureLoaded()
 	return s.tok, nil
 }
 
@@ -193,14 +187,15 @@ func (s *grant) publishLocked() {
 	s.tx.Send(s.stateLocked()) //nolint:errcheck // Send never blocks; closed hub is a no-op
 }
 
-// ensureLoaded loads the token into the cache on first use (s.mu held).
-func (s *grant) ensureLoaded() error {
+// ensureLoaded loads the token into the cache on first use (s.mu held). It cannot fail:
+// an unreadable store degrades to signed-out, so no caller has a load error to handle.
+func (s *grant) ensureLoaded() {
 	if s.loaded {
-		return nil
+		return
 	}
 	if s.store == nil {
 		s.loaded = true
-		return nil
+		return
 	}
 	tok, err := s.store.Load()
 	if err != nil {
@@ -208,10 +203,9 @@ func (s *grant) ensureLoaded() error {
 		// rather than failing every state read. Mark loaded so we don't re-hit it.
 		slog.Warn("auth: could not read stored credentials; treating as signed out", "err", err)
 		s.loaded = true
-		return nil
+		return
 	}
 	s.applyToken(tok)
-	return nil
 }
 
 // applyToken caches a loaded token and decodes its identity. DisplayOnly is the one place an

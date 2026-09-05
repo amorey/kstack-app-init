@@ -20,19 +20,23 @@ func generateVerifier() string { return oauth2.GenerateVerifier() }
 // generateState returns the CSRF state the loopback callback must echo back.
 func generateState() string { return oauth2.GenerateVerifier() }
 
+// browserCommand is the per-OS opener for rawURL. Split from the exec so the mapping can
+// be checked for every platform from any one of them.
+func browserCommand(goos, rawURL string) (string, []string) {
+	switch goos {
+	case "darwin":
+		return "open", []string{rawURL}
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", rawURL}
+	default: // linux, *bsd, etc.
+		return "xdg-open", []string{rawURL}
+	}
+}
+
 // defaultOpenBrowser opens rawURL in the default browser. The sidecar inherits the host's
 // GUI session env, so the per-OS opener behaves as it would from the host.
 func defaultOpenBrowser(rawURL string) error {
-	var name string
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		name, args = "open", []string{rawURL}
-	case "windows":
-		name, args = "rundll32", []string{"url.dll,FileProtocolHandler", rawURL}
-	default: // linux, *bsd, etc.
-		name, args = "xdg-open", []string{rawURL}
-	}
+	name, args := browserCommand(runtime.GOOS, rawURL)
 	return exec.Command(name, args...).Start()
 }
 

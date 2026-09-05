@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -53,5 +54,46 @@ func TestKeyringStoreRoundTrip(t *testing.T) {
 	}
 	if got != (Token{}) {
 		t.Fatalf("after clearing, want the zero Token, got %+v", got)
+	}
+}
+
+// An unreadable keyring is an error, not an empty store: only a genuinely absent entry
+// means signed out, and the two must not be confused into discarding a live session.
+func TestKeyringStoreSurfacesBackendErrors(t *testing.T) {
+	boom := errors.New("keyring unavailable")
+	keyring.MockInitWithError(boom)
+	store := newKeyringStore("kstack-app-test")
+
+	if _, err := store.Load(); !errors.Is(err, boom) {
+		t.Fatalf("Load err = %v, want %v", err, boom)
+	}
+	if err := store.Save(Token{RefreshToken: "r"}); !errors.Is(err, boom) {
+		t.Fatalf("Save err = %v, want %v", err, boom)
+	}
+	if err := store.Save(Token{}); !errors.Is(err, boom) {
+		t.Fatalf("Save(zero) err = %v, want %v", err, boom)
+	}
+}
+
+// A stored entry that is not the Token JSON is an error rather than a zero Token, so a
+// corrupted keyring cannot silently read as signed out.
+func TestKeyringStoreRejectsAMalformedEntry(t *testing.T) {
+	keyring.MockInit()
+	if err := keyring.Set("kstack-app-test", keyringUser, "not json"); err != nil {
+		t.Fatalf("seed keyring: %v", err)
+	}
+
+	if _, err := newKeyringStore("kstack-app-test").Load(); err == nil {
+		t.Fatal("Load should reject an entry that is not a Token")
+	}
+}
+
+// Clearing a store that holds nothing is a no-op: sign-out runs the same path whether or
+// not a credential was ever written.
+func TestKeyringStoreClearIsIdempotent(t *testing.T) {
+	keyring.MockInit()
+
+	if err := newKeyringStore("kstack-app-test").Save(Token{}); err != nil {
+		t.Fatalf("Save(zero) on an empty store: %v", err)
 	}
 }
