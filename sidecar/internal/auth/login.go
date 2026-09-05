@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os/exec"
 	"runtime"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -121,6 +122,11 @@ type loopbackServer struct {
 	errCh  chan error
 }
 
+const (
+	loopbackReadTimeout = 10 * time.Second
+	loopbackIdleTimeout = 30 * time.Second
+)
+
 // newLoopbackServer binds an ephemeral port and serves /oauth/callback. state must match
 // what the caller passed to AuthCodeURL, so a stray local request can't satisfy the
 // one-shot callback.
@@ -137,10 +143,18 @@ func newLoopbackServer(state string) (*loopbackServer, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth/callback", lb.handleCallback)
-	lb.srv = &http.Server{Handler: mux}
+	// The port is reachable by any local process, so a stalled peer must lose its slot
+	// rather than hold one for the login's lifetime. The browser's redirect is a single
+	// small GET; these are generous for it and short against the five-minute flow.
+	lb.srv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: loopbackReadTimeout,
+		ReadTimeout:       loopbackReadTimeout,
+		IdleTimeout:       loopbackIdleTimeout,
+	}
 	go func() {
 		if err := lb.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			lb.errCh <- err
+			lb.fail(err)
 		}
 	}()
 	return lb, nil
@@ -169,7 +183,7 @@ func (lb *loopbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if e := q.Get("error"); e != "" {
-		lb.errCh <- fmt.Errorf("oauth: authorization failed: %s", e)
+		lb.fail(fmt.Errorf("oauth: authorization failed: %s", e))
 		http.Error(w, e, http.StatusBadRequest)
 		return
 	}
@@ -182,6 +196,16 @@ func (lb *loopbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 	_, _ = w.Write([]byte(callbackHTML))
 	select {
 	case lb.codeCh <- code:
+	default:
+	}
+}
+
+// fail records the first error to reach the flow and drops the rest. Wait consumes at
+// most one and nothing drains the channel behind it, so neither sender may block: a
+// repeated callback would otherwise park its handler goroutine for good.
+func (lb *loopbackServer) fail(err error) {
+	select {
+	case lb.errCh <- err:
 	default:
 	}
 }

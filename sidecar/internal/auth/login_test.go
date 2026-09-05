@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kubetail-org/kstack-app/sidecar/internal/testutil"
 )
 
 // fakeOAuth is a stand-in for the oauth protocol client the login flow drives,
@@ -155,15 +157,22 @@ func newTestLoopback(t *testing.T) Loopback {
 	return lb
 }
 
-// hitCallback fires a GET at the loopback's redirect URL with the given query.
-func hitCallback(t *testing.T, lb Loopback, q url.Values) *http.Response {
+// callbackURL is the loopback's redirect URL carrying the given query.
+func callbackURL(t *testing.T, lb Loopback, q url.Values) string {
 	t.Helper()
 	u, err := url.Parse(lb.RedirectURL())
 	if err != nil {
 		t.Fatalf("parse redirect url: %v", err)
 	}
 	u.RawQuery = q.Encode()
-	resp, err := http.Get(u.String())
+	return u.String()
+}
+
+// hitCallback fires a GET at the loopback's redirect URL with the given query.
+func hitCallback(t *testing.T, lb Loopback, q url.Values) *http.Response {
+	t.Helper()
+	u := callbackURL(t, lb, q)
+	resp, err := http.Get(u)
 	if err != nil {
 		t.Fatalf("GET %s: %v", u, err)
 	}
@@ -256,6 +265,52 @@ func TestLoopbackSurfacesAuthorizationError(t *testing.T) {
 
 	if _, err := lb.Wait(context.Background()); err == nil || !strings.Contains(err.Error(), "access_denied") {
 		t.Fatalf("Wait err = %v, want one mentioning access_denied", err)
+	}
+}
+
+// A second declined authorization must still get a response. Wait consumes at most one
+// error and nothing drains the channel behind it, so a blocking send would park the
+// handler goroutine for the life of the process.
+func TestLoopbackSurvivesRepeatedAuthorizationErrors(t *testing.T) {
+	lb := newTestLoopback(t)
+	q := url.Values{"state": {lbState}, "error": {"access_denied"}}
+
+	first := hitCallback(t, lb, q)
+	first.Body.Close()
+
+	// A wedged handler never answers, so the response is the only event to wait on.
+	u := callbackURL(t, lb, q)
+	testutil.WaitReturn(t, func() {
+		if resp, err := http.Get(u); err == nil {
+			resp.Body.Close()
+		}
+	}, "the second authorization-error callback to answer")
+
+	if _, err := lb.Wait(context.Background()); err == nil || !strings.Contains(err.Error(), "access_denied") {
+		t.Fatalf("Wait err = %v, want one mentioning access_denied", err)
+	}
+}
+
+// The callback listens on a port any local process can reach, so a peer that opens a
+// connection and then stalls must not hold a slot until the login times out.
+func TestLoopbackServerBoundsItsReads(t *testing.T) {
+	lb, err := newLoopbackServer(lbState)
+	if err != nil {
+		t.Fatalf("newLoopbackServer: %v", err)
+	}
+	t.Cleanup(func() { _ = lb.Close() })
+
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+	}{
+		{"ReadHeaderTimeout", lb.srv.ReadHeaderTimeout},
+		{"ReadTimeout", lb.srv.ReadTimeout},
+		{"IdleTimeout", lb.srv.IdleTimeout},
+	} {
+		if tc.got <= 0 {
+			t.Errorf("%s = %v, want a bound", tc.name, tc.got)
+		}
 	}
 }
 

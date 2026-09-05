@@ -206,11 +206,11 @@ distinguishable from an unnoticed one. **Decided against:**
   scanning half is running them on a schedule — deliberately not done yet, so an idle branch still
   learns nothing about a new advisory until someone opens a pull request.
 
-- **R-10 — OAuth callback bounds (low; auth owner).** Add read-header/idle limits and nonblocking
-  one-shot error delivery, with repeated-valid-callback and cancellation tests. `loopbackServer`
-  sends on its error channel from two places — the callback handler and the `Serve` goroutine — and
-  both block; fixing only the handler leaves the bug. Document and test best-effort revocation
-  separately from local logout success.
+- **R-10 — logout's revocation is best-effort, and unsaid (low; auth owner).** `Logout` clears the
+  local session and revokes server-side without waiting on it, so a failed or interrupted revoke
+  leaves the server grant live while the app reports signed out. Say so in
+  [`security-model.md`](security-model.md) and test the two halves apart. The callback's read
+  bounds and one-shot error delivery have landed.
 
 - **R-11 — pending login after logout (medium; auth owner).** Cancel/invalidate old browser flows
   on logout or replacement; check a session generation atomically with token persistence so a
