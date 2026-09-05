@@ -192,8 +192,7 @@ risk stays distinguishable from an unnoticed one, and is not repeated here.
   it — a notice with a brake, and it should say so — or it evicts, which contradicts a standing ADR
   and needs a new one first.
 
-- **R-08 — a release cannot be verified, and the pipeline making it is loose (medium; release
-  owner).** Four gaps, all in `.github/`. Third-party actions float on tags, and
+- **R-08 — a release cannot be verified, and the pipeline making it is loose (medium; release owner).** Four gaps, all in `.github/`. Third-party actions float on tags, and
   `dtolnay/rust-toolchain@master` floats on a *branch* in the job that builds what we ship — pin each
   to a SHA with the version in a trailing comment, and add `.github/dependabot.yml` so the pins still
   move. `release.yml` grants `contents: write` and `deployments: write` at the top, so every job runs
@@ -248,14 +247,49 @@ risk stays distinguishable from an unnoticed one, and is not repeated here.
   one to a test release, confirm it updates, then publish one signed with a different key and confirm
   it is refused.
 
-- **Verification debt (security/release owners).** What the 4 September review could not run, it
-  recorded as owed; most of it was already running in CI, which the review did not check.
-  `govulncheck`, `cargo audit`, `cargo test` and `go test -race` all run per pull request across
-  the full OS/arch matrix (`ci.yml`), so the scanner half is closed. What remains needs a signed
-  build on real hardware and has no test written yet: signature and entitlement verification on
-  release artifacts, IPC peer authentication against a hostile listener, and navigation policy on
-  all three webview engines. Release settings and branch protections live outside this checkout
-  (R-08). Unknown platform results are not clean results.
+- **Nothing exercises the release workflow's input validation (release owner).** `release.yml` takes
+  a dispatched version only if it matches a plain `major.minor.patch` with an optional prerelease, and
+  the input reaches the config script as an environment value instead of as shell source. That is what
+  keeps a crafted version string from running as shell in a job that holds release permissions and
+  signing secrets. It has no test: the 4 September review ran eighteen cases by hand, and an edit that
+  interpolated `${{ inputs.version }}` back into a `run:` block would pass everything we check today.
+  **Fix:** feed the workflow's own pattern a table of good and hostile strings — quotes, whitespace,
+  `$(…)`, newlines, a build-metadata suffix — so the rule is exercised rather than remembered. **When
+  it lands:** the *dispatched release version* row in [`security-model.md`](security-model.md) moves to
+  **Enforced**.
+
+- **Nobody has read the SBOM we publish (release owner).** Every release generates a CycloneDX SBOM
+  (`anchore/sbom-action` in `release.yml`). It reads the source tree, so whether it covers the native
+  runtime libraries and the bundled sidecar binary is unknown. An SBOM that quietly omits half the
+  bundle is worse than none, because it reads as complete. **Fix:** generate one, read it, and write
+  down what it does and does not cover.
+
+- **Nothing watches the parts we do not build (release/desktop owners).** The app runs on WebKitGTK,
+  WebView2 and WKWebView, and ships binaries produced by the Go and Rust toolchains. `cargo audit` and
+  `govulncheck` cover our dependencies, not these. A WebKitGTK advisory reaches a user through their
+  distribution or not at all, and today we would not know either way. **Fix:** decide who watches
+  what, and how a fix reaches a user. The macOS `minimumSystemVersion` in `tauri.conf.json` is the one
+  lever we already have.
+
+- **Dialling an insecure cluster is a choice nobody wrote down.** A context with
+  `insecure-skip-tls-verify`, or a plain `http` server, is connected to like any other; the context bar
+  badges it (`tlsUnverifiedReason`). Matching `kubectl` is deliberate — refusing would make the app
+  useless on the clusters people actually run — but the model records only the badge, so connecting
+  anyway reads as something nobody noticed. **Fix:** an ADR accepting it, and a **By decision** row
+  beside the badge's row in [`security-model.md`](security-model.md).
+
+- **A struct logged behind `slog.Any` goes past the redactor.** The sink renders and redacts strings
+  and errors whoever wrote them (`internal/logging/redact.go`), and the model's row says plainly that a
+  value which is neither is encoded whole. So one `slog.Any("state", v)` whose struct holds a token
+  lands in the log unredacted, and no test fails. **Fix:** either handle structs in the renderer, or
+  make the shape unreachable — a lint, or a sentinel test that fails on `slog.Any` in the sidecar.
+  Prefer whichever keeps the sink the only place that has to be right.
+
+- **The log-tail and exec windows arrive with an obligation.** They do not exist yet. When they do,
+  what they display is bytes from a cluster an attacker may control: no HTML interpretation, and
+  terminal control sequences stripped before anything renders them. Both `CLAUDE.md` files say so, and
+  nothing will fail if it is forgotten, because there is no code yet to fail. **Fix:** the first of
+  those windows brings its own test and its row in [`security-model.md`](security-model.md).
 
 ## Testing
 
