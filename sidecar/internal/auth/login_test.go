@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -311,6 +312,30 @@ func TestLoopbackServerBoundsItsReads(t *testing.T) {
 		if tc.got <= 0 {
 			t.Errorf("%s = %v, want a bound", tc.name, tc.got)
 		}
+	}
+}
+
+// The Serve goroutine's whole job is to surface a listener failure to whoever is
+// waiting, so a listener that dies under it reaches Wait rather than stranding the
+// caller until the login times out. Closing lb.ln rather than lb.Close() is what makes
+// Serve fail: Close is the shutdown path Serve reports as ErrServerClosed and swallows.
+func TestLoopbackSurfacesAServeFailure(t *testing.T) {
+	lb, err := newLoopbackServer(lbState)
+	if err != nil {
+		t.Fatalf("newLoopbackServer: %v", err)
+	}
+	t.Cleanup(func() { _ = lb.Close() })
+
+	if err := lb.ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	// Bounded: a Serve failure that never reaches the channel leaves Wait with nothing
+	// to return, and the test has to fail rather than hang until the suite's own timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Timeout)
+	defer cancel()
+	if _, err := lb.Wait(ctx); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Wait err = %v, want one wrapping net.ErrClosed", err)
 	}
 }
 
