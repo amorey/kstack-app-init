@@ -176,74 +176,8 @@ distinguishable from an unnoticed one. **Decided against:**
   trust decision. Gate the first probe/plugin run behind explicit approval of the resolved command,
   args, environment and source; invalidate approval when these change. Include token/certificate
   file references and server/proxy destinations in the trust design. Test startup, reload, previously
-  unused contexts and approval revocation. Until then use only trusted kubeconfigs.
-
-- **R-01 / H-5 — authenticate the sidecar to the host (medium; desktop/IPC owner).** Verify the
-  spawned child PID/account on every GraphQL, SSE and gRPC connection; use a private Unix runtime
-  directory with safe cleanup. Test replacement/reconnect and native Windows pipe precreation.
-  The sidecar's existing client PID check is only one direction.
-
-- **R-02 — native navigation policy (medium; desktop owner).** Reject remote origins and unexpected
-  schemes/popups in the native webview callbacks; keep intended external links host-owned. Verify
-  routing, reload, URL-based data egress and remote-origin IPC denial on all three webview engines.
-  CSP is not a top-level navigation allowlist.
-
-- **R-05 / S-9 — resource budgets (medium; sidecar/desktop owners).** Define GraphQL cost/depth and
-  concurrency limits, subscription/frame and Kubernetes object/decompression limits, worker fan-out
-  and a global disk budget including `app.db`. Test oversized inputs, repeated operations and
-  recovery. The 2 GiB per-cache janitor ceiling and query timeouts are partial protection only.
-
-- **R-06 — diagnostics and malformed credential fields (medium; sidecar owner).** Redact/bound
-  auth, probe and sync errors before logging/persistence; add sentinel tests through native log
-  forwarding. Fail closed on malformed shapes of known credential paths and test GVK mismatches.
-  The R-03 GraphQL logging fix is not a system-wide credential-redaction guarantee.
-
-- **R-08 — release assurance (medium; release owner).** Pin third-party actions to reviewed SHAs,
-  minimize per-job permissions and require checks for the exact release commit. Verify signing
-  policy/artifacts, publish trusted signature verification instructions and confirm SBOM coverage.
-  Review actual GitHub environment/branch protections separately; this checkout cannot establish
-  them. The advisory jobs now fail on unsound and unmaintained findings, so what is left of the
-  scanning half is running them on a schedule — deliberately not done yet, so an idle branch still
-  learns nothing about a new advisory until someone opens a pull request.
-
-- **R-10 — logout's revocation is best-effort, and unsaid (low; auth owner).** `Logout` clears the
-  local session and revokes server-side without waiting on it, so a failed or interrupted revoke
-  leaves the server grant live while the app reports signed out. Say so in
-  [`security-model.md`](security-model.md) and test the two halves apart. The callback's read
-  bounds and one-shot error delivery have landed.
-
-- **Verification debt (security/release owners).** What the 4 September review could not run, it
-  recorded as owed; most of it was already running in CI, which the review did not check.
-  `govulncheck`, `cargo audit`, `cargo test` and `go test -race` all run per pull request across
-  the full OS/arch matrix (`ci.yml`), so the scanner half is closed. What remains needs a signed
-  build on real hardware and has no test written yet: signature and entitlement verification on
-  release artifacts, IPC peer authentication against a hostile listener, and navigation policy on
-  all three webview engines. Release settings and branch protections live outside this checkout
-  (R-08). Unknown platform results are not clean results.
-
-
-- **In-app updates.** Nothing checks for a newer build, and nothing would verify one. What
-  `release.yml` ships is signed direct downloads — a notarized `.dmg` with the sidecar signed
-  inside it, an `.msi` signed through SignPath, unsigned `.deb`/`.rpm`/`.AppImage`, and
-  `SHA256SUMS` with a detached GPG signature beside all of them — so a download is verifiable by
-  hand everywhere and by the OS on two platforms. The in-app path is what is missing. **What it
-  takes:** a keypair from `pnpm tauri signer generate` whose private half lives only in the
-  `production` environment's secrets (`TAURI_SIGNING_PRIVATE_KEY` and its password; macOS and Windows
-  bundle jobs already use that environment, while Linux would need to be added); `tauri-plugin-updater` in `Cargo.toml` and registered in
-  `lib.rs`, with **nothing added to `src-tauri/capabilities/default.json`** — the host checks,
-  prompts and installs, and granting `updater:default` to the webview would hand a compromised page
-  the download-and-install path for no reason; `plugins.updater` in `tauri.conf.json` carrying the
-  **public** key (that key is what makes a substituted download fail to install — the endpoint's TLS
-  is not) and an `https` manifest endpoint, cheapest being the GitHub release's `latest.json`; and
-  `bundle.createUpdaterArtifacts: true`, after which the bundle jobs emit a `.sig` beside each
-  updater-capable artifact (`.dmg`/`.app.tar.gz`, `.msi`, `.AppImage` — `.deb` and `.rpm` update
-  through the package manager) and the `release` job assembles `latest.json` from them. The sidecar
-  rides the same signature as an `externalBin`, so it needs no channel of its own. **Nothing here is
-  unit-testable**; the check is manual and done once: install an older build, publish a signed newer
-  one to a test release and confirm it updates, then publish one signed with a different key and
-  confirm it is refused. **When it lands:** move *"Signed in-app updates"* in
-  [`security-model.md`](security-model.md) from **Not built** to **Held by review**, and rewrite
-  `src-tauri/CLAUDE.md`'s distribution paragraph, which states today that there are none.
+  unused contexts and approval revocation. The highest open finding, and the one whose shape is
+  still a product question. Until then use only trusted kubeconfigs.
 
 - **A cache stops outliving the user's interest in its cluster.** The one obligation left open by
   [the cache is ordinary application data](adr/2026-09-02-the-cache-is-ordinary-application-data.md):
@@ -262,12 +196,46 @@ distinguishable from an unnoticed one. **Decided against:**
   *"A retention policy…"* row in [`security-model.md`](security-model.md) to **Enforced**, naming
   the test, and fold the policy into `sidecar/CLAUDE.md`.
 
-- **H-3 — macOS runtime exceptions (medium; desktop/release owners).**
-  `disable-library-validation` relaxes in-process library signature validation; it does not grant
-  permission to exec a separate sidecar. Test a signed/notarized build without it, and separately
-  evaluate `allow-unsigned-executable-memory` and `allow-jit`. Remove unnecessary exceptions only
-  after startup, sidecar, OAuth and webview smoke tests on both supported CPU architectures.
-  Source inspection alone cannot establish the minimum required entitlements.
+**Specced.** Each links a spec in [`docs/specs/`](specs/) self-contained enough to build straight
+through; the numbers are the build order.
+
+- **R-10 — logout's revocation is best-effort, and unsaid (low; auth owner).** →
+  [spec 1](specs/1-logout-revocation-is-best-effort.md)
+
+- **R-02 — native navigation policy (medium; desktop owner).** →
+  [spec 2](specs/2-native-navigation-policy.md)
+
+- **R-06 — diagnostics and malformed credential fields (medium; sidecar owner).** →
+  [spec 4](specs/4-diagnostics-and-malformed-credential-fields.md)
+
+- **R-01 / H-5 — authenticate the sidecar to the host (medium; desktop/IPC owner).** →
+  [spec 5](specs/5-host-authenticates-the-sidecar.md)
+
+- **R-05 / S-9 — resource budgets (medium; sidecar/desktop owners).** →
+  [spec 6](specs/6-resource-budgets.md)
+
+- **R-08 — release assurance (medium; release owner).** →
+  [spec 7](specs/7-release-assurance.md)
+
+- **H-3 — macOS entitlements (medium; desktop owner).** →
+  [spec 8](specs/8-macos-entitlements.md)
+
+- **H-4a — the app never says it is out of date (medium; release owner).** →
+  [spec 3](specs/3-update-notification.md). Split from H-4: it needs no signing key and no release
+  work, so it does not wait behind them.
+
+- **H-4b — no in-app updater (medium; release owner).** →
+  [spec 9](specs/9-signed-in-app-updates.md), whose first deliverable is an ADR settling the trust
+  root.
+
+- **Verification debt (security/release owners).** What the 4 September review could not run, it
+  recorded as owed; most of it was already running in CI, which the review did not check.
+  `govulncheck`, `cargo audit`, `cargo test` and `go test -race` all run per pull request across
+  the full OS/arch matrix (`ci.yml`), so the scanner half is closed. What remains needs a signed
+  build on real hardware and has no test written yet: signature and entitlement verification on
+  release artifacts, IPC peer authentication against a hostile listener, and navigation policy on
+  all three webview engines. Release settings and branch protections live outside this checkout
+  (R-08). Unknown platform results are not clean results.
 
 ## Testing
 
