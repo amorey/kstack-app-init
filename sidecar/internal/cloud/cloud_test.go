@@ -280,11 +280,14 @@ func TestConfiguredStartStop(t *testing.T) {
 // a degrade: degrading is for "no cloud configured", and silently dropping the
 // user's prefs on the floor is a different thing entirely.
 func TestNewFailsOnAnUnusableDataDir(t *testing.T) {
-	notADir := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	// A directory where the settings file goes, not a file where the dir goes:
+	// Windows reports a path under a regular file as "not found", which is what
+	// a settings file nobody has written yet looks like.
+	dataDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dataDir, "settings.json"), 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
 	}
-	if _, err := newWithOptions(notADir, "https://api.example.test", nil, nil, withUpstream(newSignalUpstream())); err == nil {
+	if _, err := newWithOptions(dataDir, "https://api.example.test", nil, nil, withUpstream(newSignalUpstream())); err == nil {
 		t.Fatal("New with an unusable data dir returned no error")
 	}
 }
