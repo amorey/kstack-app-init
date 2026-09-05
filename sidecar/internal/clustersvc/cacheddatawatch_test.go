@@ -19,6 +19,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -249,24 +250,42 @@ func TestCacheWatchDiffsAgainstThePreviousSnapshot(t *testing.T) {
 // A burst is one re-read. The bus coalesces only what is undelivered, so a loop that drains
 // promptly would otherwise re-read the whole collection once per write.
 func TestCacheWatchCollapsesABurstIntoOneReRead(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	f := newWatchFixture(t)
-	f.open()
-	f.set(row{UID: "a", Data: "1"})
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f := newWatchFixture(t)
+		f.open()
+		f.set(row{UID: "a", Data: "1"})
 
-	s := f.start(ctx, 40*time.Millisecond, time.Millisecond)
-	recvFrame(t, s)
-	require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
-	require.Equal(t, 1, f.readCount())
+		const debounce = 40 * time.Millisecond
+		s := f.start(ctx, debounce, time.Millisecond)
+		recvFrame(t, s)
+		require.Equal(t, DeltaFrameBookmark, recvFrame(t, s).Type)
+		synctest.Wait()
+		require.Equal(t, 1, f.readCount())
 
-	for range 5 {
-		f.ping()
-	}
-	f.set(row{UID: "a", Data: "2"})
+		f.set(row{UID: "a", Data: "2"})
+		// Virtual time keeps even slow SQLite writes inside one debounce window.
+		// Drain each ping separately so the loop, rather than just the bus, must
+		// collapse them. Later pings must not extend the first ping's deadline.
+		for range 5 {
+			f.ping()
+			synctest.Wait()
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(debounce - 25*time.Millisecond - time.Nanosecond)
+		synctest.Wait()
+		require.Equal(t, 1, f.readCount(), "the watch read before the debounce elapsed")
 
-	assert.Equal(t, DeltaFrameModified, recvFrame(t, s).Type)
-	assert.Equal(t, 2, f.readCount(), "the burst was not collapsed")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		require.Equal(t, 2, f.readCount(), "the burst was not collapsed at the first ping's deadline")
+		assert.Equal(t, frame{Type: DeltaFrameModified, Row: &row{UID: "a", Data: "2"}}, recvFrame(t, s))
+
+		time.Sleep(debounce)
+		synctest.Wait()
+		assert.Equal(t, 2, f.readCount(), "the burst left an extra re-read pending")
+	})
 }
 
 // A failed read is retried in place rather than ending the stream: the bus is keyed, so a
